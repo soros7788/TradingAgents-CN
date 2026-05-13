@@ -26,7 +26,9 @@ jobs:
         run: |
           set -e
 
-          MSG="TradingAgents-CN 定时任务已运行
+          MSG=$(cat <<EOF
+TradingAgents-CN 定时任务已运行
+
 仓库：${GITHUB_REPOSITORY}
 分支：${GITHUB_REF_NAME}
 时间UTC：$(date -u '+%Y-%m-%d %H:%M:%S')
@@ -34,7 +36,9 @@ jobs:
 
 当前版本：轻量提醒版
 状态：GitHub Actions 可用
-下一步：接入 A股等突破规则"
+下一步：接入 A股等突破规则
+EOF
+)
 
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
