@@ -36,13 +36,22 @@ jobs:
         run: |
           set +e
 
-          python scripts/breakout_alert.py > msg.txt 2>&1
+          python scripts/breakout_alert.py > msg_full.txt 2>&1
           CODE=$?
 
-          echo "" >> msg.txt
-          echo "退出码：$CODE" >> msg.txt
+          {
+            echo "A股等突破扫描结果"
+            echo "退出码：$CODE"
+            echo "北京时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "===== 输出摘要 ====="
+            tail -c 3500 msg_full.txt
+          } > msg.txt
 
-          echo "===== Message ====="
+          echo "===== Full Message ====="
+          cat msg_full.txt
+
+          echo "===== Telegram Message ====="
           cat msg.txt
 
           echo "===== Telegram response ====="
