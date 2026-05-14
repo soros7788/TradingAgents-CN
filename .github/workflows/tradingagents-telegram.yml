@@ -3,11 +3,11 @@ name: TradingAgents Telegram Alert
 on:
   workflow_dispatch:
   schedule:
-    # 北京时间 09:35 = UTC 01:35
+    # 北京时间 09:35
     - cron: "35 1 * * 1-5"
-    # 北京时间 11:30 = UTC 03:30
+    # 北京时间 11:30
     - cron: "30 3 * * 1-5"
-    # 北京时间 14:30 = UTC 06:30
+    # 北京时间 14:30
     - cron: "30 6 * * 1-5"
 
 jobs:
@@ -16,9 +16,6 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -27,25 +24,238 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install akshare pandas
+          pip install pandas requests
 
-      - name: Run breakout scan and send Telegram
+      - name: Run 30m breakout scan and send Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          set +e
+          cat > scan.py <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import requests
+          import pandas as pd
 
-          python scripts/breakout_alert.py > msg.txt 2>&1
+          WATCHLIST = [
+              {"code": "002463", "name": "沪电股份"},
+              {"code": "300750", "name": "宁德时代"},
+              {"code": "688981", "name": "中芯国际"},
+          ]
+
+          # ===== 参数 =====
+          TOL = 0.01          # 高低点允许 1% 误差
+          BREAK_BUF = 0.003  # 突破缓冲 0.3%
+          FAIL_BUF = 0.01    # 证伪缓冲 1%
+
+          # ===== K线周期 =====
+          # 101 = 日线
+          # 60  = 60分钟
+          # 30  = 30分钟
+          # 15  = 15分钟
+          # 5   = 5分钟
+          KLT = "30"
+          PERIOD_NAME = "30分钟"
+
+          def is_main_board(code):
+              return code.startswith(("600", "601", "603", "605", "000", "001", "002", "003"))
+
+          def near(a, b, tol=TOL):
+              return a > 0 and b > 0 and abs(a - b) / max(a, b) <= tol
+
+          def secid(code):
+              # 沪市：600/601/603/605/688
+              if code.startswith(("600", "601", "603", "605", "688")):
+                  return "1." + code
+              # 深市：000/001/002/003/300
+              return "0." + code
+
+          def get_hist_em(code):
+              """
+              东方财富 30分钟K线。
+              """
+              url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+              params = {
+                  "secid": secid(code),
+                  "fields1": "f1,f2,f3,f4,f5,f6",
+                  "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                  "klt": KLT,
+                  "fqt": "1",
+                  "beg": "20240101",
+                  "end": datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d"),
+              }
+              headers = {
+                  "User-Agent": "Mozilla/5.0",
+                  "Referer": "https://quote.eastmoney.com/",
+              }
+
+              r = requests.get(url, params=params, headers=headers, timeout=20)
+              r.raise_for_status()
+              data = r.json()
+
+              klines = data.get("data", {}).get("klines", [])
+              if not klines:
+                  raise RuntimeError("东方财富K线接口返回空")
+
+              rows = []
+              for x in klines:
+                  p = x.split(",")
+                  rows.append({
+                      "时间": p[0],
+                      "开盘": p[1],
+                      "收盘": p[2],
+                      "最高": p[3],
+                      "最低": p[4],
+                      "成交量": p[5],
+                      "成交额": p[6],
+                  })
+
+              df = pd.DataFrame(rows).tail(90).copy()
+
+              for c in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
+
+              df = df.dropna(subset=["最高", "最低", "收盘"])
+
+              if len(df) < 60:
+                  raise RuntimeError(f"{PERIOD_NAME}K线不足60根，当前{len(df)}根")
+
+              return df
+
+          def analyze(code, name):
+              if not is_main_board(code):
+                  return {
+                      "code": code,
+                      "name": name,
+                      "status": "过滤",
+                      "reason": "非主板，跳过"
+                  }
+
+              df = get_hist_em(code)
+
+              current = float(df["收盘"].iloc[-1])
+              last_time = str(df["时间"].iloc[-1])
+
+              h5 = float(df["最高"].tail(5).max())
+              h20 = float(df["最高"].tail(20).max())
+              h60 = float(df["最高"].tail(60).max())
+
+              l2 = float(df["最低"].tail(2).min())
+              l5 = float(df["最低"].tail(5).min())
+
+              amount = float(df["成交额"].iloc[-1]) if "成交额" in df.columns else 0
+
+              # A：5根最高≈20根最高≈60根最高
+              A = near(h5, h20) and near(h20, h60)
+
+              # B：近2根最低≈近5根最低
+              B = near(l2, l5)
+
+              # D：当前收盘价突破60根结构高点
+              D = current > h60 * (1 + BREAK_BUF)
+
+              # 证伪：当前收盘价跌破近5根低点
+              F = current < l5 * (1 - FAIL_BUF)
+
+              if F:
+                  status = "证伪"
+                  reason = f"{PERIOD_NAME}收盘价 {current:.2f} 跌破支撑 {l5:.2f}"
+              elif A and B and D:
+                  status = "突破"
+                  reason = f"{PERIOD_NAME}收盘价 {current:.2f} 突破结构高点 {h60:.2f}"
+              elif A and B:
+                  status = "等待"
+                  reason = f"{PERIOD_NAME}结构有效，等待突破 {h60:.2f}"
+              elif A:
+                  status = "观察"
+                  reason = "高点压缩存在，但低点承接不足"
+              else:
+                  status = "未成型"
+                  reason = f"不满足{PERIOD_NAME}K的5/20/60高点重合"
+
+              return {
+                  "code": code,
+                  "name": name,
+                  "status": status,
+                  "reason": reason,
+                  "price": current,
+                  "last_time": last_time,
+                  "amount": amount / 100000000 if amount else 0,
+                  "A": A,
+                  "B": B,
+                  "D": D,
+                  "F": F,
+                  "h5": h5,
+                  "h20": h20,
+                  "h60": h60,
+                  "l2": l2,
+                  "l5": l5,
+              }
+
+          results = []
+
+          for item in WATCHLIST:
+              try:
+                  results.append(analyze(item["code"], item["name"]))
+              except Exception as e:
+                  results.append({
+                      "code": item["code"],
+                      "name": item["name"],
+                      "status": "ERROR",
+                      "reason": f"{type(e).__name__}: {e}",
+                  })
+
+          now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+
+          lines = []
+          lines.append("A股等突破自动扫描")
+          lines.append(f"模型周期：{PERIOD_NAME}K")
+          lines.append(f"时间：{now}")
+          lines.append("")
+          lines.append(f"突破：{sum(r['status'] == '突破' for r in results)}")
+          lines.append(f"等待：{sum(r['status'] == '等待' for r in results)}")
+          lines.append(f"证伪：{sum(r['status'] == '证伪' for r in results)}")
+          lines.append(f"观察：{sum(r['status'] == '观察' for r in results)}")
+          lines.append("")
+
+          for r in results:
+              lines.append(f"{r['code']} {r['name']}｜{r['status']}")
+              lines.append(f"原因：{r['reason']}")
+
+              if "price" in r:
+                  lines.append(f"K线时间：{r['last_time']}")
+                  lines.append(f"价格：{r['price']:.2f}｜成交额：{r['amount']:.2f}亿")
+                  lines.append(f"A高点重合：{r['A']}｜B低点承接：{r['B']}｜D突破：{r['D']}｜证伪：{r['F']}")
+                  lines.append(f"5高：{r['h5']:.2f}｜20高：{r['h20']:.2f}｜60高：{r['h60']:.2f}")
+                  lines.append(f"2低：{r['l2']:.2f}｜5低：{r['l5']:.2f}")
+
+              lines.append("")
+
+          lines.append("规则：")
+          lines.append(f"A：5根{PERIOD_NAME}最高≈20根{PERIOD_NAME}最高≈60根{PERIOD_NAME}最高")
+          lines.append(f"B：近2根{PERIOD_NAME}最低≈近5根{PERIOD_NAME}最低")
+          lines.append("C：主板+非ST")
+          lines.append(f"D：当前{PERIOD_NAME}收盘价突破结构高点")
+          lines.append("")
+          lines.append("提示：仅用于策略观察，不构成投资建议。")
+
+          print("\n".join(lines))
+          PY
+
+          python scan.py > msg_full.txt 2>&1
           CODE=$?
 
-          echo "" >> msg.txt
-          echo "退出码：$CODE" >> msg.txt
+          {
+            echo "A股等突破扫描结果"
+            echo "退出码：$CODE"
+            echo "北京时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            tail -c 3500 msg_full.txt
+          } > msg.txt
 
-          echo "===== Message ====="
+          echo "===== Telegram Message ====="
           cat msg.txt
 
-          echo "===== Telegram response ====="
           RESPONSE=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             --data-urlencode text="$(cat msg.txt)")
