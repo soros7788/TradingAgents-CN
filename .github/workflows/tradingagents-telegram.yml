@@ -34,6 +34,7 @@ jobs:
           cat > scan.py <<'PY'
           from datetime import datetime
           from zoneinfo import ZoneInfo
+          import time
           import requests
           import pandas as pd
 
@@ -58,23 +59,36 @@ jobs:
           PERIOD_NAME = "30分钟"
 
           def is_main_board(code):
-              return code.startswith(("600", "601", "603", "605", "000", "001", "002", "003"))
+              """
+              扫描范围：
+              沪主板：600/601/603/605
+              深主板：000/001/002/003
+              创业板：300/301
+              科创板：688
+              """
+              return code.startswith((
+                  "600", "601", "603", "605",
+                  "000", "001", "002", "003",
+                  "300", "301",
+                  "688"
+              ))
 
           def near(a, b, tol=TOL):
               return a > 0 and b > 0 and abs(a - b) / max(a, b) <= tol
 
           def secid(code):
-              # 沪市：600/601/603/605/688
+              # 沪市
               if code.startswith(("600", "601", "603", "605", "688")):
                   return "1." + code
-              # 深市：000/001/002/003/300
+              # 深市
               return "0." + code
 
           def get_hist_em(code):
               """
-              东方财富 30分钟K线。
+              东方财富 30分钟K线，带5次重试。
               """
               url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
               params = {
                   "secid": secid(code),
                   "fields1": "f1,f2,f3,f4,f5,f6",
@@ -83,44 +97,58 @@ jobs:
                   "fqt": "1",
                   "beg": "20240101",
                   "end": datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d"),
+                  "lmt": "1000000",
               }
+
               headers = {
-                  "User-Agent": "Mozilla/5.0",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                  "Accept": "application/json,text/plain,*/*",
                   "Referer": "https://quote.eastmoney.com/",
+                  "Connection": "close",
               }
 
-              r = requests.get(url, params=params, headers=headers, timeout=20)
-              r.raise_for_status()
-              data = r.json()
+              last_error = None
 
-              klines = data.get("data", {}).get("klines", [])
-              if not klines:
-                  raise RuntimeError("东方财富K线接口返回空")
+              for i in range(5):
+                  try:
+                      r = requests.get(url, params=params, headers=headers, timeout=30)
+                      r.raise_for_status()
+                      data = r.json()
 
-              rows = []
-              for x in klines:
-                  p = x.split(",")
-                  rows.append({
-                      "时间": p[0],
-                      "开盘": p[1],
-                      "收盘": p[2],
-                      "最高": p[3],
-                      "最低": p[4],
-                      "成交量": p[5],
-                      "成交额": p[6],
-                  })
+                      klines = data.get("data", {}).get("klines", [])
+                      if not klines:
+                          raise RuntimeError("东方财富K线接口返回空")
 
-              df = pd.DataFrame(rows).tail(90).copy()
+                      rows = []
+                      for x in klines:
+                          p = x.split(",")
+                          rows.append({
+                              "时间": p[0],
+                              "开盘": p[1],
+                              "收盘": p[2],
+                              "最高": p[3],
+                              "最低": p[4],
+                              "成交量": p[5],
+                              "成交额": p[6],
+                          })
 
-              for c in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
-                  df[c] = pd.to_numeric(df[c], errors="coerce")
+                      df = pd.DataFrame(rows).tail(90).copy()
 
-              df = df.dropna(subset=["最高", "最低", "收盘"])
+                      for c in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
+                          df[c] = pd.to_numeric(df[c], errors="coerce")
 
-              if len(df) < 60:
-                  raise RuntimeError(f"{PERIOD_NAME}K线不足60根，当前{len(df)}根")
+                      df = df.dropna(subset=["最高", "最低", "收盘"])
 
-              return df
+                      if len(df) < 60:
+                          raise RuntimeError(f"{PERIOD_NAME}K线不足60根，当前{len(df)}根")
+
+                      return df
+
+                  except Exception as e:
+                      last_error = e
+                      time.sleep(3)
+
+              raise RuntimeError(f"东方财富K线接口连续失败5次：{last_error}")
 
           def analyze(code, name):
               if not is_main_board(code):
@@ -128,7 +156,7 @@ jobs:
                       "code": code,
                       "name": name,
                       "status": "过滤",
-                      "reason": "非主板，跳过"
+                      "reason": "不在当前扫描范围，跳过"
                   }
 
               df = get_hist_em(code)
@@ -216,6 +244,7 @@ jobs:
           lines.append(f"等待：{sum(r['status'] == '等待' for r in results)}")
           lines.append(f"证伪：{sum(r['status'] == '证伪' for r in results)}")
           lines.append(f"观察：{sum(r['status'] == '观察' for r in results)}")
+          lines.append(f"错误：{sum(r['status'] == 'ERROR' for r in results)}")
           lines.append("")
 
           for r in results:
@@ -234,7 +263,7 @@ jobs:
           lines.append("规则：")
           lines.append(f"A：5根{PERIOD_NAME}最高≈20根{PERIOD_NAME}最高≈60根{PERIOD_NAME}最高")
           lines.append(f"B：近2根{PERIOD_NAME}最低≈近5根{PERIOD_NAME}最低")
-          lines.append("C：主板+非ST")
+          lines.append("C：沪深主板 + 创业板 + 科创板，非ST")
           lines.append(f"D：当前{PERIOD_NAME}收盘价突破结构高点")
           lines.append("")
           lines.append("提示：仅用于策略观察，不构成投资建议。")
