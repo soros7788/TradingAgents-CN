@@ -3,86 +3,82 @@
 
 import argparse
 import json
-import math
 import re
-import sys
 import time
 from datetime import datetime, timezone, timedelta
 
 import requests
 
 
-def market_prefix(code: str) -> str:
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://quote.eastmoney.com/",
+}
+
+
+def eastmoney_secid(code: str) -> str:
     code = code.strip()
     if code.startswith("6"):
-        return "sh" + code
-    if code.startswith(("0", "3")):
-        return "sz" + code
-    if code.startswith(("4", "8")):
-        return "bj" + code
-    return code
+        return f"1.{code}"   # 上海
+    return f"0.{code}"       # 深圳
 
 
 def to_float(v):
     try:
-        if v is None:
-            return None
-        if isinstance(v, (int, float)):
-            return float(v)
-        v = str(v).replace(",", "").strip()
-        if v == "":
-            return None
-        return float(v)
+        return float(str(v).replace(",", "").strip())
     except Exception:
         return None
 
 
-def fetch_sina_30m(code: str, datalen: int = 240):
+def fetch_eastmoney_30m(code: str, lmt: int = 260):
     """
-    新浪 30分钟K线。
-    不依赖 akshare，适合 GitHub Actions 轻量运行。
+    东方财富 30分钟K线。
+    GitHub Actions 可直接跑，不依赖 akshare，不需要 Docker。
     """
-    symbol = market_prefix(code)
-    url = (
-        "https://quotes.sina.cn/cn/api/openapi.php/"
-        "CN_MinlineService.getMinlineData"
-    )
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
     params = {
-        "symbol": symbol,
-        "scale": "30",
-        "ma": "no",
-        "datalen": str(datalen),
+        "secid": eastmoney_secid(code),
+        "klt": "30",
+        "fqt": "1",
+        "lmt": str(lmt),
+        "end": "20500101",
+        "iscca": "1",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
     }
 
     last_err = None
+
     for _ in range(3):
         try:
-            r = requests.get(url, params=params, timeout=15)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=20)
             r.raise_for_status()
-            text = r.text.strip()
+            data = r.json()
 
-            # 正常是 JSON；如果变成 JSONP，也尽量剥离
-            if not text.startswith("{"):
-                m = re.search(r"\{.*\}", text, re.S)
-                if m:
-                    text = m.group(0)
-
-            data = json.loads(text)
-            rows = data.get("result", {}).get("data", [])
+            klines = (
+                data.get("data", {}).get("klines")
+                if isinstance(data.get("data"), dict)
+                else []
+            )
 
             bars = []
-            for x in rows:
-                if not isinstance(x, dict):
+
+            for line in klines or []:
+                parts = str(line).split(",")
+
+                if len(parts) < 6:
                     continue
 
-                t = x.get("day") or x.get("time") or x.get("date")
-                o = to_float(x.get("open"))
-                h = to_float(x.get("high"))
-                l = to_float(x.get("low"))
-                c = to_float(x.get("close"))
-                v = to_float(x.get("volume"))
+                t = parts[0]
+                o = to_float(parts[1])
+                c = to_float(parts[2])
+                h = to_float(parts[3])
+                l = to_float(parts[4])
+                v = to_float(parts[5])
 
-                if all(vv is not None for vv in [o, h, l, c]):
+                if all(x is not None for x in [o, h, l, c]):
                     bars.append({
                         "time": t,
                         "open": o,
@@ -92,10 +88,10 @@ def fetch_sina_30m(code: str, datalen: int = 240):
                         "volume": v,
                     })
 
-            if len(bars) >= 30:
+            if len(bars) >= 65:
                 return bars
 
-            last_err = f"数据不足：{len(bars)}"
+            last_err = f"东方财富返回数据不足：{len(bars)}"
         except Exception as e:
             last_err = str(e)
             time.sleep(1)
@@ -109,16 +105,14 @@ def pct(a, b):
     return (a - b) / b * 100
 
 
-def near(a, b, tolerance=0.005):
+def near(a, b, tolerance=0.003):
     if a is None or b is None or b == 0:
         return False
     return abs(a - b) / abs(b) <= tolerance
 
 
 def analyze_one(code: str):
-    bars = fetch_sina_30m(code)
-    if len(bars) < 65:
-        raise RuntimeError(f"{code} 30分钟K线不足，当前只有 {len(bars)} 根")
+    bars = fetch_eastmoney_30m(code)
 
     latest = bars[-1]
     hist = bars[:-1]
