@@ -1,0 +1,169 @@
+name: TradingAgents Telegram Only
+
+on:
+  schedule:
+    # 北京时间 09:35
+    - cron: "35 1 * * 1-5"
+    # 北京时间 11:30
+    - cron: "30 3 * * 1-5"
+    # 北京时间 14:30
+    - cron: "30 6 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      stocks:
+        description: "股票代码，逗号分隔，如：000001,000858,001979"
+        required: false
+        default: "000001,000858,001979"
+      analysis_type:
+        description: "分析类型"
+        required: false
+        type: choice
+        options:
+          - quick
+          - full
+        default: "quick"
+
+permissions:
+  contents: read
+
+jobs:
+  telegram-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # 如果你的分析代码需要模型 Key，就保留；没有也不影响 Telegram 发送
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+      STOCKS: ${{ github.event.inputs.stocks || '000001,000858,001979' }}
+      ANALYSIS_TYPE: ${{ github.event.inputs.analysis_type || 'quick' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install requests aiohttp pandas numpy scikit-learn python-telegram-bot
+
+      - name: Run trading analysis
+        id: run_analysis
+        continue-on-error: true
+        run: |
+          set +e
+
+          echo "====== TradingAgents Telegram Only ======" > run.log
+          echo "Time UTC: $(date -u '+%Y-%m-%d %H:%M:%S')" >> run.log
+          echo "Stocks: $STOCKS" >> run.log
+          echo "Analysis Type: $ANALYSIS_TYPE" >> run.log
+          echo "" >> run.log
+
+          if [ -f scripts/sync_stock_data.py ]; then
+            echo "====== Sync stock data ======" >> run.log
+            python scripts/sync_stock_data.py --date today >> run.log 2>&1
+          else
+            echo "scripts/sync_stock_data.py 不存在，跳过同步。" >> run.log
+          fi
+
+          echo "" >> run.log
+          echo "====== Run analysis ======" >> run.log
+
+          if [ -f scripts/trading_analysis_main.py ]; then
+            python scripts/trading_analysis_main.py \
+              --stocks "$STOCKS" \
+              --analysis_type "$ANALYSIS_TYPE" \
+              --output json \
+              > result.json 2>> run.log
+            CODE=$?
+          else
+            echo "❌ 找不到 scripts/trading_analysis_main.py" >> run.log
+            CODE=127
+          fi
+
+          echo "$CODE" > exit_code.txt
+
+          echo "" >> run.log
+          echo "Exit code: $CODE" >> run.log
+
+          exit 0
+
+      - name: Build Telegram message
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from datetime import datetime, timezone, timedelta
+
+          bj = datetime.now(timezone.utc) + timedelta(hours=8)
+          title = f"📈 TradingAgents-CN 量化分析\n北京时间：{bj:%Y-%m-%d %H:%M:%S}\n"
+
+          stocks = Path("exit_code.txt").read_text().strip() if Path("exit_code.txt").exists() else "unknown"
+          exit_code = stocks
+
+          msg = title + "\n"
+
+          if Path("result.json").exists() and Path("result.json").stat().st_size > 0:
+              raw = Path("result.json").read_text(encoding="utf-8", errors="ignore")
+              try:
+                  data = json.loads(raw)
+                  pretty = json.dumps(data, ensure_ascii=False, indent=2)
+                  msg += "✅ 分析结果：\n\n" + pretty
+              except Exception:
+                  msg += "✅ 原始分析输出：\n\n" + raw
+          else:
+              log = Path("run.log").read_text(encoding="utf-8", errors="ignore") if Path("run.log").exists() else ""
+              msg += "⚠️ 没有生成 result.json，以下是运行日志尾部：\n\n"
+              msg += "\n".join(log.splitlines()[-120:])
+
+          msg += f"\n\nExit code: {exit_code}"
+
+          Path("telegram_message.txt").write_text(msg[:12000], encoding="utf-8")
+          PY
+
+      - name: Send Telegram
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+          from pathlib import Path
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+          if not token or not chat_id:
+              raise SystemExit("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID")
+
+          text = Path("telegram_message.txt").read_text(encoding="utf-8", errors="ignore")
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+          # Telegram 单条消息长度有限，分段发送
+          chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
+
+          for i, chunk in enumerate(chunks, 1):
+              payload = {
+                  "chat_id": chat_id,
+                  "text": chunk,
+                  "disable_web_page_preview": True
+              }
+              r = requests.post(url, json=payload, timeout=30)
+              if not r.ok:
+                  raise SystemExit(f"Telegram 发送失败: {r.status_code} {r.text}")
+
+          print("Telegram sent.")
+          PY
