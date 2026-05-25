@@ -22,7 +22,7 @@ on:
       stocks:
         description: "股票代码，逗号分隔，如：000001,002463,000006"
         required: false
-        default: "1A0001,002463,000006"
+        default: "002463,000006"
       analysis_type:
         description: "分析类型"
         required: false
