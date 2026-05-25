@@ -2,7 +2,6 @@ name: TradingAgents Telegram Only
 
 on:
   schedule:
-  schedule:
     # 北京时间 09:35
     - cron: "35 1 * * 1-5"
 
