@@ -119,31 +119,126 @@ jobs:
           from datetime import datetime, timezone, timedelta
 
           bj = datetime.now(timezone.utc) + timedelta(hours=8)
-          title = f"📈 TradingAgents-CN 量化分析\n北京时间：{bj:%Y-%m-%d %H:%M:%S}\n"
 
-          stocks = Path("exit_code.txt").read_text().strip() if Path("exit_code.txt").exists() else "unknown"
-          exit_code = stocks
+          def yesno(v):
+              return "✅" if v else "❌"
 
-          msg = title + "\n"
-
-          if Path("result.json").exists() and Path("result.json").stat().st_size > 0:
-              raw = Path("result.json").read_text(encoding="utf-8", errors="ignore")
+          def fmt_pct(v):
+              if v is None:
+                  return "-"
               try:
-                  data = json.loads(raw)
-                  pretty = json.dumps(data, ensure_ascii=False, indent=2)
-                  msg += "✅ 分析结果：\n\n" + pretty
+                  return f"{float(v):+.2f}%"
               except Exception:
-                  msg += "✅ 原始分析输出：\n\n" + raw
-          else:
+                  return str(v)
+
+          def signal_cn(sig):
+              return {
+                  "BREAKOUT": "🚀 已突破",
+                  "WATCH": "👀 等突破",
+                  "WEAK_BREAKOUT": "⚠️ 弱突破",
+                  "NONE": "— 未触发",
+              }.get(sig, sig or "-")
+
+          msg = []
+          msg.append("📈 A股30分钟突破监控")
+          msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
+          msg.append("")
+
+          if not Path("result.json").exists() or Path("result.json").stat().st_size == 0:
               log = Path("run.log").read_text(encoding="utf-8", errors="ignore") if Path("run.log").exists() else ""
-              msg += "⚠️ 没有生成 result.json，以下是运行日志尾部：\n\n"
-              msg += "\n".join(log.splitlines()[-120:])
+              msg.append("⚠️ 本次没有生成分析结果。")
+              msg.append("")
+              msg.append("运行日志尾部：")
+              msg.append("\n".join(log.splitlines()[-80:]))
+              Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
+              raise SystemExit(0)
 
-          msg += f"\n\nExit code: {exit_code}"
+          raw = Path("result.json").read_text(encoding="utf-8", errors="ignore")
 
-          Path("telegram_message.txt").write_text(msg[:12000], encoding="utf-8")
+          try:
+              data = json.loads(raw)
+          except Exception:
+              msg.append("⚠️ result.json 解析失败，原始输出如下：")
+              msg.append(raw[:10000])
+              Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
+              raise SystemExit(0)
+
+          summary = data.get("summary", {})
+          total = summary.get("total", 0)
+          ok = summary.get("ok", 0)
+          errors = summary.get("errors", 0)
+          candidates = data.get("candidates", [])
+          all_results = data.get("all_results", [])
+          err_list = data.get("errors", [])
+
+          msg.append(f"📊 扫描：{total} 只")
+          msg.append(f"✅ 成功：{ok} 只")
+          msg.append(f"❌ 异常：{errors} 只")
+          msg.append(f"🎯 候选：{len(candidates)} 只")
+          msg.append("")
+
+          if candidates:
+              msg.append("🔥 候选股票")
+              for x in candidates:
+                  code = x.get("code", "-")
+                  sig = signal_cn(x.get("signal"))
+                  price = x.get("last_price", "-")
+                  high = x.get("structure_high_60", "-")
+                  bp = fmt_pct(x.get("breakout_pct"))
+                  score = x.get("score", "-")
+                  decision = x.get("decision", "-")
+                  cond = x.get("conditions", {})
+
+                  msg.append(f"{code}｜{sig}｜得分 {score}")
+                  msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}")
+                  msg.append(
+                      f"A高点共振 {yesno(cond.get('A_high_resonance_5_20_60'))} "
+                      f"B低点抬高 {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
+                      f"D突破 {yesno(cond.get('D_price_above_structure_high'))}"
+                  )
+                  msg.append(f"结论：{decision}")
+                  msg.append("")
+          else:
+              msg.append("🎯 本次没有触发候选。")
+              msg.append("")
+
+          if all_results:
+              msg.append("📋 明细")
+              for x in all_results:
+                  code = x.get("code", "-")
+                  sig = signal_cn(x.get("signal"))
+                  price = x.get("last_price", "-")
+                  high = x.get("structure_high_60", "-")
+                  bp = fmt_pct(x.get("breakout_pct"))
+                  score = x.get("score", "-")
+                  source = x.get("data_source", "-")
+                  latest_time = x.get("latest_time", "-")
+                  cond = x.get("conditions", {})
+
+                  msg.append(f"{code}｜{sig}｜得分 {score}")
+                  msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}")
+                  msg.append(
+                      f"A {yesno(cond.get('A_high_resonance_5_20_60'))} "
+                      f"B {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
+                      f"D {yesno(cond.get('D_price_above_structure_high'))}"
+                  )
+                  msg.append(f"数据源：{source}｜K线时间：{latest_time}")
+                  msg.append("")
+
+          if err_list:
+              msg.append("⚠️ 异常")
+              for e in err_list[:8]:
+                  msg.append(f"{e.get('code', '-')}: {e.get('error', '-')}")
+              msg.append("")
+
+          msg.append("规则：")
+          msg.append("A = 5/20/60 高点共振")
+          msg.append("B = 近2根低点不破近5根低点")
+          msg.append("D = 当前价突破60根结构高点")
+
+          Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
           PY
-
+          
       - name: Send Telegram
         run: |
           python - <<'PY'
