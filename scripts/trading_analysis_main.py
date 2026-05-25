@@ -1,6 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+TradingAgents-CN Telegram Only
+30分钟突破扫描脚本
+
+特点：
+1. 不用 Docker
+2. 不用本地部署
+3. 不用 GitHub Pages
+4. 不创建 Issue
+5. GitHub Actions 直接跑 Python
+6. 结果输出 JSON，由 workflow 推送 Telegram
+
+数据源顺序：
+1. Yahoo Finance：适合 GitHub Actions 海外环境，优先
+2. 腾讯行情：备用
+3. 东方财富：备用
+4. 新浪行情：备用
+
+A股代码映射：
+000001 -> 000001.SZ
+002463 -> 002463.SZ
+600000 -> 600000.SS
+"""
+
 import argparse
 import json
 import random
@@ -18,20 +42,34 @@ USER_AGENTS = [
 ]
 
 
-def headers():
-    return {
+def make_headers(extra=None):
+    h = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Connection": "close",
     }
+    if extra:
+        h.update(extra)
+    return h
 
 
 def to_float(v):
     try:
+        if v is None:
+            return None
         return float(str(v).replace(",", "").strip())
     except Exception:
         return None
+
+
+def yahoo_symbol(code: str) -> str:
+    code = code.strip()
+    if code.startswith("6"):
+        return f"{code}.SS"
+    if code.startswith(("0", "2", "3")):
+        return f"{code}.SZ"
+    return code
 
 
 def tencent_symbol(code: str) -> str:
@@ -59,9 +97,111 @@ def sina_symbol(code: str) -> str:
     return "sz" + code
 
 
+def fetch_yahoo_30m(code: str):
+    """
+    Yahoo Finance 30分钟K线。
+    适合 GitHub Actions 海外环境。
+    """
+    symbol = yahoo_symbol(code)
+
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
+    ]
+
+    params = {
+        "range": "60d",
+        "interval": "30m",
+        "includePrePost": "false",
+        "events": "history",
+    }
+
+    last_err = None
+
+    for url in urls:
+        for _ in range(3):
+            try:
+                r = requests.get(
+                    url,
+                    params=params,
+                    headers=make_headers({"Referer": "https://finance.yahoo.com/"}),
+                    timeout=25,
+                )
+                r.raise_for_status()
+                data = r.json()
+
+                chart = data.get("chart", {})
+                err = chart.get("error")
+                if err:
+                    raise RuntimeError(str(err))
+
+                result = chart.get("result")
+                if not result:
+                    raise RuntimeError("Yahoo result 为空")
+
+                item = result[0]
+                timestamps = item.get("timestamp") or []
+
+                indicators = item.get("indicators", {})
+                quote_list = indicators.get("quote") or []
+                if not quote_list:
+                    raise RuntimeError("Yahoo quote 为空")
+
+                quote = quote_list[0]
+                opens = quote.get("open") or []
+                highs = quote.get("high") or []
+                lows = quote.get("low") or []
+                closes = quote.get("close") or []
+                volumes = quote.get("volume") or []
+
+                bars = []
+
+                for i, ts in enumerate(timestamps):
+                    try:
+                        o = to_float(opens[i]) if i < len(opens) else None
+                        h = to_float(highs[i]) if i < len(highs) else None
+                        l = to_float(lows[i]) if i < len(lows) else None
+                        c = to_float(closes[i]) if i < len(closes) else None
+                        v = to_float(volumes[i]) if i < len(volumes) else None
+
+                        if all(x is not None for x in [o, h, l, c]):
+                            bj_time = datetime.fromtimestamp(ts, timezone.utc) + timedelta(hours=8)
+                            bars.append(
+                                {
+                                    "time": bj_time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "open": o,
+                                    "high": h,
+                                    "low": l,
+                                    "close": c,
+                                    "volume": v,
+                                    "source": "yahoo",
+                                }
+                            )
+                    except Exception:
+                        continue
+
+                if len(bars) >= 65:
+                    return bars
+
+                last_err = f"Yahoo返回数据不足：{len(bars)}"
+
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(1)
+
+    raise RuntimeError(last_err or "Yahoo未知错误")
+
+
 def fetch_tencent_30m(code: str, lmt: int = 260):
+    """
+    腾讯 30分钟K线备用。
+    """
     symbol = tencent_symbol(code)
-    url = "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline"
+
+    urls = [
+        "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline",
+        "https://web3.ifzq.gtimg.cn/appstock/app/kline/mkline",
+    ]
 
     params = {
         "param": f"{symbol},m30,,{lmt}",
@@ -69,50 +209,58 @@ def fetch_tencent_30m(code: str, lmt: int = 260):
 
     last_err = None
 
-    for _ in range(3):
-        try:
-            r = requests.get(url, params=params, headers=headers(), timeout=20)
-            r.raise_for_status()
-            data = r.json()
+    for url in urls:
+        for _ in range(2):
+            try:
+                r = requests.get(url, params=params, headers=make_headers(), timeout=20)
+                r.raise_for_status()
+                data = r.json()
 
-            node = data.get("data", {}).get(symbol, {})
-            rows = node.get("m30") or node.get("qfqm30") or []
+                node = data.get("data", {}).get(symbol, {})
+                rows = node.get("m30") or node.get("qfqm30") or []
 
-            bars = []
-            for row in rows:
-                if not isinstance(row, list) or len(row) < 6:
-                    continue
+                bars = []
 
-                t = row[0]
-                o = to_float(row[1])
-                c = to_float(row[2])
-                h = to_float(row[3])
-                l = to_float(row[4])
-                v = to_float(row[5])
+                for row in rows:
+                    if not isinstance(row, list) or len(row) < 6:
+                        continue
 
-                if all(x is not None for x in [o, h, l, c]):
-                    bars.append({
-                        "time": t,
-                        "open": o,
-                        "high": h,
-                        "low": l,
-                        "close": c,
-                        "volume": v,
-                        "source": "tencent",
-                    })
+                    t = row[0]
+                    o = to_float(row[1])
+                    c = to_float(row[2])
+                    h = to_float(row[3])
+                    l = to_float(row[4])
+                    v = to_float(row[5])
 
-            if len(bars) >= 65:
-                return bars
+                    if all(x is not None for x in [o, h, l, c]):
+                        bars.append(
+                            {
+                                "time": t,
+                                "open": o,
+                                "high": h,
+                                "low": l,
+                                "close": c,
+                                "volume": v,
+                                "source": "tencent",
+                            }
+                        )
 
-            last_err = f"腾讯返回数据不足：{len(bars)}"
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(1)
+                if len(bars) >= 65:
+                    return bars
 
-    raise RuntimeError(last_err)
+                last_err = f"腾讯返回数据不足：{len(bars)}"
+
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(1)
+
+    raise RuntimeError(last_err or "腾讯未知错误")
 
 
 def fetch_eastmoney_30m(code: str, lmt: int = 260):
+    """
+    东方财富 30分钟K线备用。
+    """
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
     params = {
@@ -131,10 +279,12 @@ def fetch_eastmoney_30m(code: str, lmt: int = 260):
 
     for _ in range(3):
         try:
-            h = headers()
-            h["Referer"] = "https://quote.eastmoney.com/"
-
-            r = requests.get(url, params=params, headers=h, timeout=20)
+            r = requests.get(
+                url,
+                params=params,
+                headers=make_headers({"Referer": "https://quote.eastmoney.com/"}),
+                timeout=20,
+            )
             r.raise_for_status()
             data = r.json()
 
@@ -143,6 +293,7 @@ def fetch_eastmoney_30m(code: str, lmt: int = 260):
                 klines = data["data"].get("klines") or []
 
             bars = []
+
             for line in klines:
                 parts = str(line).split(",")
                 if len(parts) < 6:
@@ -151,33 +302,39 @@ def fetch_eastmoney_30m(code: str, lmt: int = 260):
                 t = parts[0]
                 o = to_float(parts[1])
                 c = to_float(parts[2])
-                h2 = to_float(parts[3])
+                h = to_float(parts[3])
                 l = to_float(parts[4])
                 v = to_float(parts[5])
 
-                if all(x is not None for x in [o, h2, l, c]):
-                    bars.append({
-                        "time": t,
-                        "open": o,
-                        "high": h2,
-                        "low": l,
-                        "close": c,
-                        "volume": v,
-                        "source": "eastmoney",
-                    })
+                if all(x is not None for x in [o, h, l, c]):
+                    bars.append(
+                        {
+                            "time": t,
+                            "open": o,
+                            "high": h,
+                            "low": l,
+                            "close": c,
+                            "volume": v,
+                            "source": "eastmoney",
+                        }
+                    )
 
             if len(bars) >= 65:
                 return bars
 
             last_err = f"东方财富返回数据不足：{len(bars)}"
+
         except Exception as e:
             last_err = str(e)
             time.sleep(1)
 
-    raise RuntimeError(last_err)
+    raise RuntimeError(last_err or "东方财富未知错误")
 
 
 def fetch_sina_30m(code: str, lmt: int = 260):
+    """
+    新浪 30分钟K线备用。
+    """
     symbol = sina_symbol(code)
     url = "https://quotes.sina.cn/cn/api/openapi.php/CN_MinlineService.getMinlineData"
 
@@ -192,7 +349,7 @@ def fetch_sina_30m(code: str, lmt: int = 260):
 
     for _ in range(3):
         try:
-            r = requests.get(url, params=params, headers=headers(), timeout=20)
+            r = requests.get(url, params=params, headers=make_headers(), timeout=20)
             r.raise_for_status()
             text = r.text.strip()
 
@@ -205,6 +362,7 @@ def fetch_sina_30m(code: str, lmt: int = 260):
             rows = data.get("result", {}).get("data", []) or []
 
             bars = []
+
             for x in rows:
                 if not isinstance(x, dict):
                     continue
@@ -217,31 +375,39 @@ def fetch_sina_30m(code: str, lmt: int = 260):
                 v = to_float(x.get("volume"))
 
                 if all(vv is not None for vv in [o, h, l, c]):
-                    bars.append({
-                        "time": t,
-                        "open": o,
-                        "high": h,
-                        "low": l,
-                        "close": c,
-                        "volume": v,
-                        "source": "sina",
-                    })
+                    bars.append(
+                        {
+                            "time": t,
+                            "open": o,
+                            "high": h,
+                            "low": l,
+                            "close": c,
+                            "volume": v,
+                            "source": "sina",
+                        }
+                    )
 
             if len(bars) >= 65:
                 return bars
 
             last_err = f"新浪返回数据不足：{len(bars)}"
+
         except Exception as e:
             last_err = str(e)
             time.sleep(1)
 
-    raise RuntimeError(last_err)
+    raise RuntimeError(last_err or "新浪未知错误")
 
 
 def fetch_30m(code: str):
+    """
+    多数据源容错。
+    GitHub Actions 在海外环境，优先 Yahoo。
+    """
     errors = []
 
     for name, fn in [
+        ("yahoo", fetch_yahoo_30m),
         ("tencent", fetch_tencent_30m),
         ("eastmoney", fetch_eastmoney_30m),
         ("sina", fetch_sina_30m),
@@ -268,6 +434,9 @@ def near(a, b, tolerance=0.003):
 
 def analyze_one(code: str):
     bars = fetch_30m(code)
+
+    if len(bars) < 65:
+        raise RuntimeError(f"{code} 30分钟K线不足，当前只有 {len(bars)} 根")
 
     latest = bars[-1]
     hist = bars[:-1]
@@ -316,6 +485,11 @@ def analyze_one(code: str):
         "last_price": round(last_price, 3),
         "structure_high_60": round(structure_high, 3),
         "breakout_pct": None if breakout_pct is None else round(breakout_pct, 2),
+        "high_5": round(high_5, 3),
+        "high_20": round(high_20, 3),
+        "high_60": round(high_60, 3),
+        "low_2": round(low_2, 3),
+        "low_5": round(low_5, 3),
         "conditions": {
             "A_high_resonance_5_20_60": cond_a,
             "B_low_not_breaking_2_vs_5": cond_b,
@@ -345,13 +519,16 @@ def main():
         try:
             results.append(analyze_one(code))
         except Exception as e:
-            errors.append({
-                "code": code,
-                "error": str(e),
-            })
+            errors.append(
+                {
+                    "code": code,
+                    "error": str(e),
+                }
+            )
 
     candidates = [
-        x for x in results
+        x
+        for x in results
         if x["signal"] in ("BREAKOUT", "WATCH", "WEAK_BREAKOUT")
     ]
 
