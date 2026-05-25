@@ -15,12 +15,12 @@ on:
     - cron: "5,35 5 * * 1-5"
 
     # 北京时间 14:05、14:35
-    - cron: "5,35 6 * * 1-5”
-    
+    - cron: "5,35 6 * * 1-5"
+
   workflow_dispatch:
     inputs:
       stocks:
-        description: "股票代码，逗号分隔，如：000001,000858,001979"
+        description: "股票代码，逗号分隔，如：000001,002463,000006"
         required: false
         default: "000001,002463,000006"
       analysis_type:
@@ -44,12 +44,11 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # 如果你的分析代码需要模型 Key，就保留；没有也不影响 Telegram 发送
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
-      STOCKS: ${{ github.event.inputs.stocks || '000001,000858,001979' }}
+      STOCKS: ${{ github.event.inputs.stocks || '000001,002463,000006' }}
       ANALYSIS_TYPE: ${{ github.event.inputs.analysis_type || 'quick' }}
 
     steps:
@@ -238,7 +237,7 @@ jobs:
 
           Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
           PY
-          
+
       - name: Send Telegram
         run: |
           python - <<'PY'
@@ -253,13 +252,11 @@ jobs:
               raise SystemExit("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID")
 
           text = Path("telegram_message.txt").read_text(encoding="utf-8", errors="ignore")
-
           url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-          # Telegram 单条消息长度有限，分段发送
           chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
 
-          for i, chunk in enumerate(chunks, 1):
+          for chunk in chunks:
               payload = {
                   "chat_id": chat_id,
                   "text": chunk,
