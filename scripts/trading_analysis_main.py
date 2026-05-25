@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import random
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -10,17 +11,20 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://quote.eastmoney.com/",
-}
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+]
 
 
-def eastmoney_secid(code: str) -> str:
-    code = code.strip()
-    if code.startswith("6"):
-        return f"1.{code}"   # 上海
-    return f"0.{code}"       # 深圳
+def headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "close",
+    }
 
 
 def to_float(v):
@@ -30,11 +34,85 @@ def to_float(v):
         return None
 
 
+def tencent_symbol(code: str) -> str:
+    code = code.strip()
+    if code.startswith("6"):
+        return "sh" + code
+    if code.startswith(("0", "2", "3")):
+        return "sz" + code
+    if code.startswith(("4", "8")):
+        return "bj" + code
+    return code
+
+
+def eastmoney_secid(code: str) -> str:
+    code = code.strip()
+    if code.startswith("6"):
+        return f"1.{code}"
+    return f"0.{code}"
+
+
+def sina_symbol(code: str) -> str:
+    code = code.strip()
+    if code.startswith("6"):
+        return "sh" + code
+    return "sz" + code
+
+
+def fetch_tencent_30m(code: str, lmt: int = 260):
+    symbol = tencent_symbol(code)
+    url = "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline"
+
+    params = {
+        "param": f"{symbol},m30,,{lmt}",
+    }
+
+    last_err = None
+
+    for _ in range(3):
+        try:
+            r = requests.get(url, params=params, headers=headers(), timeout=20)
+            r.raise_for_status()
+            data = r.json()
+
+            node = data.get("data", {}).get(symbol, {})
+            rows = node.get("m30") or node.get("qfqm30") or []
+
+            bars = []
+            for row in rows:
+                if not isinstance(row, list) or len(row) < 6:
+                    continue
+
+                t = row[0]
+                o = to_float(row[1])
+                c = to_float(row[2])
+                h = to_float(row[3])
+                l = to_float(row[4])
+                v = to_float(row[5])
+
+                if all(x is not None for x in [o, h, l, c]):
+                    bars.append({
+                        "time": t,
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                        "source": "tencent",
+                    })
+
+            if len(bars) >= 65:
+                return bars
+
+            last_err = f"腾讯返回数据不足：{len(bars)}"
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1)
+
+    raise RuntimeError(last_err)
+
+
 def fetch_eastmoney_30m(code: str, lmt: int = 260):
-    """
-    东方财富 30分钟K线。
-    GitHub Actions 可直接跑，不依赖 akshare，不需要 Docker。
-    """
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
     params = {
@@ -53,39 +131,39 @@ def fetch_eastmoney_30m(code: str, lmt: int = 260):
 
     for _ in range(3):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            h = headers()
+            h["Referer"] = "https://quote.eastmoney.com/"
+
+            r = requests.get(url, params=params, headers=h, timeout=20)
             r.raise_for_status()
             data = r.json()
 
-            klines = (
-                data.get("data", {}).get("klines")
-                if isinstance(data.get("data"), dict)
-                else []
-            )
+            klines = []
+            if isinstance(data.get("data"), dict):
+                klines = data["data"].get("klines") or []
 
             bars = []
-
-            for line in klines or []:
+            for line in klines:
                 parts = str(line).split(",")
-
                 if len(parts) < 6:
                     continue
 
                 t = parts[0]
                 o = to_float(parts[1])
                 c = to_float(parts[2])
-                h = to_float(parts[3])
+                h2 = to_float(parts[3])
                 l = to_float(parts[4])
                 v = to_float(parts[5])
 
-                if all(x is not None for x in [o, h, l, c]):
+                if all(x is not None for x in [o, h2, l, c]):
                     bars.append({
                         "time": t,
                         "open": o,
-                        "high": h,
+                        "high": h2,
                         "low": l,
                         "close": c,
                         "volume": v,
+                        "source": "eastmoney",
                     })
 
             if len(bars) >= 65:
@@ -96,7 +174,84 @@ def fetch_eastmoney_30m(code: str, lmt: int = 260):
             last_err = str(e)
             time.sleep(1)
 
-    raise RuntimeError(f"{code} 获取30分钟K线失败：{last_err}")
+    raise RuntimeError(last_err)
+
+
+def fetch_sina_30m(code: str, lmt: int = 260):
+    symbol = sina_symbol(code)
+    url = "https://quotes.sina.cn/cn/api/openapi.php/CN_MinlineService.getMinlineData"
+
+    params = {
+        "symbol": symbol,
+        "scale": "30",
+        "ma": "no",
+        "datalen": str(lmt),
+    }
+
+    last_err = None
+
+    for _ in range(3):
+        try:
+            r = requests.get(url, params=params, headers=headers(), timeout=20)
+            r.raise_for_status()
+            text = r.text.strip()
+
+            if not text.startswith("{"):
+                m = re.search(r"\{.*\}", text, re.S)
+                if m:
+                    text = m.group(0)
+
+            data = json.loads(text)
+            rows = data.get("result", {}).get("data", []) or []
+
+            bars = []
+            for x in rows:
+                if not isinstance(x, dict):
+                    continue
+
+                t = x.get("day") or x.get("time") or x.get("date")
+                o = to_float(x.get("open"))
+                h = to_float(x.get("high"))
+                l = to_float(x.get("low"))
+                c = to_float(x.get("close"))
+                v = to_float(x.get("volume"))
+
+                if all(vv is not None for vv in [o, h, l, c]):
+                    bars.append({
+                        "time": t,
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                        "source": "sina",
+                    })
+
+            if len(bars) >= 65:
+                return bars
+
+            last_err = f"新浪返回数据不足：{len(bars)}"
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1)
+
+    raise RuntimeError(last_err)
+
+
+def fetch_30m(code: str):
+    errors = []
+
+    for name, fn in [
+        ("tencent", fetch_tencent_30m),
+        ("eastmoney", fetch_eastmoney_30m),
+        ("sina", fetch_sina_30m),
+    ]:
+        try:
+            return fn(code)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+
+    raise RuntimeError("全部数据源失败；" + " | ".join(errors))
 
 
 def pct(a, b):
@@ -112,7 +267,7 @@ def near(a, b, tolerance=0.003):
 
 
 def analyze_one(code: str):
-    bars = fetch_eastmoney_30m(code)
+    bars = fetch_30m(code)
 
     latest = bars[-1]
     hist = bars[:-1]
@@ -156,6 +311,7 @@ def analyze_one(code: str):
 
     return {
         "code": code,
+        "data_source": latest.get("source"),
         "latest_time": latest["time"],
         "last_price": round(last_price, 3),
         "structure_high_60": round(structure_high, 3),
