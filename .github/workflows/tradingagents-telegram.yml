@@ -2,12 +2,22 @@ name: TradingAgents Telegram Only
 
 on:
   schedule:
+  schedule:
     # 北京时间 09:35
     - cron: "35 1 * * 1-5"
-    # 北京时间 11:30
-    - cron: "30 3 * * 1-5"
-    # 北京时间 14:30
-    - cron: "30 6 * * 1-5"
+
+    # 北京时间 10:05、10:35
+    - cron: "5,35 2 * * 1-5"
+
+    # 北京时间 11:05、11:35
+    - cron: "5,35 3 * * 1-5"
+
+    # 北京时间 13:05、13:35
+    - cron: "5,35 5 * * 1-5"
+
+    # 北京时间 14:05、14:35
+    - cron: "5,35 6 * * 1-5”
+    
   workflow_dispatch:
     inputs:
       stocks:
