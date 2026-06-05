@@ -23,6 +23,24 @@ on:
         description: "股票代码，逗号分隔，如：000001,002463,000006"
         required: false
         default: "002463,000006"
+      kline_period:
+        description: "K线周期"
+        required: false
+        type: choice
+        options:
+          - 15m
+          - 30m
+          - 60m
+        default: "15m"
+      signal_mode:
+        description: "信号模式"
+        required: false
+        type: choice
+        options:
+          - strict
+          - balanced
+          - relaxed
+        default: "balanced"
       analysis_type:
         description: "分析类型"
         required: false
@@ -49,6 +67,8 @@ jobs:
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       STOCKS: ${{ github.event.inputs.stocks || '000001,002463,000006' }}
+      KLINE_PERIOD: ${{ github.event.inputs.kline_period || '15m' }}
+      SIGNAL_MODE: ${{ github.event.inputs.signal_mode || 'balanced' }}
       ANALYSIS_TYPE: ${{ github.event.inputs.analysis_type || 'quick' }}
 
     steps:
@@ -78,6 +98,8 @@ jobs:
           echo "====== TradingAgents Telegram Only ======" > run.log
           echo "Time UTC: $(date -u '+%Y-%m-%d %H:%M:%S')" >> run.log
           echo "Stocks: $STOCKS" >> run.log
+          echo "Kline Period: $KLINE_PERIOD" >> run.log
+          echo "Signal Mode: $SIGNAL_MODE" >> run.log
           echo "Analysis Type: $ANALYSIS_TYPE" >> run.log
           echo "" >> run.log
 
@@ -94,6 +116,8 @@ jobs:
           if [ -f scripts/trading_analysis_main.py ]; then
             python scripts/trading_analysis_main.py \
               --stocks "$STOCKS" \
+              --period "$KLINE_PERIOD" \
+              --signal-mode "$SIGNAL_MODE" \
               --analysis_type "$ANALYSIS_TYPE" \
               --output json \
               > result.json 2>> run.log
@@ -139,10 +163,6 @@ jobs:
               }.get(sig, sig or "-")
 
           msg = []
-          msg.append("📈 A股30分钟突破监控")
-          msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
-          msg.append("")
-
           if not Path("result.json").exists() or Path("result.json").stat().st_size == 0:
               log = Path("run.log").read_text(encoding="utf-8", errors="ignore") if Path("run.log").exists() else ""
               msg.append("⚠️ 本次没有生成分析结果。")
@@ -166,9 +186,17 @@ jobs:
           total = summary.get("total", 0)
           ok = summary.get("ok", 0)
           errors = summary.get("errors", 0)
+          period = data.get("period", "15m")
+          signal_mode = data.get("signal_mode", "balanced")
+          title = data.get("title", "TradingAgents-CN 突破扫描")
           candidates = data.get("candidates", [])
           all_results = data.get("all_results", [])
           err_list = data.get("errors", [])
+
+          msg.append(f"📈 {title}")
+          msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
+          msg.append(f"周期：{period}｜模式：{signal_mode}")
+          msg.append("")
 
           msg.append(f"📊 扫描：{total} 只")
           msg.append(f"✅ 成功：{ok} 只")
@@ -232,8 +260,8 @@ jobs:
 
           msg.append("规则：")
           msg.append("A = 5/20/60 高点共振")
-          msg.append("B = 近2根低点不破近5根低点")
-          msg.append("D = 当前价突破60根结构高点")
+          msg.append("B = 近2根低点不破近5根低点（按模式可放宽）")
+          msg.append("D = 当前价突破60根结构高点（按模式可放宽）")
 
           Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
           PY

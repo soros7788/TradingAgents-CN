@@ -3,7 +3,7 @@
 
 """
 TradingAgents-CN Telegram Only
-30分钟突破扫描脚本
+可配置周期的突破扫描脚本
 
 特点：
 1. 不用 Docker
@@ -12,6 +12,10 @@ TradingAgents-CN Telegram Only
 4. 不创建 Issue
 5. GitHub Actions 直接跑 Python
 6. 结果输出 JSON，由 workflow 推送 Telegram
+
+默认配置偏向提高信号命中率：
+- 周期：15分钟
+- 信号模式：balanced
 
 数据源顺序：
 1. Yahoo Finance：适合 GitHub Actions 海外环境，优先
@@ -40,6 +44,18 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
 ]
+
+PERIOD_CONFIG = {
+    "15m": {"label": "15分钟", "yahoo_interval": "15m", "tencent_key": "m15", "eastmoney_klt": "15", "sina_scale": "15"},
+    "30m": {"label": "30分钟", "yahoo_interval": "30m", "tencent_key": "m30", "eastmoney_klt": "30", "sina_scale": "30"},
+    "60m": {"label": "60分钟", "yahoo_interval": "60m", "tencent_key": "m60", "eastmoney_klt": "60", "sina_scale": "60"},
+}
+
+SIGNAL_MODES = {
+    "strict": {"high_tolerance": 0.003, "low_floor_ratio": 1.000, "breakout_buffer": 0.003},
+    "balanced": {"high_tolerance": 0.008, "low_floor_ratio": 0.997, "breakout_buffer": 0.0015},
+    "relaxed": {"high_tolerance": 0.015, "low_floor_ratio": 0.995, "breakout_buffer": 0.0000},
+}
 
 
 def make_headers(extra=None):
@@ -95,6 +111,225 @@ def sina_symbol(code: str) -> str:
     if code.startswith("6"):
         return "sh" + code
     return "sz" + code
+
+
+def _period_cfg(period: str) -> dict:
+    period = (period or "15m").strip().lower()
+    if period not in PERIOD_CONFIG:
+        raise ValueError(f"不支持的周期: {period}，可选值: {', '.join(PERIOD_CONFIG)}")
+    return PERIOD_CONFIG[period]
+
+
+def _source_rows_to_bars(rows, source_name: str):
+    bars = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        t = row.get("time")
+        o = to_float(row.get("open"))
+        h = to_float(row.get("high"))
+        l = to_float(row.get("low"))
+        c = to_float(row.get("close"))
+        v = to_float(row.get("volume"))
+        if all(x is not None for x in [o, h, l, c]):
+            bars.append(
+                {
+                    "time": t,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
+                    "source": source_name,
+                }
+            )
+    return bars
+
+
+def fetch_yahoo_kline(code: str, period: str):
+    cfg = _period_cfg(period)
+    symbol = yahoo_symbol(code)
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
+    ]
+    params = {
+        "range": "60d",
+        "interval": cfg["yahoo_interval"],
+        "includePrePost": "false",
+        "events": "history",
+    }
+    last_err = None
+    for url in urls:
+        for _ in range(3):
+            try:
+                r = requests.get(
+                    url,
+                    params=params,
+                    headers=make_headers({"Referer": "https://finance.yahoo.com/"}),
+                    timeout=25,
+                )
+                r.raise_for_status()
+                data = r.json()
+                chart = data.get("chart", {})
+                err = chart.get("error")
+                if err:
+                    raise RuntimeError(str(err))
+                result = chart.get("result")
+                if not result:
+                    raise RuntimeError("Yahoo result 为空")
+                item = result[0]
+                timestamps = item.get("timestamp") or []
+                indicators = item.get("indicators", {})
+                quote_list = indicators.get("quote") or []
+                if not quote_list:
+                    raise RuntimeError("Yahoo quote 为空")
+                quote = quote_list[0]
+                opens = quote.get("open") or []
+                highs = quote.get("high") or []
+                lows = quote.get("low") or []
+                closes = quote.get("close") or []
+                volumes = quote.get("volume") or []
+                rows = []
+                for i, ts in enumerate(timestamps):
+                    o = to_float(opens[i]) if i < len(opens) else None
+                    h = to_float(highs[i]) if i < len(highs) else None
+                    l = to_float(lows[i]) if i < len(lows) else None
+                    c = to_float(closes[i]) if i < len(closes) else None
+                    v = to_float(volumes[i]) if i < len(volumes) else None
+                    if all(x is not None for x in [o, h, l, c]):
+                        bj_time = datetime.fromtimestamp(ts, timezone.utc) + timedelta(hours=8)
+                        rows.append({"time": bj_time.strftime("%Y-%m-%d %H:%M:%S"), "open": o, "high": h, "low": l, "close": c, "volume": v})
+                bars = _source_rows_to_bars(rows, "yahoo")
+                if len(bars) >= 65:
+                    return bars
+                last_err = f"Yahoo返回数据不足：{len(bars)}"
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(1)
+    raise RuntimeError(last_err or "Yahoo未知错误")
+
+
+def fetch_tencent_kline(code: str, period: str, lmt: int = 260):
+    cfg = _period_cfg(period)
+    symbol = tencent_symbol(code)
+    urls = [
+        "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline",
+        "https://web3.ifzq.gtimg.cn/appstock/app/kline/mkline",
+    ]
+    params = {"param": f"{symbol},{cfg['tencent_key']},,{lmt}"}
+    last_err = None
+    for url in urls:
+        for _ in range(2):
+            try:
+                r = requests.get(url, params=params, headers=make_headers(), timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                node = data.get("data", {}).get(symbol, {})
+                rows = node.get(cfg["tencent_key"]) or []
+                bars = _source_rows_to_bars(
+                    [
+                        {"time": row[0], "open": row[1], "close": row[2], "high": row[3], "low": row[4], "volume": row[5]}
+                        for row in rows
+                        if isinstance(row, list) and len(row) >= 6
+                    ],
+                    "tencent",
+                )
+                if len(bars) >= 65:
+                    return bars
+                last_err = f"腾讯返回数据不足：{len(bars)}"
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(1)
+    raise RuntimeError(last_err or "腾讯未知错误")
+
+
+def fetch_eastmoney_kline(code: str, period: str, lmt: int = 260):
+    cfg = _period_cfg(period)
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": eastmoney_secid(code),
+        "klt": cfg["eastmoney_klt"],
+        "fqt": "1",
+        "lmt": str(lmt),
+        "end": "20500101",
+        "iscca": "1",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+    }
+    last_err = None
+    for _ in range(3):
+        try:
+            r = requests.get(url, params=params, headers=make_headers({"Referer": "https://quote.eastmoney.com/"}), timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            klines = []
+            if isinstance(data.get("data"), dict):
+                klines = data["data"].get("klines") or []
+            rows = []
+            for line in klines:
+                parts = str(line).split(",")
+                if len(parts) < 6:
+                    continue
+                rows.append({"time": parts[0], "open": parts[1], "close": parts[2], "high": parts[3], "low": parts[4], "volume": parts[5]})
+            bars = _source_rows_to_bars(rows, "eastmoney")
+            if len(bars) >= 65:
+                return bars
+            last_err = f"东方财富返回数据不足：{len(bars)}"
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1)
+    raise RuntimeError(last_err or "东方财富未知错误")
+
+
+def fetch_sina_kline(code: str, period: str, lmt: int = 260):
+    cfg = _period_cfg(period)
+    symbol = sina_symbol(code)
+    url = "https://quotes.sina.cn/cn/api/openapi.php/CN_MinlineService.getMinlineData"
+    params = {"symbol": symbol, "scale": cfg["sina_scale"], "ma": "no", "datalen": str(lmt)}
+    last_err = None
+    for _ in range(3):
+        try:
+            r = requests.get(url, params=params, headers=make_headers(), timeout=20)
+            r.raise_for_status()
+            text = r.text.strip()
+            if not text.startswith("{"):
+                m = re.search(r"\{.*\}", text, re.S)
+                if m:
+                    text = m.group(0)
+            data = json.loads(text)
+            rows = data.get("result", {}).get("data", []) or []
+            bars = _source_rows_to_bars(
+                [
+                    {"time": x.get("day") or x.get("time") or x.get("date"), "open": x.get("open"), "close": x.get("close"), "high": x.get("high"), "low": x.get("low"), "volume": x.get("volume")}
+                    for x in rows
+                    if isinstance(x, dict)
+                ],
+                "sina",
+            )
+            if len(bars) >= 65:
+                return bars
+            last_err = f"新浪返回数据不足：{len(bars)}"
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1)
+    raise RuntimeError(last_err or "新浪未知错误")
+
+
+def fetch_kline(code: str, period: str):
+    errors = []
+    for name, fn in [
+        ("yahoo", fetch_yahoo_kline),
+        ("tencent", fetch_tencent_kline),
+        ("eastmoney", fetch_eastmoney_kline),
+        ("sina", fetch_sina_kline),
+    ]:
+        try:
+            return fn(code, period)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    raise RuntimeError("全部数据源失败；" + " | ".join(errors))
 
 
 def fetch_yahoo_30m(code: str):
@@ -432,11 +667,13 @@ def near(a, b, tolerance=0.003):
     return abs(a - b) / abs(b) <= tolerance
 
 
-def analyze_one(code: str):
-    bars = fetch_30m(code)
+def analyze_one(code: str, period: str, signal_mode: str):
+    period_cfg = _period_cfg(period)
+    mode_cfg = SIGNAL_MODES.get(signal_mode, SIGNAL_MODES["balanced"])
+    bars = fetch_kline(code, period)
 
     if len(bars) < 65:
-        raise RuntimeError(f"{code} 30分钟K线不足，当前只有 {len(bars)} 根")
+        raise RuntimeError(f"{code} {period_cfg['label']}K线不足，当前只有 {len(bars)} 根")
 
     latest = bars[-1]
     hist = bars[:-1]
@@ -453,9 +690,9 @@ def analyze_one(code: str):
     structure_high = high_60
     breakout_pct = pct(last_price, structure_high)
 
-    cond_a = near(high_5, high_20, 0.003) and near(high_20, high_60, 0.003)
-    cond_b = low_2 >= low_5
-    cond_d = last_price > structure_high
+    cond_a = near(high_5, high_20, mode_cfg["high_tolerance"]) and near(high_20, high_60, mode_cfg["high_tolerance"])
+    cond_b = low_2 >= (low_5 * mode_cfg["low_floor_ratio"])
+    cond_d = last_price > structure_high * (1 + mode_cfg["breakout_buffer"])
 
     score = 0
     if cond_a:
@@ -467,13 +704,13 @@ def analyze_one(code: str):
 
     if cond_d and cond_a and cond_b:
         signal = "BREAKOUT"
-        decision = "触发突破，进入重点观察"
+        decision = f"触发{period_cfg['label']}突破，进入重点观察"
     elif cond_a and cond_b:
         signal = "WATCH"
-        decision = "结构压缩，等待突破"
+        decision = f"{period_cfg['label']}结构压缩，等待突破"
     elif cond_d:
         signal = "WEAK_BREAKOUT"
-        decision = "价格突破，但结构条件不完整"
+        decision = f"价格突破，但{period_cfg['label']}结构条件不完整"
     else:
         signal = "NONE"
         decision = "暂未触发"
@@ -505,6 +742,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stocks", default="000001,000006,002463")
     parser.add_argument("--analysis_type", default="quick")
+    parser.add_argument("--period", default="15m", choices=sorted(PERIOD_CONFIG.keys()))
+    parser.add_argument("--signal-mode", default="balanced", choices=sorted(SIGNAL_MODES.keys()))
     parser.add_argument("--output", default="json")
     args = parser.parse_args()
 
@@ -517,7 +756,7 @@ def main():
 
     for code in stocks:
         try:
-            results.append(analyze_one(code))
+            results.append(analyze_one(code, args.period, args.signal_mode))
         except Exception as e:
             errors.append(
                 {
@@ -535,9 +774,11 @@ def main():
     candidates.sort(key=lambda x: x["score"], reverse=True)
 
     output = {
-        "title": "TradingAgents-CN 30分钟突破扫描",
+        "title": f"TradingAgents-CN {PERIOD_CONFIG[args.period]['label']}突破扫描",
         "beijing_time": bj.strftime("%Y-%m-%d %H:%M:%S"),
         "analysis_type": args.analysis_type,
+        "period": args.period,
+        "signal_mode": args.signal_mode,
         "stocks": stocks,
         "summary": {
             "total": len(stocks),
@@ -549,9 +790,9 @@ def main():
         "all_results": results,
         "errors": errors,
         "rule": {
-            "A": "近5/20/60根30分钟K线高点共振",
-            "B": "近2根低点不低于近5根低点",
-            "D": "当前价突破近60根结构高点",
+            "A": f"近5/20/60根{PERIOD_CONFIG[args.period]['label']}K线高点共振",
+            "B": f"近2根{PERIOD_CONFIG[args.period]['label']}K线低点不低于近5根低点（按模式可放宽）",
+            "D": f"当前价突破近60根结构高点（按模式可放宽）",
         },
     }
 
