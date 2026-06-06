@@ -301,9 +301,9 @@ jobs:
                   msg.append(f"{e.get('code', '-')}: {e.get('error', '-')}")
               msg.append("")
 
-          msg.append("规则：A=5/20/60高点共振｜B=近2根低点不破近5根低点｜D=突破60根结构高点")
-          msg.append("日线：trend=趋势股｜momentum=强势股｜pullback=回撤后再起")
-          msg.append("时效：超过最大延迟的K线会标记为 stale，并跳过强信号判断")
+          msg.append("规则：A高点共振｜B低点不破｜D突破结构高点")
+          msg.append("日线：trend=趋势｜momentum=强势｜pullback=回撤再起")
+          msg.append("时效：超时=stale，跳过强信号")
 
           Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
           PY
