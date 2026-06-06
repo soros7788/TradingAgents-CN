@@ -194,6 +194,14 @@ jobs:
                   "NONE": "— 未触发",
               }.get(sig, sig or "-")
 
+          def daily_filter_cn(mode):
+              return {
+                  "trend": "趋势过滤：看大方向。要求日线收盘站上 MA20，且 MA20 不弱于 MA60，适合顺势票。",
+                  "momentum": "动量过滤：看加速。要求 MA5 强于 MA20，收盘站上 MA5，并接近近期高点，适合强势票。",
+                  "pullback": "回撤过滤：看回踩后再起。要求日线仍在 MA20 上方，但不是贴着高点，且近 10 日已经出现反弹。",
+                  "off": "关闭：不做日线前置过滤，直接看盘中信号。",
+              }.get(mode, f"日线过滤：{mode}")
+
           msg = []
           if not Path("result.json").exists() or Path("result.json").stat().st_size == 0:
               log = Path("run.log").read_text(encoding="utf-8", errors="ignore") if Path("run.log").exists() else ""
@@ -232,6 +240,7 @@ jobs:
           msg.append(f"📈 {title}")
           msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
           msg.append(f"周期：{period}｜模式：{signal_mode}｜日线：{daily_filter_label}({daily_filter_mode})｜阶段：{scan_phase}｜最大延迟：{max_data_lag_minutes}分钟")
+          msg.append(daily_filter_cn(daily_filter_mode))
           msg.append("")
 
           msg.append(f"📊 扫描：{total} 只")
@@ -307,7 +316,10 @@ jobs:
           msg.append("A = 5/20/60 高点共振")
           msg.append("B = 近2根低点不破近5根低点（按模式可放宽）")
           msg.append("D = 当前价突破60根结构高点（按模式可放宽）")
-          msg.append("日线：先过趋势/动量过滤，再看盘中突破")
+          msg.append("日线过滤说明：")
+          msg.append("trend：偏趋势股，先看大方向是否站稳")
+          msg.append("momentum：偏强势股，先看加速是否成立")
+          msg.append("pullback：偏回撤后再启动的票，先看是否回踩后重新抬头")
           msg.append("时效：超过最大延迟的K线会被标记为 stale 并跳过强信号判断")
 
           Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
