@@ -62,6 +62,7 @@ DAILY_FILTER_MODES = {
     "off": {"label": "关闭"},
     "trend": {"label": "趋势过滤"},
     "momentum": {"label": "动量过滤"},
+    "pullback": {"label": "回撤过滤"},
 }
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
@@ -526,9 +527,19 @@ def compute_daily_filter(code: str, mode: str):
     if mode == "trend":
         passed = last_close > ma20 and ma20 >= ma60 and ma20 >= prev_ma20 and ma60 >= prev_ma60 * 0.995
         reason = f"收盘 {last_close:.2f}，MA20 {ma20:.2f}，MA60 {ma60:.2f}"
+    elif mode == "momentum":
+        passed = last_close > ma5 and ma5 > ma20 and last_close >= high20 * 0.98 and ma20 >= ma60 * 0.99
+        reason = f"收盘 {last_close:.2f}，MA5 {ma5:.2f}，MA20 {ma20:.2f}，20日高点 {high20:.2f}"
     else:
-        passed = last_close > ma20 and last_close >= high20 * 0.97 and ma20 >= ma60 * 0.995
-        reason = f"收盘 {last_close:.2f}，MA20 {ma20:.2f}，20日高点 {high20:.2f}"
+        recent_low_10 = min([b["low"] for b in bars[-10:] if b.get("low") is not None], default=last_close)
+        rebound_from_low = recent_low_10 > 0 and (last_close - recent_low_10) / recent_low_10
+        passed = (
+            last_close > ma20
+            and last_close < high20 * 0.995
+            and rebound_from_low >= 0.03
+            and ma20 >= ma60 * 0.985
+        )
+        reason = f"收盘 {last_close:.2f}，近10日低点 {recent_low_10:.2f}，反弹 {rebound_from_low * 100:.1f}%"
 
     return {
         "mode": mode,

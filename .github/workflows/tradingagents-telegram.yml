@@ -49,6 +49,7 @@ on:
           - off
           - trend
           - momentum
+          - pullback
         default: "trend"
       scan_phase:
         description: "扫描阶段"
