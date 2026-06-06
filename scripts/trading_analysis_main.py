@@ -58,6 +58,12 @@ SIGNAL_MODES = {
     "relaxed": {"high_tolerance": 0.015, "low_floor_ratio": 0.995, "breakout_buffer": 0.0000},
 }
 
+DAILY_FILTER_MODES = {
+    "off": {"label": "关闭"},
+    "trend": {"label": "趋势过滤"},
+    "momentum": {"label": "动量过滤"},
+}
+
 CN_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -289,6 +295,69 @@ def fetch_yahoo_kline(code: str, period: str):
     raise RuntimeError(last_err or "Yahoo未知错误")
 
 
+def fetch_yahoo_daily(code: str):
+    symbol = yahoo_symbol(code)
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
+    ]
+    params = {
+        "range": "1y",
+        "interval": "1d",
+        "includePrePost": "false",
+        "events": "history",
+    }
+    last_err = None
+    for url in urls:
+        for _ in range(3):
+            try:
+                r = requests.get(
+                    url,
+                    params=params,
+                    headers=make_headers({"Referer": "https://finance.yahoo.com/"}),
+                    timeout=25,
+                )
+                r.raise_for_status()
+                data = r.json()
+                chart = data.get("chart", {})
+                err = chart.get("error")
+                if err:
+                    raise RuntimeError(str(err))
+                result = chart.get("result")
+                if not result:
+                    raise RuntimeError("Yahoo日线result为空")
+                item = result[0]
+                timestamps = item.get("timestamp") or []
+                indicators = item.get("indicators", {})
+                quote_list = indicators.get("quote") or []
+                if not quote_list:
+                    raise RuntimeError("Yahoo日线quote为空")
+                quote = quote_list[0]
+                opens = quote.get("open") or []
+                highs = quote.get("high") or []
+                lows = quote.get("low") or []
+                closes = quote.get("close") or []
+                volumes = quote.get("volume") or []
+                rows = []
+                for i, ts in enumerate(timestamps):
+                    o = to_float(opens[i]) if i < len(opens) else None
+                    h = to_float(highs[i]) if i < len(highs) else None
+                    l = to_float(lows[i]) if i < len(lows) else None
+                    c = to_float(closes[i]) if i < len(closes) else None
+                    v = to_float(volumes[i]) if i < len(volumes) else None
+                    if all(x is not None for x in [o, h, l, c]):
+                        bj_time = datetime.fromtimestamp(ts, timezone.utc) + timedelta(hours=8)
+                        rows.append({"time": bj_time.strftime("%Y-%m-%d"), "open": o, "high": h, "low": l, "close": c, "volume": v})
+                bars = _source_rows_to_bars(rows, "yahoo_daily")
+                if len(bars) >= 60:
+                    return bars
+                last_err = f"Yahoo日线返回数据不足：{len(bars)}"
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(1)
+    raise RuntimeError(last_err or "Yahoo日线未知错误")
+
+
 def fetch_tencent_kline(code: str, period: str, lmt: int = 260):
     cfg = _period_cfg(period)
     symbol = tencent_symbol(code)
@@ -409,6 +478,70 @@ def fetch_kline(code: str, period: str):
         except Exception as e:
             errors.append(f"{name}: {e}")
     raise RuntimeError("全部数据源失败；" + " | ".join(errors))
+
+
+def compute_daily_filter(code: str, mode: str):
+    mode = (mode or "off").strip().lower()
+    if mode not in DAILY_FILTER_MODES:
+        raise ValueError(f"不支持的日线过滤模式: {mode}，可选值: {', '.join(DAILY_FILTER_MODES)}")
+    if mode == "off":
+        return {
+            "mode": mode,
+            "mode_label": DAILY_FILTER_MODES[mode]["label"],
+            "status": "off",
+            "passed": True,
+            "reason": "日线过滤关闭",
+        }
+
+    try:
+        bars = fetch_yahoo_daily(code)
+    except Exception as e:
+        return {
+            "mode": mode,
+            "mode_label": DAILY_FILTER_MODES[mode]["label"],
+            "status": "unknown",
+            "passed": True,
+            "reason": f"日线数据获取失败: {e}",
+        }
+
+    closes = [b["close"] for b in bars if b.get("close") is not None]
+    highs = [b["high"] for b in bars if b.get("high") is not None]
+    if len(closes) < 60 or len(highs) < 20:
+        return {
+            "mode": mode,
+            "mode_label": DAILY_FILTER_MODES[mode]["label"],
+            "status": "unknown",
+            "passed": True,
+            "reason": f"日线样本不足: {len(closes)}",
+        }
+
+    last_close = closes[-1]
+    ma5 = sum(closes[-5:]) / 5
+    ma20 = sum(closes[-20:]) / 20
+    ma60 = sum(closes[-60:]) / 60
+    prev_ma20 = sum(closes[-21:-1]) / 20 if len(closes) >= 21 else ma20
+    prev_ma60 = sum(closes[-61:-1]) / 60 if len(closes) >= 61 else ma60
+    high20 = max(highs[-20:])
+
+    if mode == "trend":
+        passed = last_close > ma20 and ma20 >= ma60 and ma20 >= prev_ma20 and ma60 >= prev_ma60 * 0.995
+        reason = f"收盘 {last_close:.2f}，MA20 {ma20:.2f}，MA60 {ma60:.2f}"
+    else:
+        passed = last_close > ma20 and last_close >= high20 * 0.97 and ma20 >= ma60 * 0.995
+        reason = f"收盘 {last_close:.2f}，MA20 {ma20:.2f}，20日高点 {high20:.2f}"
+
+    return {
+        "mode": mode,
+        "mode_label": DAILY_FILTER_MODES[mode]["label"],
+        "status": "pass" if passed else "fail",
+        "passed": passed,
+        "reason": reason,
+        "last_close": round(last_close, 3),
+        "ma5": round(ma5, 3),
+        "ma20": round(ma20, 3),
+        "ma60": round(ma60, 3),
+        "high20": round(high20, 3),
+    }
 
 
 def fetch_yahoo_30m(code: str):
@@ -746,11 +879,48 @@ def near(a, b, tolerance=0.003):
     return abs(a - b) / abs(b) <= tolerance
 
 
-def analyze_one(code: str, period: str, signal_mode: str, scan_phase: str, max_data_lag_minutes: int):
+def analyze_one(
+    code: str,
+    period: str,
+    signal_mode: str,
+    scan_phase: str,
+    max_data_lag_minutes: int,
+    daily_filter_mode: str,
+):
     period_cfg = _period_cfg(period)
     mode_cfg = SIGNAL_MODES.get(signal_mode, SIGNAL_MODES["balanced"])
     resolved_phase = resolve_scan_phase(scan_phase)
     session_ok = is_session_valid(resolved_phase)
+    daily_filter = compute_daily_filter(code, daily_filter_mode)
+
+    if daily_filter["status"] == "fail":
+        return {
+            "code": code,
+            "data_source": "daily_filter",
+            "latest_time": "-",
+            "data_delay_minutes": None,
+            "data_stale": False,
+            "scan_phase": resolved_phase,
+            "session_ok": session_ok,
+            "daily_filter": daily_filter,
+            "last_price": None,
+            "structure_high_60": None,
+            "breakout_pct": None,
+            "high_5": None,
+            "high_20": None,
+            "high_60": None,
+            "low_2": None,
+            "low_5": None,
+            "conditions": {
+                "A_high_resonance_5_20_60": False,
+                "B_low_not_breaking_2_vs_5": False,
+                "D_price_above_structure_high": False,
+            },
+            "score": 0,
+            "signal": "NONE",
+            "decision": f"日线过滤未通过：{daily_filter['reason']}",
+        }
+
     bars = fetch_kline(code, period)
 
     if len(bars) < 65:
@@ -812,6 +982,7 @@ def analyze_one(code: str, period: str, signal_mode: str, scan_phase: str, max_d
         "data_stale": data_stale,
         "scan_phase": resolved_phase,
         "session_ok": session_ok,
+        "daily_filter": daily_filter,
         "last_price": round(last_price, 3),
         "structure_high_60": round(structure_high, 3),
         "breakout_pct": None if breakout_pct is None else round(breakout_pct, 2),
@@ -837,6 +1008,7 @@ def main():
     parser.add_argument("--analysis_type", default="quick")
     parser.add_argument("--period", default="15m", choices=sorted(PERIOD_CONFIG.keys()))
     parser.add_argument("--signal-mode", default="balanced", choices=sorted(SIGNAL_MODES.keys()))
+    parser.add_argument("--daily-filter-mode", default="trend", choices=sorted(DAILY_FILTER_MODES.keys()))
     parser.add_argument("--scan-phase", default="auto", choices=["auto", "intraday", "close"])
     parser.add_argument("--max-data-lag-minutes", type=int, default=15)
     parser.add_argument("--output", default="json")
@@ -851,7 +1023,16 @@ def main():
 
     for code in stocks:
         try:
-            results.append(analyze_one(code, args.period, args.signal_mode, args.scan_phase, args.max_data_lag_minutes))
+            results.append(
+                analyze_one(
+                    code,
+                    args.period,
+                    args.signal_mode,
+                    args.scan_phase,
+                    args.max_data_lag_minutes,
+                    args.daily_filter_mode,
+                )
+            )
         except Exception as e:
             errors.append(
                 {
@@ -874,6 +1055,7 @@ def main():
         "analysis_type": args.analysis_type,
         "period": args.period,
         "signal_mode": args.signal_mode,
+        "daily_filter_mode": args.daily_filter_mode,
         "scan_phase": resolve_scan_phase(args.scan_phase),
         "max_data_lag_minutes": args.max_data_lag_minutes,
         "stocks": stocks,
@@ -882,6 +1064,9 @@ def main():
             "ok": len(results),
             "errors": len(errors),
             "candidates": len(candidates),
+            "daily_pass": sum(1 for x in results if x.get("daily_filter", {}).get("status") == "pass"),
+            "daily_fail": sum(1 for x in results if x.get("daily_filter", {}).get("status") == "fail"),
+            "daily_unknown": sum(1 for x in results if x.get("daily_filter", {}).get("status") == "unknown"),
         },
         "candidates": candidates,
         "all_results": results,
@@ -893,6 +1078,7 @@ def main():
         },
         "market_phase": market_phase(bj),
         "scan_enabled": is_session_valid(resolve_scan_phase(args.scan_phase), bj),
+        "daily_filter_label": DAILY_FILTER_MODES[args.daily_filter_mode]["label"],
     }
 
     print(json.dumps(output, ensure_ascii=False, indent=2))

@@ -41,6 +41,15 @@ on:
           - balanced
           - relaxed
         default: "balanced"
+      daily_filter_mode:
+        description: "日线过滤"
+        required: false
+        type: choice
+        options:
+          - off
+          - trend
+          - momentum
+        default: "trend"
       scan_phase:
         description: "扫描阶段"
         required: false
@@ -82,6 +91,7 @@ jobs:
       STOCKS: ${{ github.event.inputs.stocks || '000001,002463,000006' }}
       KLINE_PERIOD: ${{ github.event.inputs.kline_period || '15m' }}
       SIGNAL_MODE: ${{ github.event.inputs.signal_mode || 'balanced' }}
+      DAILY_FILTER_MODE: ${{ github.event.inputs.daily_filter_mode || 'trend' }}
       SCAN_PHASE: ${{ github.event.inputs.scan_phase || 'auto' }}
       MAX_DATA_LAG_MINUTES: ${{ github.event.inputs.max_data_lag_minutes || '15' }}
       ANALYSIS_TYPE: ${{ github.event.inputs.analysis_type || 'quick' }}
@@ -115,6 +125,7 @@ jobs:
           echo "Stocks: $STOCKS" >> run.log
           echo "Kline Period: $KLINE_PERIOD" >> run.log
           echo "Signal Mode: $SIGNAL_MODE" >> run.log
+          echo "Daily Filter Mode: $DAILY_FILTER_MODE" >> run.log
           echo "Scan Phase: $SCAN_PHASE" >> run.log
           echo "Max Data Lag Minutes: $MAX_DATA_LAG_MINUTES" >> run.log
           echo "Analysis Type: $ANALYSIS_TYPE" >> run.log
@@ -135,6 +146,7 @@ jobs:
               --stocks "$STOCKS" \
               --period "$KLINE_PERIOD" \
               --signal-mode "$SIGNAL_MODE" \
+              --daily-filter-mode "$DAILY_FILTER_MODE" \
               --scan-phase "$SCAN_PHASE" \
               --max-data-lag-minutes "$MAX_DATA_LAG_MINUTES" \
               --analysis_type "$ANALYSIS_TYPE" \
@@ -207,6 +219,8 @@ jobs:
           errors = summary.get("errors", 0)
           period = data.get("period", "15m")
           signal_mode = data.get("signal_mode", "balanced")
+          daily_filter_mode = data.get("daily_filter_mode", "trend")
+          daily_filter_label = data.get("daily_filter_label", "趋势过滤")
           scan_phase = data.get("scan_phase", "auto")
           max_data_lag_minutes = data.get("max_data_lag_minutes", 15)
           title = data.get("title", "TradingAgents-CN 突破扫描")
@@ -216,13 +230,14 @@ jobs:
 
           msg.append(f"📈 {title}")
           msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
-          msg.append(f"周期：{period}｜模式：{signal_mode}｜阶段：{scan_phase}｜最大延迟：{max_data_lag_minutes}分钟")
+          msg.append(f"周期：{period}｜模式：{signal_mode}｜日线：{daily_filter_label}({daily_filter_mode})｜阶段：{scan_phase}｜最大延迟：{max_data_lag_minutes}分钟")
           msg.append("")
 
           msg.append(f"📊 扫描：{total} 只")
           msg.append(f"✅ 成功：{ok} 只")
           msg.append(f"❌ 异常：{errors} 只")
           msg.append(f"🎯 候选：{len(candidates)} 只")
+          msg.append(f"📈 日线通过：{summary.get('daily_pass', 0)}｜未通过：{summary.get('daily_fail', 0)}｜未知：{summary.get('daily_unknown', 0)}")
           msg.append("")
 
           if candidates:
@@ -238,9 +253,11 @@ jobs:
                   cond = x.get("conditions", {})
                   lag = x.get("data_delay_minutes", "-")
                   stale = x.get("data_stale", False)
+                  daily = x.get("daily_filter", {})
 
                   msg.append(f"{code}｜{sig}｜得分 {score}")
                   msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}｜延迟 {lag} 分钟{'｜stale' if stale else ''}")
+                  msg.append(f"日线：{daily.get('status', '-') }｜{daily.get('reason', '-')}")
                   msg.append(
                       f"A高点共振 {yesno(cond.get('A_high_resonance_5_20_60'))} "
                       f"B低点抬高 {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
@@ -266,9 +283,11 @@ jobs:
                   lag = x.get("data_delay_minutes", "-")
                   stale = x.get("data_stale", False)
                   cond = x.get("conditions", {})
+                  daily = x.get("daily_filter", {})
 
                   msg.append(f"{code}｜{sig}｜得分 {score}")
                   msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}｜延迟 {lag} 分钟{'｜stale' if stale else ''}")
+                  msg.append(f"日线：{daily.get('status', '-') }｜{daily.get('reason', '-')}")
                   msg.append(
                       f"A {yesno(cond.get('A_high_resonance_5_20_60'))} "
                       f"B {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
@@ -287,6 +306,7 @@ jobs:
           msg.append("A = 5/20/60 高点共振")
           msg.append("B = 近2根低点不破近5根低点（按模式可放宽）")
           msg.append("D = 当前价突破60根结构高点（按模式可放宽）")
+          msg.append("日线：先过趋势/动量过滤，再看盘中突破")
           msg.append("时效：超过最大延迟的K线会被标记为 stale 并跳过强信号判断")
 
           Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
