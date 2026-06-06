@@ -35,6 +35,7 @@ import random
 import re
 import time
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -56,6 +57,8 @@ SIGNAL_MODES = {
     "balanced": {"high_tolerance": 0.008, "low_floor_ratio": 0.997, "breakout_buffer": 0.0015},
     "relaxed": {"high_tolerance": 0.015, "low_floor_ratio": 0.995, "breakout_buffer": 0.0000},
 }
+
+CN_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def make_headers(extra=None):
@@ -144,6 +147,82 @@ def _source_rows_to_bars(rows, source_name: str):
                 }
             )
     return bars
+
+
+def parse_bar_time(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        dt = None
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+        ):
+            try:
+                dt = datetime.strptime(text, fmt)
+                break
+            except Exception:
+                continue
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except Exception:
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=CN_TZ)
+    return dt.astimezone(CN_TZ)
+
+
+def market_phase(now=None):
+    now = now or datetime.now(CN_TZ)
+    weekday = now.weekday()
+    if weekday >= 5:
+        return "closed"
+    minutes = now.hour * 60 + now.minute
+    if 9 * 60 + 30 <= minutes < 11 * 60 + 30:
+        return "intraday"
+    if 13 * 60 <= minutes < 15 * 60:
+        return "intraday"
+    if 15 * 60 + 10 <= minutes <= 23 * 60 + 59:
+        return "close"
+    return "closed"
+
+
+def resolve_scan_phase(value=None, now=None):
+    value = (value or "auto").strip().lower()
+    if value in ("intraday", "close"):
+        return value
+    return market_phase(now)
+
+
+def is_session_valid(phase: str, now=None):
+    now = now or datetime.now(CN_TZ)
+    weekday = now.weekday()
+    if weekday >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    if phase == "intraday":
+        return (9 * 60 + 30 <= minutes < 11 * 60 + 30) or (13 * 60 <= minutes < 15 * 60)
+    if phase == "close":
+        return 15 * 60 + 10 <= minutes <= 23 * 60 + 59
+    return False
+
+
+def calc_bar_delay_minutes(bar_time, now=None):
+    dt = parse_bar_time(bar_time)
+    if dt is None:
+        return None
+    now = now or datetime.now(CN_TZ)
+    return max(0.0, round((now - dt).total_seconds() / 60.0, 1))
 
 
 def fetch_yahoo_kline(code: str, period: str):
@@ -667,9 +746,11 @@ def near(a, b, tolerance=0.003):
     return abs(a - b) / abs(b) <= tolerance
 
 
-def analyze_one(code: str, period: str, signal_mode: str):
+def analyze_one(code: str, period: str, signal_mode: str, scan_phase: str, max_data_lag_minutes: int):
     period_cfg = _period_cfg(period)
     mode_cfg = SIGNAL_MODES.get(signal_mode, SIGNAL_MODES["balanced"])
+    resolved_phase = resolve_scan_phase(scan_phase)
+    session_ok = is_session_valid(resolved_phase)
     bars = fetch_kline(code, period)
 
     if len(bars) < 65:
@@ -677,6 +758,8 @@ def analyze_one(code: str, period: str, signal_mode: str):
 
     latest = bars[-1]
     hist = bars[:-1]
+    lag_minutes = calc_bar_delay_minutes(latest.get("time"))
+    data_stale = lag_minutes is None or lag_minutes > max_data_lag_minutes
 
     last_price = latest["close"]
 
@@ -702,7 +785,13 @@ def analyze_one(code: str, period: str, signal_mode: str):
     if cond_d:
         score += 50
 
-    if cond_d and cond_a and cond_b:
+    if not session_ok:
+        signal = "NONE"
+        decision = f"当前不在{resolved_phase}扫描时段"
+    elif data_stale:
+        signal = "NONE"
+        decision = f"数据延迟过高（{lag_minutes} 分钟），跳过信号判断"
+    elif cond_d and cond_a and cond_b:
         signal = "BREAKOUT"
         decision = f"触发{period_cfg['label']}突破，进入重点观察"
     elif cond_a and cond_b:
@@ -719,6 +808,10 @@ def analyze_one(code: str, period: str, signal_mode: str):
         "code": code,
         "data_source": latest.get("source"),
         "latest_time": latest["time"],
+        "data_delay_minutes": lag_minutes,
+        "data_stale": data_stale,
+        "scan_phase": resolved_phase,
+        "session_ok": session_ok,
         "last_price": round(last_price, 3),
         "structure_high_60": round(structure_high, 3),
         "breakout_pct": None if breakout_pct is None else round(breakout_pct, 2),
@@ -744,19 +837,21 @@ def main():
     parser.add_argument("--analysis_type", default="quick")
     parser.add_argument("--period", default="15m", choices=sorted(PERIOD_CONFIG.keys()))
     parser.add_argument("--signal-mode", default="balanced", choices=sorted(SIGNAL_MODES.keys()))
+    parser.add_argument("--scan-phase", default="auto", choices=["auto", "intraday", "close"])
+    parser.add_argument("--max-data-lag-minutes", type=int, default=15)
     parser.add_argument("--output", default="json")
     args = parser.parse_args()
 
     stocks = [x.strip() for x in args.stocks.split(",") if x.strip()]
 
-    bj = datetime.now(timezone.utc) + timedelta(hours=8)
+    bj = datetime.now(CN_TZ)
 
     results = []
     errors = []
 
     for code in stocks:
         try:
-            results.append(analyze_one(code, args.period, args.signal_mode))
+            results.append(analyze_one(code, args.period, args.signal_mode, args.scan_phase, args.max_data_lag_minutes))
         except Exception as e:
             errors.append(
                 {
@@ -779,6 +874,8 @@ def main():
         "analysis_type": args.analysis_type,
         "period": args.period,
         "signal_mode": args.signal_mode,
+        "scan_phase": resolve_scan_phase(args.scan_phase),
+        "max_data_lag_minutes": args.max_data_lag_minutes,
         "stocks": stocks,
         "summary": {
             "total": len(stocks),
@@ -794,6 +891,8 @@ def main():
             "B": f"近2根{PERIOD_CONFIG[args.period]['label']}K线低点不低于近5根低点（按模式可放宽）",
             "D": f"当前价突破近60根结构高点（按模式可放宽）",
         },
+        "market_phase": market_phase(bj),
+        "scan_enabled": is_session_valid(resolve_scan_phase(args.scan_phase), bj),
     }
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
