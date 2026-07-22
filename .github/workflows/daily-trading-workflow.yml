@@ -1,0 +1,56 @@
+name: Daily Trading Workflow
+on:
+  schedule:
+    # 盘中扫描: 交易日 10:00/11:00/13:00/14:00 (UTC+8 = UTC 02:00/03:00/05:00/06:00)
+    - cron: '0 2,3,5,6 * * 1-5'
+    # 收盘扫描+录入: 交易日 15:05 (UTC+8 = UTC 07:05)
+    - cron: '5 7 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      command:
+        description: '工作流命令'
+        required: false
+        default: 'intraday'
+        type: choice
+        options:
+          - intraday
+          - scan
+          - compliance
+
+env:
+  PYTHONPATH: ${{ github.workspace }}/scripts/chanlun-workflow
+  TZ: Asia/Shanghai
+
+jobs:
+  daily-workflow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install openpyxl numpy pandas scikit-learn
+
+      - name: Run workflow
+        run: |
+          CMD="${{ github.event.inputs.command || 'intraday' }}"
+          echo "=== $CMD $(date '+%Y-%m-%d %H:%M') ==="
+          cd scripts/chanlun-workflow
+          python daily_workflow.py $CMD
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-result-${{ github.run_number }}
+          path: |
+            scripts/chanlun-workflow/*.txt
+            scripts/chanlun-workflow/*.json
+          retention-days: 7
