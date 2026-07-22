@@ -36,7 +36,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install openpyxl numpy pandas scikit-learn
+          pip install openpyxl numpy pandas scikit-learn==1.7.2
 
       - name: Run workflow
         run: |
