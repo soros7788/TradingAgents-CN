@@ -627,6 +627,10 @@ app.add_middleware(
 )
 
 
+# 每日配额中间件（使用配置时区，北京时间0点重置）
+from app.middleware.rate_limit import QuotaMiddleware
+app.add_middleware(QuotaMiddleware, daily_quota=settings.DEFAULT_DAILY_QUOTA)
+
 # 操作日志中间件
 app.add_middleware(OperationLogMiddleware)
 

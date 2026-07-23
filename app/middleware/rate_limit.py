@@ -131,46 +131,63 @@ class QuotaMiddleware(BaseHTTPMiddleware):
         
         return await call_next(request)
     
+    async def _get_user_daily_quota(self, user_id: str) -> int:
+        """从数据库获取用户的每日配额"""
+        try:
+            from app.core.database import get_mongo_db
+            from bson import ObjectId
+            db = get_mongo_db()
+            user = await db.users.find_one({"_id": ObjectId(user_id)})
+            if user is None:
+                user = await db.users.find_one({"_id": user_id})
+            return (user or {}).get("daily_quota", self.daily_quota)
+        except Exception as e:
+            logger.warning(f"获取用户配额失败，使用默认值: {e}")
+            return self.daily_quota
+
     async def check_daily_quota(self, user_id: str):
-        """检查每日配额"""
-        import datetime
-        
+        """检查每日配额（使用配置时区，确保北京时间0点重置）"""
+        from app.utils.timezone import now_tz
+
         redis_service = get_redis_service()
-        
-        # 获取今天的日期
-        today = datetime.date.today().isoformat()
-        
+
+        # 使用配置时区获取今天的日期，而非服务器本地时间
+        today = now_tz().date().isoformat()
+
         # 构建Redis键
         quota_key = RedisKeys.USER_DAILY_QUOTA.format(
             user_id=user_id,
             date=today
         )
-        
+
+        # 从数据库获取用户专属配额（管理员更高）
+        daily_quota = await self._get_user_daily_quota(user_id)
+
         # 获取今日使用量
         current_usage = await redis_service.increment_with_ttl(quota_key, ttl=86400)  # 24小时TTL
-        
+
         # 检查是否超过配额
-        if current_usage > self.daily_quota:
+        if current_usage > daily_quota:
             logger.warning(
                 f"每日配额超限 - 用户: {user_id}, "
                 f"今日使用: {current_usage}, "
-                f"配额: {self.daily_quota}"
+                f"配额: {daily_quota}"
             )
-            
+
             raise HTTPException(
                 status_code=429,
                 detail={
                     "error": {
                         "code": "DAILY_QUOTA_EXCEEDED",
                         "message": "今日配额已用完，请明天再试",
-                        "daily_quota": self.daily_quota,
+                        "daily_quota": daily_quota,
                         "current_usage": current_usage,
                         "reset_date": today
                     }
                 }
             )
-        
+
         logger.debug(
             f"配额检查通过 - 用户: {user_id}, "
-            f"今日使用: {current_usage}/{self.daily_quota}"
+            f"今日使用: {current_usage}/{daily_quota}"
         )
