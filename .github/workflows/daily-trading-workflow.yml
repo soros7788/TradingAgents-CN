@@ -3,8 +3,10 @@ on:
   schedule:
     # 盘中扫描: 交易日 10:00/11:00/13:00/14:00 (UTC+8 = UTC 02:00/03:00/05:00/06:00)
     - cron: '0 2,3,5,6 * * 1-5'
-    # 收盘扫描+录入: 交易日 15:05 (UTC+8 = UTC 07:05)
+    # 收盘扫描: 交易日 15:05 (UTC+8 = UTC 07:05)
     - cron: '5 7 * * 1-5'
+    # 心态日志提醒: 交易日 15:30 (UTC+8 = UTC 07:30)
+    - cron: '30 7 * * 1-5'
   workflow_dispatch:
     inputs:
       command:
@@ -39,18 +41,89 @@ jobs:
           pip install openpyxl numpy pandas scikit-learn==1.7.2
 
       - name: Run workflow
+        id: workflow
         run: |
           CMD="${{ github.event.inputs.command || 'intraday' }}"
           echo "=== $CMD $(date '+%Y-%m-%d %H:%M') ==="
           cd scripts/chanlun-workflow
-          python daily_workflow.py $CMD
+          python daily_workflow.py $CMD 2>&1 | tee /tmp/workflow_output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
 
-      - name: Upload results
+      - name: Send Telegram notification
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: workflow-result-${{ github.run_number }}
-          path: |
-            scripts/chanlun-workflow/*.txt
-            scripts/chanlun-workflow/*.json
-          retention-days: 7
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "Telegram secrets not configured, skipping notification"
+            exit 0
+          fi
+
+          STATUS="${{ steps.workflow.outcome }}"
+          TIMESTAMP=$(date '+%m-%d %H:%M')
+
+          # 判断是定时任务还是手动触发
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # 根据 cron 时间判断类型
+            HOUR=$(date '+%H')
+            MINUTE=$(date '+%M')
+            if [ "$MINUTE" = "30" ] && [ "$HOUR" = "07" ]; then
+              MSG_TITLE="📝 心态日志提醒"
+              MSG_BODY="现在是北京时间15:30，请填写今日心态日志。\n\n评分维度(0-5分):\n• 非工作流看盘次数 (0=0次最好)\n• 是否追价操作 (0=没有最好)\n• 是否按系统执行 (5=完全最好)\n• 情绪状态 (5=平静最好)\n• 止损外操作 (0=没有最好)\n\n达标线: 80分"
+            elif [ "$MINUTE" = "05" ] && [ "$HOUR" = "07" ]; then
+              MSG_TITLE="📊 收盘扫描报告"
+            else
+              MSG_TITLE="📡 盘中扫描 $TIMESTAMP"
+            fi
+          else
+            MSG_TITLE="🔧 手动触发: ${{ github.event.inputs.command || 'intraday' }}"
+          fi
+
+          # 如果是 scan/intraday/compliance, 提取输出摘要
+          if [ -f /tmp/workflow_output.txt ]; then
+            # 提取关键信息
+            CONFIRMED=$(grep -oP '确认\d*只' /tmp/workflow_output.txt | tail -1)
+            NEAR=$(grep -oP '接近\d*只' /tmp/workflow_output.txt | tail -1)
+            ALERT=$(grep -oP '⚠️.*' /tmp/workflow_output.txt | head -5)
+            COMPLIANT=$(grep -oP '合规' /tmp/workflow_output.txt | tail -1)
+            COVERAGE=$(grep -oP '覆盖.*只' /tmp/workflow_output.txt | tail -1)
+            ERROR=$(grep -oP 'Error.*' /tmp/workflow_output.txt | head -1)
+
+            if [ -n "$ERROR" ]; then
+              STATUS_ICON="❌"
+            elif [ "$STATUS" = "success" ]; then
+              STATUS_ICON="✅"
+            else
+              STATUS_ICON="⚠️"
+            fi
+
+            # 构建消息体
+            if [ "${{ github.event_name }}" = "schedule" ] && [ "$MINUTE" = "30" ] && [ "$HOUR" = "07" ]; then
+              # 心态日志提醒不需要输出摘要
+              MSG_BODY="$MSG_BODY"
+            else
+              BODY_LINES=""
+              [ -n "$COVERAGE" ] && BODY_LINES="$BODY_LINES\n📊 $COVERAGE"
+              [ -n "$CONFIRMED" ] && BODY_LINES="$BODY_LINES\n★ $CONFIRMED"
+              [ -n "$NEAR" ] && BODY_LINES="$BODY_LINES\n◆ $NEAR"
+              [ -n "$COMPLIANT" ] && BODY_LINES="$BODY_LINES\n✓ 持仓$COMPLIANT"
+              [ -n "$ALERT" ] && BODY_LINES="$BODY_LINES\n$ALERT"
+              MSG_BODY="${STATUS_ICON} $TIMESTAMP\n${BODY_LINES}"
+            fi
+          else
+            MSG_BODY="工作流运行完成: $STATUS"
+          fi
+
+          # 发送消息
+          PAYLOAD=$(jq -n \
+            --arg chat_id "$TG_CHAT_ID" \
+            --arg text "$MSG_TITLE
+
+          $MSG_BODY" \
+            --arg parse_mode "Markdown" \
+            '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" | jq '.ok // false'
