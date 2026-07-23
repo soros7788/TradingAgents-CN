@@ -247,27 +247,45 @@ def run_intraday_scan():
     else:
         print(f"\n[2/3] 5min扫描: 跳过(30min无确认)")
 
-    # 3. 持仓止损 + 背驰卖点检查
-    print(f"\n[3/3] 持仓检查(止损+背驰卖点)...")
+    # 3. 持仓止损 + 背驰卖点 + 中枢破位检查
+    print(f"\n[3/3] 持仓检查(止损+背驰卖点+中枢破位)...")
     holdings = get_today_holdings()
     alerts = []
     sell_signals = []
+    zs_breakdowns = []
     for h in holdings:
         code = str(h['code'])
         name = h['name']
         waived = h['waived']
+        close_price = h['close'] or 0
 
         # 3a. 止损检查
         if waived != '是':
-            if h['close'] and h['stop'] and h['close'] <= h['stop']:
-                alerts.append(f"⚠️ {name}({code}) 破止损: 现价{h['close']:.2f}<=止损{h['stop']:.2f}")
+            if close_price and h['stop'] and close_price <= h['stop']:
+                alerts.append(f"⚠️ {name}({code}) 破止损: 现价{close_price:.2f}<=止损{h['stop']:.2f}")
 
-        # 3b. 背驰卖点检查(日线 + 30min)
+        # 3b. 背驰卖点 + 中枢破位检查(日线 + 30min)
         for level in ["日线", "30min"]:
             try:
                 r = analyze_beichi(code, level=level)
                 if "error" in r:
                     continue
+
+                # 中枢破位检查: 现价跌破最新中枢下沿
+                zss = r.get("zss", [])
+                if zss and close_price > 0:
+                    last_zs = zss[-1]
+                    zd = last_zs["zd"]
+                    zg = last_zs["zg"]
+                    if close_price < zd:
+                        pct = ((close_price - zd) / zd) * 100
+                        zs_breakdowns.append({
+                            "name": name, "code": code, "level": level,
+                            "price": close_price, "zd": zd, "zg": zg, "pct": pct,
+                            "waived": waived,
+                        })
+
+                # 背驰卖点检查
                 for sig in r.get("signals", []):
                     if "卖" not in sig["op"]:
                         continue
@@ -296,6 +314,13 @@ def run_intraday_scan():
         for a in alerts:
             print(f"  {a}")
 
+    # 中枢破位汇总
+    if zs_breakdowns:
+        print(f"  🔻 中枢破位: {len(zs_breakdowns)}个")
+        for z in zs_breakdowns:
+            waived_tag = " [WAIVED]" if z["waived"] == "是" else ""
+            print(f"    {z['name']}({z['code']}) {z['level']} 现价{z['price']:.2f}<下沿{z['zd']:.2f} ({z['pct']:+.1f}%){waived_tag}")
+
     # 卖点汇总
     confirmed_sells = [s for s in sell_signals if s["type"] == "确认卖点"]
     near_sells = [s for s in sell_signals if s["type"] == "接近卖点"]
@@ -308,8 +333,8 @@ def run_intraday_scan():
             if s["ratio"] >= 60: missing.append("ratio=%d%%" % s["ratio"])
             if s["dlp"] <= 0.8: missing.append("DL_P=%.2f" % s["dlp"])
             print(f"    {s['name']}({s['code']}) {s['level']} {s['op']} 缺:{'+'.join(missing)}")
-    if not alerts and not confirmed_sells and not near_sells:
-        print(f"  持仓{len(holdings)}只, 止损合规, 无背驰卖点")
+    if not alerts and not confirmed_sells and not near_sells and not zs_breakdowns:
+        print(f"  持仓{len(holdings)}只, 止损合规, 无背驰卖点, 无中枢破位")
 
     # 汇总
     print(f"\n{'='*50}")
@@ -331,6 +356,12 @@ def run_intraday_scan():
     if alerts:
         print(f"\n⚠️ 止损告警: {len(alerts)}只需处理")
 
+    if zs_breakdowns:
+        non_waived_bd = [z for z in zs_breakdowns if z["waived"] != "是"]
+        print(f"\n🔻 中枢破位: {len(zs_breakdowns)}个 (非WAIVED {len(non_waived_bd)}个)")
+        if non_waived_bd:
+            print("  → 跌破中枢下沿但卖点未确认, 建议人工评估是否减仓")
+
     if confirmed_sells:
         print(f"\n🔴 确认卖点: {len(confirmed_sells)}个 (建议卖出)")
     if near_sells:
@@ -343,6 +374,7 @@ def run_intraday_scan():
         "alerts": alerts,
         "confirmed_sells": confirmed_sells,
         "near_sells": near_sells,
+        "zs_breakdowns": zs_breakdowns,
         "scanned": len(candidates),
     }
 
