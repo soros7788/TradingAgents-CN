@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """每日交易工作流 — 主入口
 用法:
+  python daily_workflow.py screenshot [截图路径1 截图路径2 ...]
   python daily_workflow.py compliance
   python daily_workflow.py scan            # 日线全市场扫描 + 写入候选池
   python daily_workflow.py intraday        # 盘中30min扫描候选池 + 持仓止损检查
@@ -13,28 +14,15 @@ from decimal import Decimal
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_WORKSPACE = os.environ.get('WORKSPACE', '/workspace')
-
-# Excel路径(本地环境)
-WB_LOCAL = os.path.join(_WORKSPACE, '动态仓位资金管理法则_执行版.xlsx')
-RECALC_LOCAL = '/data/user/builtin/work/eurydice/skills/xlsx/scripts/recalc.py'
-
-# GitHub Actions环境: 无Excel时降级为纯扫描+JSON输出
-HAS_EXCEL = os.path.exists(WB_LOCAL)
-WB = WB_LOCAL if HAS_EXCEL else None
-RECALC = RECALC_LOCAL if os.path.exists(RECALC_LOCAL) else None
-BEICHI_DIR = _SCRIPT_DIR  # 背驰分析器在同目录
+WB = '/workspace/动态仓位资金管理法则_执行版.xlsx'
+RECALC = '/data/user/builtin/work/eurydice/skills/xlsx/scripts/recalc.py'
+BEICHI_DIR = '/workspace/chanlun-kline'
 
 def recalc():
-    if not RECALC or not WB:
-        return {"total_errors": 0, "total_formulas": 0}
     r = subprocess.run(['python', RECALC, WB, '30'], capture_output=True, text=True)
     return json.loads(r.stdout) if r.stdout else {"status": "error"}
 
 def get_today_holdings():
-    if not WB:
-        return []
     wb = load_workbook(WB, data_only=True)
     ws = wb['持仓表']
     holdings = []
@@ -59,8 +47,6 @@ def get_today_holdings():
     return holdings
 
 def get_account_summary():
-    if not WB:
-        return {"total_asset": None, "cash": None}
     wb = load_workbook(WB, data_only=True)
     ws = wb['账户总表']
     latest_row = 2
@@ -102,7 +88,7 @@ def safe_val(v):
     return v
 
 def run_full_scan():
-    """全市场候选扫描: 沪A主板全量 + 深市全量(000/002) + 写入候选池"""
+    """全市场候选扫描: 沪A主板全量 + 深市全量(000/002) + 写入候选池(排除持仓股)"""
     sys.path.insert(0, BEICHI_DIR)
     from full_scan import full_scan, calc_funding
     account = get_account_summary()
@@ -112,10 +98,17 @@ def run_full_scan():
         silent=False,
     )
 
-    # 写入候选池(沪深均衡分配)
-    all_near = result["near"]
+    # 排除持仓股(已持有的不再推荐)
+    holdings = get_today_holdings()
+    held_codes = {str(h['code']) for h in holdings if h.get('code')}
+    all_near = [r for r in result["near"] if r["code"] not in held_codes]
+    if held_codes:
+        excluded = len(result["near"]) - len(all_near)
+        if excluded:
+            print(f"  排除持仓股: {excluded}只 ({', '.join(sorted(held_codes))})")
+
     if not all_near:
-        print("\n候选池: 无接近确认标的, 跳过写入")
+        print("\n候选池: 无接近确认标的(排除持仓后), 跳过写入")
         return result
 
     sha_near = sorted([r for r in all_near if r["code"].startswith("6")], key=lambda x: (-x["score"], x["ratio"]))
@@ -123,16 +116,10 @@ def run_full_scan():
     selected = sha_near[:15] + sz_near[:15]
     selected.sort(key=lambda x: (-x["score"], x["ratio"]))
 
-    if not WB:
-        print(f"\n候选池(无Excel,仅输出): {len(selected)}只")
-        for s in selected[:5]:
-            tag = '深' if s["code"].startswith("0") else '沪'
-            print(f"  [{tag}] {s.get('name','')} {s['code']} ¥{s['price']:.2f} ratio={s['ratio']:.0f}% DL_P={s['dlp']:.2f}")
-        return result
-
     wb = load_workbook(WB)
     ws = wb['候选池']
 
+    # 清空旧数据(保留表头和公式列)
     for r in range(2, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             cell = ws.cell(row=r, column=c)
@@ -173,8 +160,6 @@ def run_full_scan():
 
 def get_candidate_pool():
     """从Excel候选池读取标的列表"""
-    if not WB:
-        return []
     wb = load_workbook(WB, data_only=True)
     ws = wb['候选池']
     candidates = []
@@ -188,7 +173,7 @@ def get_candidate_pool():
     return candidates
 
 def run_intraday_scan():
-    """盘中扫描: 30min级别扫描候选池 + 5min确认 + 持仓止损检查"""
+    """盘中扫描: 30min级别扫描候选池(排除持仓股) + 5min确认 + 持仓止损检查"""
     sys.path.insert(0, BEICHI_DIR)
     from beichi_analyzer import analyze_beichi
     import time as _time
@@ -196,12 +181,16 @@ def run_intraday_scan():
     now = datetime.now()
     print(f"=== 盘中扫描 {now.strftime('%Y-%m-%d %H:%M')} ===\n")
 
+    # 候选池排除持仓股
+    holdings = get_today_holdings()
+    held_codes = {str(h['code']) for h in holdings if h.get('code')}
+
     # 1. 候选池30min扫描
     candidates = get_candidate_pool()
+    candidates = [c for c in candidates if c["code"] not in held_codes]
     if not candidates:
-        print("候选池为空, 跳过盘中扫描")
+        print("候选池为空(排除持仓后), 跳过盘中扫描")
         return {"confirmed_30m": [], "near_30m": [], "alerts": [], "scanned": 0}
-
     print(f"[1/3] 候选池30min扫描 ({len(candidates)}只)...")
     t0 = _time.time()
     confirmed_30m = []
@@ -250,7 +239,8 @@ def run_intraday_scan():
                     ratio = sig["ratio"]
                     dlp = sig["dl_prob"]
                     valid = sig["valid"]
-                    if (ratio < 60 and dlp > 0.8 and valid) or (ratio < 85 and dlp > 0.6 and valid):
+                    confirmed_5m = ratio < 60 and dlp > 0.8 and valid
+                    if confirmed_5m or (ratio < 85 and dlp > 0.6 and valid):
                         print(f"  ★ {s['name']} {s['code']} 5min: ratio={ratio:.0f}% DL_P={dlp:.2f} valid={valid}")
             except:
                 pass
@@ -272,6 +262,7 @@ def run_intraday_scan():
     else:
         print(f"  持仓{len(holdings)}只, 止损全部合规")
 
+    # 汇总
     print(f"\n{'='*50}")
     if confirmed_30m:
         print(f"★ 30min确认信号: {len(confirmed_30m)}只")
@@ -301,7 +292,7 @@ def run_intraday_scan():
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: daily_workflow.py [compliance|scan|intraday|account|holdings]")
+        print("用法: daily_workflow.py [compliance|scan|account|holdings]")
         return
     cmd = sys.argv[1]
     if cmd == "compliance":
