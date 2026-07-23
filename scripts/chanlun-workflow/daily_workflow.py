@@ -158,6 +158,63 @@ def run_full_scan():
     print(f"公式重算: {errors}个错误")
     return result
 
+def detect_entry_level(code, cost):
+    """根据成本价判断属于哪个级别的买点区间, 返回对应卖点级别列表
+
+    逻辑: 成本落在某级别中枢区间内 → 该级别为买点级别 → 对应同级卖点
+    成本在中枢下方 → 更大级别的买点 → 监控更大级别卖点
+    成本在所有中枢上方 → 基础级别买点 → 监控所有级别卖点
+    """
+    sys.path.insert(0, BEICHI_DIR)
+    from beichi_analyzer import analyze_beichi
+    levels_priority = ["日线", "30min", "5min", "1min"]
+    entry_info = {}
+
+    for level in levels_priority:
+        try:
+            r = analyze_beichi(code, level=level)
+            if "error" in r or not r.get("zss"):
+                continue
+            zss = r["zss"]
+            last_zs = zss[-1]
+            first_zs = zss[0]
+
+            if last_zs["zd"] <= cost <= last_zs["zg"]:
+                # 成本在最新中枢区间内 → 该级别买点
+                entry_info[level] = {"zone": "中枢内", "zs": last_zs}
+            elif cost < last_zs["zd"]:
+                # 成本在最新中枢下方 → 该级别一买区
+                entry_info[level] = {"zone": "中枢下方(一买区)", "zs": last_zs}
+            elif cost < first_zs["zd"]:
+                # 成本在所有中枢下方 → 深度一买区
+                entry_info[level] = {"zone": "全中枢下方(深度一买区)", "zs": first_zs}
+            else:
+                # 成本在中枢上方 → 不是该级别的买点
+                entry_info[level] = {"zone": "中枢上方", "zs": last_zs}
+        except:
+            pass
+
+    # 确定买点级别: 找成本最接近中枢区间内的级别(优先大级别)
+    best_entry_level = None
+    for level in levels_priority:
+        info = entry_info.get(level)
+        if info and info["zone"] in ("中枢内", "中枢下方(一买区)", "全中枢下方(深度一买区)"):
+            best_entry_level = level
+            break
+
+    # 卖点监控级别: 买点级别 + 更小级别(精确止盈)
+    if best_entry_level:
+        idx = levels_priority.index(best_entry_level)
+        sell_levels = levels_priority[idx:]  # 买点级别及更小级别
+    else:
+        sell_levels = levels_priority  # 无法确定则全监控
+
+    return {
+        "entry_level": best_entry_level,
+        "entry_info": entry_info,
+        "sell_levels": sell_levels,
+    }
+
 def get_candidate_pool():
     """从Excel候选池读取标的列表"""
     wb = load_workbook(WB, data_only=True)
@@ -247,25 +304,45 @@ def run_intraday_scan():
     else:
         print(f"\n[2/3] 5min扫描: 跳过(30min无确认)")
 
-    # 3. 持仓止损 + 背驰卖点 + 中枢破位检查
+    # 3. 持仓止损 + 背驰卖点 + 中枢破位检查(根据成本自动确定级别)
     print(f"\n[3/3] 持仓检查(止损+背驰卖点+中枢破位)...")
     holdings = get_today_holdings()
     alerts = []
     sell_signals = []
     zs_breakdowns = []
+    entry_reports = []
     for h in holdings:
         code = str(h['code'])
         name = h['name']
         waived = h['waived']
         close_price = h['close'] or 0
+        cost = h['entry'] or 0
 
-        # 3a. 止损检查
+        # 3a. 自动确定买点级别和对应卖点监控级别
+        if cost > 0:
+            entry_data = detect_entry_level(code, cost)
+            entry_level = entry_data["entry_level"]
+            sell_levels = entry_data["sell_levels"]
+            entry_info = entry_data["entry_info"].get(entry_level, {}) if entry_level else {}
+            zone_desc = entry_info.get("zone", "未知") if entry_info else "未知"
+            entry_reports.append({
+                "name": name, "code": code, "cost": cost,
+                "entry_level": entry_level or "未确定",
+                "zone": zone_desc,
+                "sell_levels": sell_levels,
+            })
+            print(f"  📌 {name}({code}) 成本{cost:.2f} → 买点级别: {entry_level or '未确定'}({zone_desc}) → 监控卖点: {'+'.join(sell_levels)}")
+        else:
+            sell_levels = ["日线", "30min"]
+            print(f"  📌 {name}({code}) 无成本价 → 默认监控: 日线+30min")
+
+        # 3b. 止损检查
         if waived != '是':
             if close_price and h['stop'] and close_price <= h['stop']:
                 alerts.append(f"⚠️ {name}({code}) 破止损: 现价{close_price:.2f}<=止损{h['stop']:.2f}")
 
-        # 3b. 背驰卖点 + 中枢破位检查(日线 + 30min)
-        for level in ["日线", "30min"]:
+        # 3c. 背驰卖点 + 中枢破位检查(动态级别)
+        for level in sell_levels:
             try:
                 r = analyze_beichi(code, level=level)
                 if "error" in r:
@@ -375,6 +452,7 @@ def run_intraday_scan():
         "confirmed_sells": confirmed_sells,
         "near_sells": near_sells,
         "zs_breakdowns": zs_breakdowns,
+        "entry_reports": entry_reports,
         "scanned": len(candidates),
     }
 
