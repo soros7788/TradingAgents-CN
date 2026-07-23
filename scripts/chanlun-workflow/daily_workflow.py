@@ -247,20 +247,69 @@ def run_intraday_scan():
     else:
         print(f"\n[2/3] 5min扫描: 跳过(30min无确认)")
 
-    # 3. 持仓止损检查
-    print(f"\n[3/3] 持仓止损检查...")
+    # 3. 持仓止损 + 背驰卖点检查
+    print(f"\n[3/3] 持仓检查(止损+背驰卖点)...")
     holdings = get_today_holdings()
     alerts = []
+    sell_signals = []
     for h in holdings:
-        if h['waived'] == '是':
-            continue
-        if h['close'] and h['stop'] and h['close'] <= h['stop']:
-            alerts.append(f"⚠️ {h['name']}({h['code']}) 破止损: 现价{h['close']:.2f}<=止损{h['stop']:.2f}")
+        code = str(h['code'])
+        name = h['name']
+        waived = h['waived']
+
+        # 3a. 止损检查
+        if waived != '是':
+            if h['close'] and h['stop'] and h['close'] <= h['stop']:
+                alerts.append(f"⚠️ {name}({code}) 破止损: 现价{h['close']:.2f}<=止损{h['stop']:.2f}")
+
+        # 3b. 背驰卖点检查(日线 + 30min)
+        for level in ["日线", "30min"]:
+            try:
+                r = analyze_beichi(code, level=level)
+                if "error" in r:
+                    continue
+                for sig in r.get("signals", []):
+                    if "卖" not in sig["op"]:
+                        continue
+                    ratio = sig["ratio"]
+                    dlp = sig["dl_prob"]
+                    valid = sig["valid"]
+                    confirmed_sell = ratio < 60 and dlp > 0.8 and valid
+                    near_sell = (ratio < 60 and dlp > 0.6 and valid) or (ratio < 85 and dlp > 0.8 and valid)
+                    if confirmed_sell:
+                        sell_signals.append({
+                            "name": name, "code": code, "level": level,
+                            "op": sig["op"], "ratio": ratio, "dlp": dlp, "valid": valid,
+                            "type": "确认卖点"
+                        })
+                        print(f"  🔴 {name}({code}) {level}确认卖点: {sig['op']} ratio={ratio:.0f}% DL_P={dlp:.2f}")
+                    elif near_sell:
+                        sell_signals.append({
+                            "name": name, "code": code, "level": level,
+                            "op": sig["op"], "ratio": ratio, "dlp": dlp, "valid": valid,
+                            "type": "接近卖点"
+                        })
+            except:
+                pass
+
     if alerts:
         for a in alerts:
             print(f"  {a}")
-    else:
-        print(f"  持仓{len(holdings)}只, 止损全部合规")
+
+    # 卖点汇总
+    confirmed_sells = [s for s in sell_signals if s["type"] == "确认卖点"]
+    near_sells = [s for s in sell_signals if s["type"] == "接近卖点"]
+    if confirmed_sells:
+        print(f"  🔴 确认卖点: {len(confirmed_sells)}个")
+    if near_sells:
+        print(f"  🟡 接近卖点: {len(near_sells)}个")
+        for s in near_sells[:5]:
+            missing = []
+            if s["ratio"] >= 60: missing.append("ratio=%d%%" % s["ratio"])
+            if s["dlp"] <= 0.8: missing.append("DL_P=%.2f" % s["dlp"])
+            print(f"    {s['name']}({s['code']}) {s['level']} {s['op']} 缺:{'+'.join(missing)}")
+    if not alerts and not confirmed_sells and not near_sells:
+        print(f"  持仓{len(holdings)}只, 止损合规, 无背驰卖点")
 
     # 汇总
     print(f"\n{'='*50}")
@@ -282,11 +331,18 @@ def run_intraday_scan():
     if alerts:
         print(f"\n⚠️ 止损告警: {len(alerts)}只需处理")
 
+    if confirmed_sells:
+        print(f"\n🔴 确认卖点: {len(confirmed_sells)}个 (建议卖出)")
+    if near_sells:
+        print(f"\n🟡 接近卖点: {len(near_sells)}个")
+
     print(f"{'='*50}")
     return {
         "confirmed_30m": confirmed_30m,
         "near_30m": near_30m,
         "alerts": alerts,
+        "confirmed_sells": confirmed_sells,
+        "near_sells": near_sells,
         "scanned": len(candidates),
     }
 
