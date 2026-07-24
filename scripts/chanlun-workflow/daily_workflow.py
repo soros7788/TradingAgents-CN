@@ -14,9 +14,10 @@ from decimal import Decimal
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 
-WB = '/workspace/动态仓位资金管理法则_执行版.xlsx'
-RECALC = '/data/user/builtin/work/eurydice/skills/xlsx/scripts/recalc.py'
-BEICHI_DIR = '/workspace/chanlun-kline'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WB = os.environ.get('TRADE_WB', os.path.join(SCRIPT_DIR, '动态仓位资金管理法则_执行版.xlsx'))
+RECALC = os.path.join(SCRIPT_DIR, 'recalc.py')
+BEICHI_DIR = SCRIPT_DIR
 
 def recalc():
     r = subprocess.run(['python', RECALC, WB, '30'], capture_output=True, text=True)

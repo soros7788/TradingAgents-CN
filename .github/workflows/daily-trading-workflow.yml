@@ -1,11 +1,11 @@
 name: Daily Trading Workflow
 on:
   schedule:
-    # 盘中扫描: 交易日 10:00/11:00/13:00/14:00 (UTC+8 = UTC 02:00/03:00/05:00/06:00)
+    # 盘中扫描: 交易日 10:00/11:00/13:00/14:00 → intraday (30min候选池+持仓止损)
     - cron: '0 2,3,5,6 * * 1-5'
-    # 收盘扫描: 交易日 15:05 (UTC+8 = UTC 07:05)
+    # 日线全市场扫描: 交易日 15:05 → scan (更新候选池日线信号)
     - cron: '5 7 * * 1-5'
-    # 心态日志提醒: 交易日 15:30 (UTC+8 = UTC 07:30)
+    # 合规核查+心态日志: 交易日 15:30 → compliance
     - cron: '30 7 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -27,7 +27,7 @@ jobs:
   daily-workflow:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -40,10 +40,28 @@ jobs:
         run: |
           pip install openpyxl numpy pandas scikit-learn==1.7.2
 
+      - name: Install LibreOffice
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libreoffice-calc
+
       - name: Run workflow
         id: workflow
         run: |
-          CMD="${{ github.event.inputs.command || 'intraday' }}"
+          # 定时任务根据cron时间自动选择命令, 手动触发用输入值
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            HOUR=$(date '+%H')
+            MINUTE=$(date '+%M')
+            if [ "$HOUR" = "07" ] && [ "$MINUTE" = "05" ]; then
+              CMD="scan"          # 15:05 收盘后日线全市场扫描 + 更新候选池
+            elif [ "$HOUR" = "07" ] && [ "$MINUTE" = "30" ]; then
+              CMD="compliance"    # 15:30 合规核查
+            else
+              CMD="intraday"      # 盘中30min扫描 + 持仓止损检查
+            fi
+          else
+            CMD="${{ github.event.inputs.command || 'intraday' }}"
+          fi
           echo "=== $CMD $(date '+%Y-%m-%d %H:%M') ==="
           cd scripts/chanlun-workflow
           python daily_workflow.py $CMD 2>&1 | tee /tmp/workflow_output.txt
@@ -100,8 +118,11 @@ jobs:
 
             # 构建消息体
             if [ "${{ github.event_name }}" = "schedule" ] && [ "$MINUTE" = "30" ] && [ "$HOUR" = "07" ]; then
-              # 心态日志提醒不需要输出摘要
-              MSG_BODY="$MSG_BODY"
+              # 心态日志提醒 + 合规告警
+              ALERT=$(grep -oP '⚠️.*' /tmp/workflow_output.txt 2>/dev/null | head -5)
+              if [ -n "$ALERT" ]; then
+                MSG_BODY="$MSG_BODY\n\n⚠️ 合规告警:\n$ALERT"
+              fi
             else
               BODY_LINES=""
               [ -n "$COVERAGE" ] && BODY_LINES="$BODY_LINES\n📊 $COVERAGE"
@@ -127,3 +148,18 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" | jq '.ok // false'
+
+      - name: Commit Excel changes
+        if: success()
+        run: |
+          cd scripts/chanlun-workflow
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet "动态仓位资金管理法则_执行版.xlsx"; then
+            echo "No changes to Excel file"
+          else
+            git add "动态仓位资金管理法则_执行版.xlsx"
+            git commit -m "auto: update candidate pool ($(date '+%Y-%m-%d %H:%M'))"
+            git push
+            echo "Excel changes committed and pushed"
+          fi
