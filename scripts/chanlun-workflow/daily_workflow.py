@@ -431,7 +431,7 @@ def run_intraday_scan():
         print(f"  🔻 中枢破位: {len(zs_breakdowns)}个")
         for z in zs_breakdowns:
             waived_tag = " [WAIVED]" if z["waived"] == "是" else ""
-            print(f"    {z['name']}({z['code']}) {z['level']} 现价{z['price']:.2f}<下沿{z['zd']:.2f} ({z['pct']:+.1f}%){waived_tag}")
+            print(f"    {z['name']}({z['code']}) {z['level']} 现价{z['price']:.2f} 跌破下沿{z['zd']:.2f} ({z['pct']:+.1f}%){waived_tag}")
 
     # 卖点汇总
     confirmed_sells = [s for s in sell_signals if s["type"] == "确认卖点"]
@@ -611,7 +611,7 @@ def format_intraday_summary(result, ts):
         non_waived = [z for z in breakdowns if z["waived"] != "是"]
         lines.append(f"🔻 中枢破位: {len(breakdowns)}个 (非WAIVED {len(non_waived)}个)")
         for z in non_waived[:5]:
-            lines.append(f"  {z['name']}({z['code']}) {z['level']} ¥{z['price']:.2f}<下沿{z['zd']:.2f} ({z['pct']:+.1f}%)")
+            lines.append(f"  {z['name']}({z['code']}) {z['level']} ¥{z['price']:.2f} 跌破下沿{z['zd']:.2f} ({z['pct']:+.1f}%)")
         if len(non_waived) > 5:
             lines.append(f"  ...还有{len(non_waived)-5}个")
         lines.append("")
