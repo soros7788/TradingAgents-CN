@@ -491,24 +491,48 @@ def run_intraday_scan():
         "scanned": len(candidates),
     }
 
-def send_telegram(text):
+def send_telegram(text, title=""):
     """Send message to Telegram. Splits long messages automatically."""
-    token = os.environ.get('TELEGRAM_BOT_TOKEN') or os.environ.get('TG_TOKEN')
-    chat_id = os.environ.get('TELEGRAM_CHAT_ID') or os.environ.get('TG_CHAT_ID')
+    # Try all possible env var names
+    token = (os.environ.get('TELEGRAM_BOT_TOKEN')
+             or os.environ.get('TG_TOKEN')
+             or os.environ.get('TELEGRAM_TOKEN'))
+    chat_id = (os.environ.get('TELEGRAM_CHAT_ID')
+               or os.environ.get('TG_CHAT_ID')
+               or os.environ.get('TELEGRAM_CHATID'))
+
+    # Debug: show what env vars exist
+    env_keys = sorted(os.environ.keys())
+    tg_keys = [k for k in env_keys if 'TELEGRAM' in k.upper() or 'TG_' in k.upper()]
+    print(f"[TG] Telegram env vars found: {tg_keys}")
+    print(f"[TG] token set: {'YES' if token else 'NO'}")
+    print(f"[TG] chat_id set: {'YES' if chat_id else 'NO'}")
+
     if not token or not chat_id:
+        print("[TG] SKIP: token or chat_id missing, printing to stdout instead")
+        print("=" * 40)
+        if title:
+            print(title)
+        print(text)
+        print("=" * 40)
         return
+
+    # Build message with title
+    full_text = f"{title}\n{text}" if title else text
 
     # Split into chunks of 4000 chars (Telegram limit is 4096)
     chunks = []
-    while text:
-        if len(text) <= 4000:
-            chunks.append(text)
+    while full_text:
+        if len(full_text) <= 4000:
+            chunks.append(full_text)
             break
-        split_at = text.rfind('\n', 0, 4000)
+        split_at = full_text.rfind('\n', 0, 4000)
         if split_at < 2000:
             split_at = 4000
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip('\n')
+        chunks.append(full_text[:split_at])
+        full_text = full_text[split_at:].lstrip('\n')
+
+    print(f"[TG] Sending {len(chunks)} message(s), total chars={len(text)}")
 
     for i, chunk in enumerate(chunks):
         if i > 0:
@@ -525,9 +549,14 @@ def send_telegram(text):
             headers={"Content-Type": "application/json"},
         )
         try:
-            urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=15)
+            resp_body = resp.read().decode('utf-8')
+            print(f"[TG] chunk {i+1} OK: {resp_body[:100]}")
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
+            print(f"[TG] chunk {i+1} HTTP ERROR {e.code}: {err_body}")
         except Exception as e:
-            print(f"Telegram发送失败: {e}")
+            print(f"[TG] chunk {i+1} ERROR: {type(e).__name__}: {e}")
         if i < len(chunks) - 1:
             time.sleep(1)
 
