@@ -540,7 +540,6 @@ def send_telegram(text, title=""):
         data = json.dumps({
             "chat_id": chat_id,
             "text": chunk,
-            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }).encode('utf-8')
         req = urllib.request.Request(
