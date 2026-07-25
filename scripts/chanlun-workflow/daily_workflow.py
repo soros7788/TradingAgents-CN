@@ -8,7 +8,8 @@
   python daily_workflow.py account
   python daily_workflow.py holdings
 """
-import sys, subprocess, json, os
+import sys, subprocess, json, os, time
+import urllib.request
 from datetime import datetime, date
 from decimal import Decimal
 from openpyxl import load_workbook
@@ -110,6 +111,8 @@ def check_compliance():
         return v
     print(json.dumps({"account": {k:safe(v) for k,v in account.items()}, "holdings": [{k:safe(v) for k,v in h.items()} for h in holdings], "issues": issues, "compliant": len(issues)==0}, ensure_ascii=False, indent=2))
 
+    return account, holdings, issues
+
 def safe_val(v):
     if isinstance(v, (datetime, date)): return str(v)
     if isinstance(v, Decimal): return float(v)
@@ -184,7 +187,11 @@ def run_full_scan():
 
     print(f"\n候选池: 写入{len(selected)}只 (沪A{min(15,len(sha_near))}+深市{min(15,len(sz_near))})")
     print(f"公式重算: {errors}个错误")
-    return result
+    return {
+        "scan_result": result,
+        "selected": selected,
+        "errors": errors,
+    }
 
 def detect_entry_level(code, cost):
     """根据成本价判断属于哪个级别的买点区间, 返回对应卖点级别列表
@@ -484,29 +491,227 @@ def run_intraday_scan():
         "scanned": len(candidates),
     }
 
+def send_telegram(text):
+    """Send message to Telegram. Splits long messages automatically."""
+    token = os.environ.get('TELEGRAM_BOT_TOKEN') or os.environ.get('TG_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID') or os.environ.get('TG_CHAT_ID')
+    if not token or not chat_id:
+        return
+
+    # Split into chunks of 4000 chars (Telegram limit is 4096)
+    chunks = []
+    while text:
+        if len(text) <= 4000:
+            chunks.append(text)
+            break
+        split_at = text.rfind('\n', 0, 4000)
+        if split_at < 2000:
+            split_at = 4000
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip('\n')
+
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            chunk = f"续({i+1}/{len(chunks)}):\n{chunk}"
+        data = json.dumps({
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"Telegram发送失败: {e}")
+        if i < len(chunks) - 1:
+            time.sleep(1)
+
+
+def format_intraday_summary(result, ts):
+    """Format intraday scan results into clean Telegram message."""
+    lines = [f"📡 盘中扫描 {ts}", ""]
+
+    scanned = result.get("scanned", 0)
+    lines.append(f"📊 扫描: {scanned}只候选")
+    lines.append("")
+
+    # 30min确认
+    confirmed = result.get("confirmed_30m", [])
+    if confirmed:
+        lines.append(f"★ 30min确认: {len(confirmed)}只")
+        for s in confirmed:
+            lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} ratio={s['ratio']:.0f}% DL_P={s['dlp']:.2f}")
+        lines.append("")
+
+    # 30min接近
+    near = result.get("near_30m", [])
+    if near:
+        lines.append(f"◆ 30min接近: {len(near)}只")
+        for s in near[:8]:
+            missing = []
+            if s["ratio"] >= 60: missing.append(f"ratio={s['ratio']:.0f}%")
+            if s["dlp"] <= 0.8: missing.append(f"DL_P={s['dlp']:.2f}")
+            lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} 缺:{'+'.join(missing)}")
+        if len(near) > 8:
+            lines.append(f"  ...还有{len(near)-8}只")
+        lines.append("")
+
+    # 持仓买点级别
+    entry_reports = result.get("entry_reports", [])
+    if entry_reports:
+        lines.append("📌 持仓买点级别:")
+        for e in entry_reports:
+            lines.append(f"  {e['name']}({e['code']}) {e['entry_level']} → 监控:{'+'.join(e['sell_levels'])}")
+        lines.append("")
+
+    # 止损告警
+    alerts = result.get("alerts", [])
+    if alerts:
+        lines.append(f"⚠️ 止损告警: {len(alerts)}只")
+        for a in alerts:
+            lines.append(f"  {a}")
+        lines.append("")
+
+    # 中枢破位
+    breakdowns = result.get("zs_breakdowns", [])
+    if breakdowns:
+        non_waived = [z for z in breakdowns if z["waived"] != "是"]
+        lines.append(f"🔻 中枢破位: {len(breakdowns)}个 (非WAIVED {len(non_waived)}个)")
+        for z in non_waived[:5]:
+            lines.append(f"  {z['name']}({z['code']}) {z['level']} ¥{z['price']:.2f}<下沿{z['zd']:.2f} ({z['pct']:+.1f}%)")
+        if len(non_waived) > 5:
+            lines.append(f"  ...还有{len(non_waived)-5}个")
+        lines.append("")
+
+    # 卖点
+    confirmed_sells = result.get("confirmed_sells", [])
+    near_sells = result.get("near_sells", [])
+    if confirmed_sells:
+        lines.append(f"🔴 确认卖点: {len(confirmed_sells)}个 (建议卖出)")
+        for s in confirmed_sells:
+            lines.append(f"  {s['name']}({s['code']}) {s['level']} {s['op']} ratio={s['ratio']:.0f}% DL_P={s['dlp']:.2f}")
+        lines.append("")
+    if near_sells:
+        lines.append(f"🟡 接近卖点: {len(near_sells)}个")
+        for s in near_sells[:5]:
+            missing = []
+            if s["ratio"] >= 60: missing.append(f"ratio={s['ratio']:.0f}%")
+            if s["dlp"] <= 0.8: missing.append(f"DL_P={s['dlp']:.2f}")
+            lines.append(f"  {s['name']}({s['code']}) {s['level']} {s['op']} 缺:{'+'.join(missing)}")
+        lines.append("")
+
+    if not any([confirmed, near, alerts, breakdowns, confirmed_sells, near_sells]):
+        lines.append("✓ 无信号, 持仓合规")
+
+    return '\n'.join(lines)
+
+
+def format_scan_summary(scan_data, ts):
+    """Format full scan results into clean Telegram message."""
+    lines = [f"📊 收盘扫描报告 {ts}", ""]
+
+    result = scan_data.get("scan_result", {})
+    selected = scan_data.get("selected", [])
+    errors = scan_data.get("errors", 0)
+
+    total = result.get("total_scanned", 0) or len(result.get("near", []))
+    near_count = len(result.get("near", []))
+
+    lines.append(f"扫描: {total}只 | 接近确认: {near_count}只")
+    lines.append(f"候选池写入: {len(selected)}只 | 公式错误: {errors}")
+    lines.append("")
+
+    if selected:
+        lines.append("候选池明细:")
+        for s in selected[:15]:
+            missing = []
+            if s.get("ratio", 0) >= 60: missing.append(f"ratio={s['ratio']:.0f}%")
+            if s.get("dlp", 0) <= 0.8: missing.append(f"DL_P={s['dlp']:.2f}")
+            note = f" 缺:{'+'.join(missing)}" if missing else " ✓确认"
+            lines.append(f"  {s.get('name','')} {s['code']} ¥{s['price']:.2f}{note}")
+        if len(selected) > 15:
+            lines.append(f"  ...还有{len(selected)-15}只")
+
+    return '\n'.join(lines)
+
+
+def format_compliance_summary(account, holdings, issues, ts):
+    """Format compliance check results into clean Telegram message."""
+    lines = [f"📝 合规核查 {ts}", ""]
+
+    total_asset = account.get("total_asset", 0) or 0
+    cash = account.get("cash", 0) or 0
+    pos_ratio = account.get("position_ratio", 0) or 0
+
+    lines.append(f"总资产: ¥{total_asset:.2f}")
+    lines.append(f"现金: ¥{cash:.2f}")
+    lines.append(f"仓位: {pos_ratio:.1%}")
+    lines.append(f"持仓: {len(holdings)}只")
+    lines.append("")
+
+    if issues:
+        lines.append(f"⚠️ 合规告警 ({len(issues)}项):")
+        for issue in issues:
+            lines.append(f"  {issue}")
+        lines.append("")
+    else:
+        lines.append("✓ 持仓合规")
+        lines.append("")
+
+    lines.append("📝 心态日志提醒:")
+    lines.append("  • 非工作流看盘次数 (0=最好)")
+    lines.append("  • 是否追价操作 (0=最好)")
+    lines.append("  • 是否按系统执行 (5=最好)")
+    lines.append("  • 情绪状态 (5=最好)")
+    lines.append("  • 止损外操作 (0=最好)")
+    lines.append("  达标线: 80分")
+
+    return '\n'.join(lines)
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: daily_workflow.py [compliance|scan|account|holdings]")
         return
     cmd = sys.argv[1]
-    if cmd == "compliance":
-        check_compliance()
-    elif cmd == "scan":
-        run_full_scan()
-    elif cmd == "intraday":
-        run_intraday_scan()
-    elif cmd == "account":
-        a = get_account_summary()
-        def safe(v):
-            if isinstance(v, (datetime, date)): return str(v)
-            if isinstance(v, Decimal): return float(v)
-            return v
-        print(json.dumps({k:safe(v) for k,v in a.items()}, ensure_ascii=False, indent=2))
-    elif cmd == "holdings":
-        h = get_today_holdings()
-        print(json.dumps(h, ensure_ascii=False, indent=2))
-    else:
-        print(f"未知命令: {cmd}")
+    ts = datetime.now().strftime('%m-%d %H:%M')
+
+    try:
+        if cmd == "compliance":
+            account, holdings, issues = check_compliance()
+            msg = format_compliance_summary(account, holdings, issues, ts)
+            send_telegram(msg)
+        elif cmd == "scan":
+            scan_data = run_full_scan()
+            msg = format_scan_summary(scan_data, ts)
+            send_telegram(msg)
+        elif cmd == "intraday":
+            result = run_intraday_scan()
+            msg = format_intraday_summary(result, ts)
+            send_telegram(msg)
+        elif cmd == "account":
+            a = get_account_summary()
+            def safe(v):
+                if isinstance(v, (datetime, date)): return str(v)
+                if isinstance(v, Decimal): return float(v)
+                return v
+            print(json.dumps({k:safe(v) for k,v in a.items()}, ensure_ascii=False, indent=2))
+        elif cmd == "holdings":
+            h = get_today_holdings()
+            print(json.dumps(h, ensure_ascii=False, indent=2))
+        else:
+            print(f"未知命令: {cmd}")
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()
+        print(f"ERROR: {err}")
+        send_telegram(f"❌ 工作流错误 ({cmd}) {ts}\n\n{str(e)}")
+        raise
 
 if __name__ == '__main__':
     main()

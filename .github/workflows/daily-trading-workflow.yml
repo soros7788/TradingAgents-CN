@@ -47,6 +47,9 @@ jobs:
 
       - name: Run workflow
         id: workflow
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           # 定时任务根据cron时间自动选择命令, 手动触发用输入值
           if [ "${{ github.event_name }}" = "schedule" ]; then
@@ -66,98 +69,6 @@ jobs:
           cd scripts/chanlun-workflow
           python daily_workflow.py $CMD 2>&1 | tee /tmp/workflow_output.txt
           echo "exit_code=$?" >> $GITHUB_OUTPUT
-
-      - name: Send Telegram notification
-        if: always()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "Telegram secrets not configured, skipping notification"
-            exit 0
-          fi
-
-          STATUS="${{ steps.workflow.outcome }}"
-          TIMESTAMP=$(date '+%m-%d %H:%M')
-
-          # 判断消息标题
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            HOUR=$(date '+%H')
-            MINUTE=$(date '+%M')
-            if [ "$MINUTE" = "30" ] && [ "$HOUR" = "07" ]; then
-              MSG_TITLE="📝 心态日志提醒"
-            elif [ "$MINUTE" = "05" ] && [ "$HOUR" = "07" ]; then
-              MSG_TITLE="📊 收盘扫描报告"
-            else
-              MSG_TITLE="📡 盘中扫描 $TIMESTAMP"
-            fi
-          else
-            MSG_TITLE="🔧 手动触发: ${{ github.event.inputs.command || 'intraday' }}"
-          fi
-
-          # 状态图标
-          if [ "$STATUS" = "success" ]; then
-            STATUS_ICON="✅"
-          else
-            STATUS_ICON="❌"
-          fi
-
-          # 从 workflow 输出提取完整汇总内容
-          # 策略: 取最后80行(包含汇总区), 清理ANSI颜色码
-          if [ -f /tmp/workflow_output.txt ]; then
-            # 取最后80行输出
-            SUMMARY=$(tail -80 /tmp/workflow_output.txt)
-
-            # 清理 ANSI 颜色码
-            SUMMARY=$(echo "$SUMMARY" | sed 's/\x1b\[[0-9;]*m//g')
-
-            # Telegram 消息上限 4096 字符, 预留标题空间, 截取到3500字符
-            # 尝试在换行处截断, 避免截断到一半
-            MSG_BODY=$(echo "$SUMMARY" | head -c 3500)
-            # 找到最后一个换行, 在那里截断
-            LAST_NL=$(echo "$MSG_BODY" | grep -b -o $'\n' | tail -1 | cut -d: -f1)
-            if [ -n "$LAST_NL" ] && [ "$LAST_NL" -gt 500 ]; then
-              MSG_BODY=$(echo "$SUMMARY" | head -c "$LAST_NL")
-            fi
-
-            # 检查是否被截断
-            FULL_LEN=$(echo "$SUMMARY" | wc -c)
-            BODY_LEN=$(echo "$MSG_BODY" | wc -c)
-            TRUNCATED=""
-            if [ "$FULL_LEN" -gt "$BODY_LEN" ]; then
-              TRUNCATED="\n\n...(输出已截断, 完整日志见 Actions 页面)"
-            fi
-
-            MSG_TEXT="${STATUS_ICON} ${MSG_TITLE}\n${TIMESTAMP}\n\n${MSG_BODY}${TRUNCATED}"
-          else
-            MSG_TEXT="${STATUS_ICON} ${MSG_TITLE}\n${TIMESTAMP}\n\n工作流运行完成: $STATUS"
-          fi
-
-          # 发送消息 (HTML 模式, 保留换行)
-          PAYLOAD=$(jq -n \
-            --arg chat_id "$TG_CHAT_ID" \
-            --arg text "$MSG_TEXT" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')
-
-          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" | jq '.ok // false'
-
-          # 如果内容被截断, 发送第二段(剩余部分)
-          if [ -n "$TRUNCATED" ] && [ "$FULL_LEN" -gt 3500 ]; then
-            REMAINING=$(echo "$SUMMARY" | tail -c +3501 | head -c 3500)
-            if [ -n "$REMAINING" ]; then
-              REMAINING_PAYLOAD=$(jq -n \
-                --arg chat_id "$TG_CHAT_ID" \
-                --arg text "续:\n${REMAINING}" \
-                '{chat_id: $chat_id, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')
-              sleep 1
-              curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-                -H "Content-Type: application/json" \
-                -d "$REMAINING_PAYLOAD" | jq '.ok // false'
-            fi
-          fi
 
       - name: Commit Excel changes
         if: success()
