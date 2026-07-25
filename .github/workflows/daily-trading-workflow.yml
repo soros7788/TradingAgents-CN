@@ -81,14 +81,12 @@ jobs:
           STATUS="${{ steps.workflow.outcome }}"
           TIMESTAMP=$(date '+%m-%d %H:%M')
 
-          # 判断是定时任务还是手动触发
+          # 判断消息标题
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            # 根据 cron 时间判断类型
             HOUR=$(date '+%H')
             MINUTE=$(date '+%M')
             if [ "$MINUTE" = "30" ] && [ "$HOUR" = "07" ]; then
               MSG_TITLE="📝 心态日志提醒"
-              MSG_BODY="现在是北京时间15:30，请填写今日心态日志。\n\n评分维度(0-5分):\n• 非工作流看盘次数 (0=0次最好)\n• 是否追价操作 (0=没有最好)\n• 是否按系统执行 (5=完全最好)\n• 情绪状态 (5=平静最好)\n• 止损外操作 (0=没有最好)\n\n达标线: 80分"
             elif [ "$MINUTE" = "05" ] && [ "$HOUR" = "07" ]; then
               MSG_TITLE="📊 收盘扫描报告"
             else
@@ -98,56 +96,68 @@ jobs:
             MSG_TITLE="🔧 手动触发: ${{ github.event.inputs.command || 'intraday' }}"
           fi
 
-          # 如果是 scan/intraday/compliance, 提取输出摘要
-          if [ -f /tmp/workflow_output.txt ]; then
-            # 提取关键信息
-            CONFIRMED=$(grep -oP '确认\d*只' /tmp/workflow_output.txt | tail -1)
-            NEAR=$(grep -oP '接近\d*只' /tmp/workflow_output.txt | tail -1)
-            ALERT=$(grep -oP '⚠️.*' /tmp/workflow_output.txt | head -5)
-            COMPLIANT=$(grep -oP '合规' /tmp/workflow_output.txt | tail -1)
-            COVERAGE=$(grep -oP '覆盖.*只' /tmp/workflow_output.txt | tail -1)
-            ERROR=$(grep -oP 'Error.*' /tmp/workflow_output.txt | head -1)
-
-            if [ -n "$ERROR" ]; then
-              STATUS_ICON="❌"
-            elif [ "$STATUS" = "success" ]; then
-              STATUS_ICON="✅"
-            else
-              STATUS_ICON="⚠️"
-            fi
-
-            # 构建消息体
-            if [ "${{ github.event_name }}" = "schedule" ] && [ "$MINUTE" = "30" ] && [ "$HOUR" = "07" ]; then
-              # 心态日志提醒 + 合规告警
-              ALERT=$(grep -oP '⚠️.*' /tmp/workflow_output.txt 2>/dev/null | head -5)
-              if [ -n "$ALERT" ]; then
-                MSG_BODY="$MSG_BODY\n\n⚠️ 合规告警:\n$ALERT"
-              fi
-            else
-              BODY_LINES=""
-              [ -n "$COVERAGE" ] && BODY_LINES="$BODY_LINES\n📊 $COVERAGE"
-              [ -n "$CONFIRMED" ] && BODY_LINES="$BODY_LINES\n★ $CONFIRMED"
-              [ -n "$NEAR" ] && BODY_LINES="$BODY_LINES\n◆ $NEAR"
-              [ -n "$COMPLIANT" ] && BODY_LINES="$BODY_LINES\n✓ 持仓$COMPLIANT"
-              [ -n "$ALERT" ] && BODY_LINES="$BODY_LINES\n$ALERT"
-              MSG_BODY="${STATUS_ICON} $TIMESTAMP\n${BODY_LINES}"
-            fi
+          # 状态图标
+          if [ "$STATUS" = "success" ]; then
+            STATUS_ICON="✅"
           else
-            MSG_BODY="工作流运行完成: $STATUS"
+            STATUS_ICON="❌"
           fi
 
-          # 发送消息
+          # 从 workflow 输出提取完整汇总内容
+          # 策略: 取最后80行(包含汇总区), 清理ANSI颜色码
+          if [ -f /tmp/workflow_output.txt ]; then
+            # 取最后80行输出
+            SUMMARY=$(tail -80 /tmp/workflow_output.txt)
+
+            # 清理 ANSI 颜色码
+            SUMMARY=$(echo "$SUMMARY" | sed 's/\x1b\[[0-9;]*m//g')
+
+            # Telegram 消息上限 4096 字符, 预留标题空间, 截取到3500字符
+            # 尝试在换行处截断, 避免截断到一半
+            MSG_BODY=$(echo "$SUMMARY" | head -c 3500)
+            # 找到最后一个换行, 在那里截断
+            LAST_NL=$(echo "$MSG_BODY" | grep -b -o $'\n' | tail -1 | cut -d: -f1)
+            if [ -n "$LAST_NL" ] && [ "$LAST_NL" -gt 500 ]; then
+              MSG_BODY=$(echo "$SUMMARY" | head -c "$LAST_NL")
+            fi
+
+            # 检查是否被截断
+            FULL_LEN=$(echo "$SUMMARY" | wc -c)
+            BODY_LEN=$(echo "$MSG_BODY" | wc -c)
+            TRUNCATED=""
+            if [ "$FULL_LEN" -gt "$BODY_LEN" ]; then
+              TRUNCATED="\n\n...(输出已截断, 完整日志见 Actions 页面)"
+            fi
+
+            MSG_TEXT="${STATUS_ICON} ${MSG_TITLE}\n${TIMESTAMP}\n\n${MSG_BODY}${TRUNCATED}"
+          else
+            MSG_TEXT="${STATUS_ICON} ${MSG_TITLE}\n${TIMESTAMP}\n\n工作流运行完成: $STATUS"
+          fi
+
+          # 发送消息 (HTML 模式, 保留换行)
           PAYLOAD=$(jq -n \
             --arg chat_id "$TG_CHAT_ID" \
-            --arg text "$MSG_TITLE
-
-          $MSG_BODY" \
-            --arg parse_mode "Markdown" \
-            '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+            --arg text "$MSG_TEXT" \
+            '{chat_id: $chat_id, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')
 
           curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" | jq '.ok // false'
+
+          # 如果内容被截断, 发送第二段(剩余部分)
+          if [ -n "$TRUNCATED" ] && [ "$FULL_LEN" -gt 3500 ]; then
+            REMAINING=$(echo "$SUMMARY" | tail -c +3501 | head -c 3500)
+            if [ -n "$REMAINING" ]; then
+              REMAINING_PAYLOAD=$(jq -n \
+                --arg chat_id "$TG_CHAT_ID" \
+                --arg text "续:\n${REMAINING}" \
+                '{chat_id: $chat_id, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')
+              sleep 1
+              curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$REMAINING_PAYLOAD" | jq '.ok // false'
+            fi
+          fi
 
       - name: Commit Excel changes
         if: success()

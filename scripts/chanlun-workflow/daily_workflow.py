@@ -77,6 +77,33 @@ def check_compliance():
             issues.append(f"⚠️ {h['name']}已破止损: 现价{h['close']:.2f}<=止损{h['stop']:.2f}")
         if h['pos'] and h['pos'] > 0.35:
             issues.append(f"⚠️ {h['name']}仓位超限: {h['pos']:.1%}>35%")
+
+    # 输出合规摘要(可读格式, 供 Telegram 推送)
+    print(f"{'='*50}")
+    print(f"📝 合规核查 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*50}")
+    print(f"账户总资产: ¥{account.get('total_asset', 0):.2f}" if account.get('total_asset') else "账户总资产: N/A")
+    print(f"现金: ¥{account.get('cash', 0):.2f}" if account.get('cash') else "现金: N/A")
+    print(f"仓位比例: {account.get('position_ratio', 0):.1%}" if account.get('position_ratio') else "仓位比例: N/A")
+    print(f"持仓数量: {len(holdings)}只")
+    if issues:
+        print(f"\n⚠️ 合规告警 ({len(issues)}项):")
+        for issue in issues:
+            print(f"  {issue}")
+    else:
+        print("\n✓ 持仓合规, 无告警")
+
+    print(f"\n📝 心态日志提醒:")
+    print(f"  评分维度(0-5分):")
+    print(f"  • 非工作流看盘次数 (0=0次最好)")
+    print(f"  • 是否追价操作 (0=没有最好)")
+    print(f"  • 是否按系统执行 (5=完全最好)")
+    print(f"  • 情绪状态 (5=平静最好)")
+    print(f"  • 止损外操作 (0=没有最好)")
+    print(f"  达标线: 80分")
+    print(f"{'='*50}")
+
+    # 同时输出 JSON (供程序化处理)
     def safe(v):
         if isinstance(v, (datetime, date)): return str(v)
         if isinstance(v, Decimal): return float(v)
