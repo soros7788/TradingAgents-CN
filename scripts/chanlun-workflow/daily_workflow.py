@@ -105,11 +105,12 @@ def get_dynamic_position_cap(code, cost, close):
     if pnl_pct < 0.05:
         return 0.35
     
-    # 条件1: 买点升级 — 检测二买/三买信号
+    # 条件1: 买点升级 — 检测二买/三买信号(需DL_P验证)
     sys.path.insert(0, BEICHI_DIR)
     from beichi_analyzer import analyze_beichi
     
     best_entry = "一买"
+    best_dl_prob = 0
     for level in ["日线", "30min"]:
         try:
             r = analyze_beichi(code, level=level)
@@ -118,17 +119,21 @@ def get_dynamic_position_cap(code, cost, close):
             for sig in r["signals"]:
                 if not sig.get("valid"):
                     continue
-                if sig["op"] == "三买":
+                dl_prob = sig.get("dl_prob", 0)
+                if sig["op"] == "三买" and dl_prob >= 0.45 and dl_prob > best_dl_prob:
                     best_entry = "三买"
+                    best_dl_prob = dl_prob
                     break
-                elif sig["op"] == "二买" and best_entry != "三买":
+                elif sig["op"] == "二买" and dl_prob >= 0.40 and dl_prob > best_dl_prob and best_entry != "三买":
                     best_entry = "二买"
+                    best_dl_prob = dl_prob
             if best_entry == "三买":
                 break
         except:
             pass
     
     dynamic_cap_info["entry"] = best_entry
+    dynamic_cap_info["dl_prob"] = best_dl_prob
     
     # 动态上限表: 买点级别 × 浮盈护垫
     cap_table = {

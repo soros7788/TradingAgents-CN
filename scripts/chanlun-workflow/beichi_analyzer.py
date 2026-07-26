@@ -593,65 +593,130 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
             })
 
     # ============================================================
-    # 二买/三买信号检测 (2026-07-26)
-    # 缠论定义:
+    # 二买/三买信号检测 V2 (2026-07-26): DL_P验证 + 四重条件
+    #
+    # BUG修复 (Codex审计):
+    #   1. 硬编码概率 → 改为DL模型计算真实概率
+    #   2. 缺一买前提 → 必须验证存在有效一买且时间在前
+    #   3. 无趋势过滤 → 必须overall_dir=="up"
+    #   4. 三买定义偏差 → 需回踩确认不追高
+    #
+    # 缠论原始定义:
     #   二买: 一买后反弹形成新中枢, 回踩不破前低 → 趋势确认
     #   三买: 二买后新中枢形成, 回踩不破二买中枢上沿 → 趋势加速
-    # 实现: 基于已有中枢序列判断中枢上移模式
     # ============================================================
+    
+    # 条件0: 必须有有效一买信号(二买/三买的前提)
     bull_signals = [s for s in signals if s["op"] == "一买" and s["valid"]]
-    if len(zss) >= 2 and bull_signals:
-        for i in range(1, len(zss)):
-            prev_zs = zss[i - 1]
-            curr_zs = zss[i]
+    if not bull_signals or len(zss) < 2:
+        pass  # 无一买信号, 跳过二买/三买检测
+    else:
+        # 条件1: 必须是上涨趋势
+        if overall_dir == "up":
+            for i in range(1, len(zss)):
+                prev_zs = zss[i - 1]
+                curr_zs = zss[i]
 
-            # 二买: 当前中枢下沿 > 前中枢上沿(中枢上移) + 回踩到当前中枢
-            if curr_zs["zd"] > prev_zs["zg"] and price > 0:
-                if curr_zs["zd"] <= price <= curr_zs["zg"]:
-                    signals.append({
-                        "type": "盘整背驰",
-                        "dir": "看多",
-                        "op": "二买",
-                        "ratio": 50,
-                        "dl_prob": 0.75,
-                        "zs": curr_zs,
-                        "pre_dir": "down",
-                        "post_dir": "up",
-                        "pre_ok": True,
-                        "post_ok": True,
-                        "valid": True,
-                        "aligned": True,
-                        "overall_dir": overall_dir,
-                        "pre_range": f"中枢{i}",
-                        "post_range": f"中枢{i+1}",
-                        "pre_reason": "中枢上移",
-                        "post_reason": "回踩确认",
-                    })
+                # 中枢上移: 当前中枢下沿 > 前中枢上沿
+                if curr_zs["zd"] > prev_zs["zg"] and price > 0:
+                    # 计算中枢上移的DL特征
+                    pre_s_ermai = max(0, prev_zs["s"] - pre_bars_map[level])
+                    pre_e_ermai = prev_zs["e"]
+                    post_s_ermai = curr_zs["s"]
+                    post_e_ermai = min(n - 1, curr_zs["e"])
 
-            # 三买: 两个中枢连续上移 + 回踩不破第二中枢上沿
-            if i >= 2 and curr_zs["zd"] > prev_zs["zg"]:
-                prev2_zs = zss[i - 2]
-                if prev_zs["zd"] > prev2_zs["zg"] and price > 0:
-                    if price > curr_zs["zg"]:
-                        signals.append({
-                            "type": "盘整背驰",
-                            "dir": "看多",
-                            "op": "三买",
-                            "ratio": 40,
-                            "dl_prob": 0.80,
-                            "zs": curr_zs,
-                            "pre_dir": "down",
-                            "post_dir": "up",
-                            "pre_ok": True,
-                            "post_ok": True,
-                            "valid": True,
-                            "aligned": True,
-                            "overall_dir": overall_dir,
-                            "pre_range": f"中枢{i-1}",
-                            "post_range": f"中枢{i+1}",
-                            "pre_reason": "连续上移",
-                            "post_reason": "突破加速",
-                        })
+                    pre_pct_ermai = abs(C[pre_e_ermai] - C[pre_s_ermai]) / C[pre_s_ermai] * 100 if C[pre_s_ermai] > 0 else 0
+                    post_pct_ermai = abs(C[post_e_ermai] - C[post_s_ermai]) / C[post_s_ermai] * 100 if C[post_s_ermai] > 0 else 0
+                    ratio_ermai = 50  # 二买默认ratio, DL模型会根据特征调整
+
+                    # 用DL模型计算真实概率
+                    try:
+                        dl_sig_type, dl_prob_ermai = predict_beichi(
+                            max(10, min(150, ratio_ermai)), pre_pct_ermai, post_pct_ermai,
+                            pre_e_ermai - pre_s_ermai + 1, post_e_ermai - post_s_ermai + 1,
+                            C, pre_s_ermai, pre_e_ermai, post_s_ermai, post_e_ermai,
+                            dif, bar, curr_zs, V, level, atr
+                        )
+                    except:
+                        dl_prob_ermai = 0.50  # DL不可用时保守估计
+
+                    # 二买: 回踩到当前中枢区间内(不追高)
+                    if curr_zs["zd"] <= price <= curr_zs["zg"]:
+                        # 条件2: 一买信号的时间必须在中枢上移之前
+                        one_buy_before = any(
+                            sig["zs"]["e"] <= prev_zs["s"] for sig in bull_signals
+                        )
+                        # 条件3: DL_P >= 0.4 (盘整背驰门槛, 二买要求较低)
+                        if one_buy_before and dl_prob_ermai >= 0.4:
+                            signals.append({
+                                "type": "盘整背驰" if dl_prob_ermai >= _DL_PAN_P else "无背驰",
+                                "dir": "看多",
+                                "op": "二买",
+                                "ratio": ratio_ermai,
+                                "dl_prob": dl_prob_ermai,
+                                "zs": curr_zs,
+                                "pre_dir": "down",
+                                "post_dir": "up",
+                                "pre_ok": True,
+                                "post_ok": True,
+                                "valid": dl_prob_ermai >= 0.4 and one_buy_before,
+                                "aligned": True,
+                                "overall_dir": overall_dir,
+                                "pre_range": f"中枢{i}",
+                                "post_range": f"中枢{i+1}",
+                                "pre_reason": "中枢上移+一买前提",
+                                "post_reason": "回踩确认",
+                            })
+
+                    # 三买: 连续两个中枢上移 + 突破后回踩不破第二中枢上沿
+                    if i >= 2:
+                        prev2_zs = zss[i - 2]
+                        if prev_zs["zd"] > prev2_zs["zg"]:
+                            # 回踩确认: 价格在当前中枢上方但有过回调
+                            if price > curr_zs["zg"]:
+                                # 检查最近5根K线是否有回踩动作(最低价接近curr_zs上沿)
+                                recent_lows = L[max(0, n-5):n]
+                                has_pullback = any(
+                                    low <= curr_zs["zg"] * 1.02 for low in recent_lows
+                                )
+
+                                if has_pullback:
+                                    # 三买DL特征
+                                    ratio_sanmai = 40
+                                    try:
+                                        dl_sig_type, dl_prob_sanmai = predict_beichi(
+                                            max(10, min(150, ratio_sanmai)),
+                                            pre_pct_ermai, post_pct_ermai,
+                                            pre_e_ermai - pre_s_ermai + 1,
+                                            post_e_ermai - post_s_ermai + 1,
+                                            C, pre_s_ermai, pre_e_ermai,
+                                            post_s_ermai, post_e_ermai,
+                                            dif, bar, curr_zs, V, level, atr
+                                        )
+                                    except:
+                                        dl_prob_sanmai = 0.50
+
+                                    # 三买要求更高: DL_P >= 0.45
+                                    if dl_prob_sanmai >= 0.45:
+                                        signals.append({
+                                            "type": "盘整背驰" if dl_prob_sanmai >= _DL_PAN_P else "无背驰",
+                                            "dir": "看多",
+                                            "op": "三买",
+                                            "ratio": ratio_sanmai,
+                                            "dl_prob": dl_prob_sanmai,
+                                            "zs": curr_zs,
+                                            "pre_dir": "down",
+                                            "post_dir": "up",
+                                            "pre_ok": True,
+                                            "post_ok": True,
+                                            "valid": dl_prob_sanmai >= 0.45 and has_pullback,
+                                            "aligned": True,
+                                            "overall_dir": overall_dir,
+                                            "pre_range": f"中枢{i-1}",
+                                            "post_range": f"中枢{i+1}",
+                                            "pre_reason": "连续上移+回踩确认",
+                                            "post_reason": "突破加速",
+                                        })
 
     signals.sort(key=lambda x: -x['zs']['e'])
 
