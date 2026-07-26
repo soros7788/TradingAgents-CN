@@ -472,7 +472,19 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
     """
     缠论背驰分析
     返回中枢列表 + 背驰信号列表
+
+    性能修复 (2026-07-26): 添加内存缓存
+    问题: check_compliance中detect_entry_level调用4个级别, 之后sell_levels又重复调用同一级别
+          每只持仓产生5-8次analyze_beichi, 每次都发网络请求 → 8持仓=40-64次请求 → 卡死
+    方案: 同一(code,level)在一次运行中只请求一次API, 后续用缓存
     """
+    # 内存缓存: 同一(code,level)不重复请求
+    cache_key = (str(code), level)
+    if not hasattr(analyze_beichi, '_cache'):
+        analyze_beichi._cache = {}
+    if cache_key in analyze_beichi._cache:
+        return analyze_beichi._cache[cache_key]
+
     scale_map = {"日线": "240", "30min": "30", "5min": "5", "1min": "1"}
     min_w_map = {"日线": 5, "30min": 4, "5min": 3, "1min": 3}
     min_amp_map = {"日线": 0.3, "30min": 0.1, "5min": 0.05, "1min": 0.02}
@@ -483,7 +495,9 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
     if level == "1min":
         bars = build_1min_from_5min(code)
         if not bars:
-            return {"error": "1min data unavailable"}
+            result = {"error": "1min data unavailable"}
+            analyze_beichi._cache[cache_key] = result
+            return result
         C = [b['close'] for b in bars]
         H = [b['high'] for b in bars]
         L = [b['low'] for b in bars]
@@ -493,7 +507,9 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
     else:
         data = fetch_kline_sina(code, scale_map[level], 120)
         if not data:
-            return {"error": "no data"}
+            result = {"error": "no data"}
+            analyze_beichi._cache[cache_key] = result
+            return result
         C = [float(d['close']) for d in data]
         H = [float(d['high']) for d in data]
         L = [float(d['low']) for d in data]
@@ -580,7 +596,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
 
     signals.sort(key=lambda x: -x['zs']['e'])
 
-    return {
+    result = {
         "code": code,
         "level": level,
         "n": n,
@@ -593,6 +609,8 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         "overall_dir": overall_dir,
         "overall_pct": overall_pct,
     }
+    analyze_beichi._cache[cache_key] = result
+    return result
 
 
 def get_signal_summary(result):

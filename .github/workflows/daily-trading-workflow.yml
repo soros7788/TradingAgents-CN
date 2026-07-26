@@ -26,6 +26,7 @@ env:
 jobs:
   daily-workflow:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -51,6 +52,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          set -o pipefail  # 确保python退出码不被tee掩盖
           # 定时任务根据cron时间自动选择命令, 手动触发用输入值
           if [ "${{ github.event_name }}" = "schedule" ]; then
             HOUR=$(date '+%H')

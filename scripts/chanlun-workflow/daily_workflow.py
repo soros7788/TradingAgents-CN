@@ -623,12 +623,16 @@ def run_intraday_scan():
 def send_telegram(text, title=""):
     """Send message to Telegram. Splits long messages automatically.
 
-    BUG修复 (2026-07-26): Telegram API默认解析HTML, 消息中的<被当作标签起始
-    根因: "现价8.03<下沿8.18" 中的 < 被解析为HTML标签 → HTTP 400
-    方案: 不使用parse_mode=HTML, 转义所有<>&为纯文本安全字符
+    彻底修复 (2026-07-26): 5次失败的根因分析
+    1. parse_mode=HTML导致消息中<被当作HTML标签 → HTTP 400 "can't parse entities"
+       修复: 完全移除parse_mode, 用纯文本发送
+    2. send_telegram失败时只print不raise → 工作流显示"success"但消息没发出
+       修复: 失败时raise RuntimeError, 确保错误传播到workflow
+    3. 工作流挂起(analyze_beichi无缓存) → 40+分钟未到达send_telegram
+       修复: beichi_analyzer.py添加内存缓存 + workflow.yml添加timeout
+
+    本函数不再静默失败: token缺失或HTTP错误都会raise异常
     """
-    import html as html_module
-    # Try all possible env var names
     token = (os.environ.get('TELEGRAM_BOT_TOKEN')
              or os.environ.get('TG_TOKEN')
              or os.environ.get('TELEGRAM_TOKEN'))
@@ -636,34 +640,29 @@ def send_telegram(text, title=""):
                or os.environ.get('TG_CHAT_ID')
                or os.environ.get('TELEGRAM_CHATID'))
 
-    # Debug: show what env vars exist
-    env_keys = sorted(os.environ.keys())
-    tg_keys = [k for k in env_keys if 'TELEGRAM' in k.upper() or 'TG_' in k.upper()]
-    print(f"[TG] Telegram env vars found: {tg_keys}")
-    print(f"[TG] token set: {'YES' if token else 'NO'}")
-    print(f"[TG] chat_id set: {'YES' if chat_id else 'NO'}")
+    tg_keys = [k for k in sorted(os.environ.keys()) if 'TELEGRAM' in k.upper() or 'TG_' in k.upper()]
+    print(f"[TG] env vars: {tg_keys}")
+    print(f"[TG] token: {'YES' if token else 'NO'}, chat_id: {'YES' if chat_id else 'NO'}")
 
     if not token or not chat_id:
-        print("[TG] SKIP: token or chat_id missing, printing to stdout instead")
+        msg = f"Telegram token或chat_id缺失 (token={'YES' if token else 'NO'}, chat_id={'YES' if chat_id else 'NO'})"
+        print(f"[TG] FAIL: {msg}")
         print("=" * 40)
         if title:
             print(title)
         print(text)
         print("=" * 40)
-        return
+        raise RuntimeError(msg)
 
-    # 转义HTML特殊字符 (不使用parse_mode, 但仍需转义避免400错误)
+    # 转义<>为全角字符 (不使用parse_mode, 纯文本模式)
+    # 注意: 不替换& — 不用parse_mode时&不需要HTML转义, 替换会导致显示&amp;
     def escape_tg(s):
-        """转义Telegram消息中的特殊字符"""
         if not s:
             return s
-        # 将<替换为全角＜, >替换为全角＞, &替换为&amp; (Telegram纯文本模式仍会解析这些)
-        s = s.replace('&', '&amp;')
-        s = s.replace('<', '＜')   # 全角小于号, 视觉接近且不被解析
-        s = s.replace('>', '＞')   # 全角大于号
+        s = s.replace('<', '＜')
+        s = s.replace('>', '＞')
         return s
 
-    # Build message with title
     full_text = f"{title}\n{text}" if title else text
     full_text = escape_tg(full_text)
 
@@ -681,6 +680,7 @@ def send_telegram(text, title=""):
 
     print(f"[TG] Sending {len(chunks)} message(s), total chars={len(text)}")
 
+    errors = []
     for i, chunk in enumerate(chunks):
         if i > 0:
             chunk = f"续({i+1}/{len(chunks)}):\n{chunk}"
@@ -700,11 +700,18 @@ def send_telegram(text, title=""):
             print(f"[TG] chunk {i+1} OK: {resp_body[:100]}")
         except urllib.error.HTTPError as e:
             err_body = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
-            print(f"[TG] chunk {i+1} HTTP ERROR {e.code}: {err_body}")
+            err_msg = f"chunk {i+1} HTTP {e.code}: {err_body}"
+            print(f"[TG] ERROR: {err_msg}")
+            errors.append(err_msg)
         except Exception as e:
-            print(f"[TG] chunk {i+1} ERROR: {type(e).__name__}: {e}")
+            err_msg = f"chunk {i+1} {type(e).__name__}: {e}"
+            print(f"[TG] ERROR: {err_msg}")
+            errors.append(err_msg)
         if i < len(chunks) - 1:
             time.sleep(1)
+
+    if errors:
+        raise RuntimeError(f"Telegram发送失败({len(errors)}/{len(chunks)}): {'; '.join(errors)}")
 
 
 def format_intraday_summary(result, ts):
@@ -1412,7 +1419,10 @@ def main():
         import traceback
         err = traceback.format_exc()
         print(f"ERROR: {err}")
-        send_telegram(f"❌ 工作流错误 ({cmd}) {ts}\n\n{str(e)}")
+        try:
+            send_telegram(f"❌ 工作流错误 ({cmd}) {ts}\n\n{str(e)}")
+        except Exception:
+            pass
         raise
 
 if __name__ == '__main__':
