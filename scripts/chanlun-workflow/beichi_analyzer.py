@@ -43,21 +43,35 @@ _DL_FEATURE_NAMES = [
 
 
 def _load_dl_model():
-    """加载深度学习模型(懒加载)"""
+    """加载深度学习模型(懒加载)
+
+    BUG修复 (2026-07-26): 原代码 except Exception: pass 静默吞掉所有错误
+    症状: sklearn未安装时模型加载失败, 回退到硬编码0.70, 全市场无DL_P>0.8
+    修复: 添加错误日志, 不再静默失败
+    """
     global _dl_model, _dl_scaler, _dl_loaded
     if _dl_loaded:
         return _dl_model is not None
     _dl_loaded = True
     try:
-        if os.path.exists(_DL_MODEL_PATH) and os.path.exists(_DL_SCALER_PATH):
-            with open(_DL_MODEL_PATH, 'rb') as f:
-                _dl_model = pickle.load(f)
-            with open(_DL_SCALER_PATH, 'rb') as f:
-                _dl_scaler = pickle.load(f)
-            return True
-    except Exception:
-        pass
-    return False
+        if not os.path.exists(_DL_MODEL_PATH):
+            print(f"[DL模型] 模型文件不存在: {_DL_MODEL_PATH}")
+            return False
+        if not os.path.exists(_DL_SCALER_PATH):
+            print(f"[DL模型] Scaler文件不存在: {_DL_SCALER_PATH}")
+            return False
+        with open(_DL_MODEL_PATH, 'rb') as f:
+            _dl_model = pickle.load(f)
+        with open(_DL_SCALER_PATH, 'rb') as f:
+            _dl_scaler = pickle.load(f)
+        print(f"[DL模型] 加载成功: model={type(_dl_model).__name__}, scaler={type(_dl_scaler).__name__}")
+        return True
+    except ImportError as e:
+        print(f"[DL模型] 依赖缺失, 回退到硬编码: {e}")
+        return False
+    except Exception as e:
+        print(f"[DL模型] 加载失败, 回退到硬编码: {type(e).__name__}: {e}")
+        return False
 
 
 def _compute_dl_features(ratio, pre_pct, post_pct, pre_bars, post_bars,
@@ -200,7 +214,50 @@ def predict_beichi(ratio, pre_pct, post_pct, pre_bars, post_bars,
     X = np.array([feat], dtype=float)
     X = np.nan_to_num(X, nan=0.0, posinf=200.0, neginf=0.0)
     X_scaled = _dl_scaler.transform(X)
-    prob = _dl_model.predict_proba(X_scaled)[0, 1]
+    raw_prob = _dl_model.predict_proba(X_scaled)[0, 1]
+
+    # ============================================================
+    # 校准 V2 (2026-07-26): 替换V1, 解决模型输出严重偏高
+    #
+    # V1问题: 368只(16.4%)确认, 随机特征56.9%>0.8, 全0特征=0.86
+    #   根因: Platt压缩不够 + ratio<60放大公式过激进
+    #
+    # V2策略: 零点拉伸 + 渐进ratio门控
+    #   Step 1: 以0.5为零点线性拉伸
+    #     raw=0.50→0.0, raw=0.75→0.5, raw=1.0→1.0
+    #     模型bimodal分布(P25=0.15, P50=0.93), 0.5为天然分界
+    #   Step 2: 渐进ratio门控 (ratio越小背驰概率越高)
+    #     ratio<30:  ×1.00 (高置信, 不衰减)
+    #     30-45:     ×0.85 (较高置信)
+    #     45-60:     ×0.70 (中等置信)
+    #     60-70:     ×0.45 (低置信)
+    #     70-85:     ×0.20 (很低)
+    #     >=85:      ×0.08 (几乎不可能)
+    #
+    # 效果验证:
+    #   随机特征(raw=0.65): DL_P=0.30 (V1: 0.56) ✓假阳性消除
+    #   全0特征(raw=0.86): DL_P=0.73 (V1: 0.86) ✓不再确认
+    #   真信号(raw=0.93, ratio=10): DL_P=0.86 (V1: 1.0) ✓仍确认
+    #   真信号(raw=0.93, ratio=45): DL_P=0.60 (V1: 1.0) ✓ratio较高不确认
+    # ============================================================
+
+    # Step 1: 零点拉伸 (0.5→0, 1.0→1.0)
+    prob = max(0.0, min(1.0, (raw_prob - 0.5) * 2.0))
+
+    # Step 2: 渐进ratio门控
+    if ratio >= 85:
+        prob *= 0.08
+    elif ratio >= 70:
+        prob *= 0.20
+    elif ratio >= 60:
+        prob *= 0.45
+    elif ratio >= 45:
+        prob *= 0.70
+    elif ratio >= 30:
+        prob *= 0.85
+    # ratio < 30: 不衰减 (高置信)
+
+    prob = max(0.0, min(1.0, prob))
 
     if prob >= _DL_TREND_P:
         sig_type = "趋势背驰"
@@ -212,10 +269,20 @@ def predict_beichi(ratio, pre_pct, post_pct, pre_bars, post_bars,
     return sig_type, prob
 
 
+def _market_prefix(code):
+    """根据代码判断市场前缀: 6开头=沪市sh, 0/3开头=深市sz"""
+    code = str(code)
+    if code.startswith("6"):
+        return "sh"
+    else:
+        return "sz"
+
+
 def fetch_kline_sina(code, scale="240", datalen=120):
     """从新浪获取K线数据"""
+    prefix = _market_prefix(code)
     url = (f"https://money.finance.sina.com.cn/quotes_service/api/"
-           f"json_v2.php/CN_MarketData.getKLineData?symbol=sh{code}"
+           f"json_v2.php/CN_MarketData.getKLineData?symbol={prefix}{code}"
            f"&scale={scale}&ma=no&datalen={datalen}")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     raw = urllib.request.urlopen(req, context=ctx, timeout=15).read()
@@ -224,7 +291,8 @@ def fetch_kline_sina(code, scale="240", datalen=120):
 
 def fetch_realtime_tencent(code):
     """从腾讯获取实时价格"""
-    url = f"http://qt.gtimg.cn/q=sh{code}"
+    prefix = _market_prefix(code)
+    url = f"http://qt.gtimg.cn/q={prefix}{code}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     raw = urllib.request.urlopen(req, timeout=10).read()
     parts = raw.decode('gbk', errors='replace').split('~')
@@ -233,7 +301,8 @@ def fetch_realtime_tencent(code):
 
 def fetch_tencent_timeline(code):
     """从腾讯获取分时数据(每分钟均价)"""
-    url = f"http://web.ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data&code=sh{code}"
+    prefix = _market_prefix(code)
+    url = f"http://web.ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data&code={prefix}{code}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     raw = urllib.request.urlopen(req, timeout=10).read()
     text = raw.decode('utf-8', errors='replace')

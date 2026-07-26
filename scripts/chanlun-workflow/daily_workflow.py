@@ -25,14 +25,20 @@ def recalc():
     return json.loads(r.stdout) if r.stdout else {"status": "error"}
 
 def get_today_holdings():
+    """读取持仓表, 按代码去重(取最后一次出现的行)
+
+    BUG修复 (2026-07-26): 万华已清仓仍显示持有
+    根因: 持仓表存在多日重复录入, 旧行(100股)和新行(0股)共存
+    修复: 以代码为key, 后出现的行覆盖先出现的行
+    """
     wb = load_workbook(WB, data_only=True)
     ws = wb['持仓表']
-    holdings = []
+    code_map = {}  # 按代码去重, 取最后一行
     for r in range(2, ws.max_row + 1):
         name = ws.cell(row=r, column=2).value
         if not name:
             continue
-        code = ws.cell(row=r, column=3).value
+        code = str(ws.cell(row=r, column=3).value or '')
         waived = ws.cell(row=r, column=4).value
         shares = ws.cell(row=r, column=7).value
         entry = ws.cell(row=r, column=8).value
@@ -41,11 +47,14 @@ def get_today_holdings():
         action = ws.cell(row=r, column=28).value
         profit = ws.cell(row=r, column=13).value
         pos = ws.cell(row=r, column=14).value
-        holdings.append({
+        # 始终用后出现的行覆盖 (最新数据)
+        code_map[code] = {
             "name": name, "code": code, "waived": waived,
             "shares": shares, "entry": entry, "close": close,
             "stop": stop, "action": action, "profit": profit, "pos": pos
-        })
+        }
+    # 过滤掉0股的(已清仓)
+    holdings = [h for h in code_map.values() if h.get('shares') and h['shares'] > 0]
     return holdings
 
 def get_account_summary():
@@ -176,7 +185,14 @@ def safe_val(v):
     return v
 
 def run_full_scan():
-    """全市场候选扫描: 沪A主板全量 + 深市全量(000/002) + 写入候选池(排除持仓股)"""
+    """全市场候选扫描: 沪A主板全量 + 深市全量(000/002) + 写入候选池(排除持仓股)
+
+    分层候选池 (2026-07-26):
+      核心池(DL_P>0.90+ratio<20%): 调仓首选, 1-2周稳定
+      观察池(DL_P 0.85-0.90): 核心池不足时补充
+      边缘池(DL_P 0.80-0.85): 仅观察不买入
+    写入Excel时: 核心池优先 → 观察池补充 → 边缘池末尾, 备注列标注层级
+    """
     sys.path.insert(0, BEICHI_DIR)
     from full_scan import full_scan, calc_funding
     account = get_account_summary()
@@ -189,20 +205,51 @@ def run_full_scan():
     # 排除持仓股(已持有的不再推荐)
     holdings = get_today_holdings()
     held_codes = {str(h['code']) for h in holdings if h.get('code')}
-    all_near = [r for r in result["near"] if r["code"] not in held_codes]
+    all_confirmed = [r for r in result["confirmed"] if r["code"] not in held_codes]
     if held_codes:
-        excluded = len(result["near"]) - len(all_near)
+        excluded = len(result["confirmed"]) - len(all_confirmed)
         if excluded:
             print(f"  排除持仓股: {excluded}只 ({', '.join(sorted(held_codes))})")
 
-    if not all_near:
-        print("\n候选池: 无接近确认标的(排除持仓后), 跳过写入")
+    if not all_confirmed:
+        print("\n候选池: 无确认标的(排除持仓后), 跳过写入")
         return result
 
-    sha_near = sorted([r for r in all_near if r["code"].startswith("6")], key=lambda x: (-x["score"], x["ratio"]))
-    sz_near = sorted([r for r in all_near if r["code"].startswith("0")], key=lambda x: (-x["score"], x["ratio"]))
-    selected = sha_near[:15] + sz_near[:15]
-    selected.sort(key=lambda x: (-x["score"], x["ratio"]))
+    # 分层: 核心池优先, 观察池补充, 边缘池末尾
+    core = [r for r in all_confirmed if r.get("tier") == "核心"]
+    watch = [r for r in all_confirmed if r.get("tier") == "观察"]
+    edge = [r for r in all_confirmed if r.get("tier") == "边缘"]
+
+    # 沪深各取, 优先核心池
+    def split_sz_sha(stocks):
+        sha = sorted([r for r in stocks if r["code"].startswith("6")], key=lambda x: (-x["dlp"], x["ratio"]))
+        sza = sorted([r for r in stocks if r["code"].startswith("0")], key=lambda x: (-x["dlp"], x["ratio"]))
+        return sha, sza
+
+    # 核心池先选
+    core_sha, core_sz = split_sz_sha(core)
+    selected = core_sha[:15] + core_sz[:15]
+
+    # 核心池不足15只/边, 用观察池补
+    if len(core_sha) < 15:
+        watch_sha, _ = split_sz_sha(watch)
+        selected += watch_sha[:15 - len(core_sha)]
+    if len(core_sz) < 15:
+        _, watch_sz = split_sz_sha(watch)
+        selected += watch_sz[:15 - len(core_sz)]
+
+    # 仍不足, 用边缘池补
+    selected_codes = {s["code"] for s in selected}
+    remaining = [r for r in all_confirmed if r["code"] not in selected_codes]
+    if len(selected) < 30:
+        remaining_sha, remaining_sz = split_sz_sha(remaining)
+        need = 30 - len(selected)
+        selected += (remaining_sha + remaining_sz)[:need]
+
+    selected.sort(key=lambda x: (0 if x.get("tier") == "核心" else 1 if x.get("tier") == "观察" else 2, -x["dlp"]))
+
+    print(f"\n分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只")
+    print(f"写入: {len(selected)}只 (核心{len([s for s in selected if s.get('tier')=='核心'])} + 观察{len([s for s in selected if s.get('tier')=='观察'])} + 边缘{len([s for s in selected if s.get('tier')=='边缘'])})")
 
     wb = load_workbook(WB)
     ws = wb['候选池']
@@ -216,15 +263,29 @@ def run_full_scan():
             cell.value = None
 
     today = date.today()
+    # 分层映射: 中文简称 → 候选池显示名称
+    tier_display = {
+        "核心": "核心池",
+        "观察": "观察池",
+        "边缘": "边缘池",
+    }
+    # 分层颜色 (与fix_tier.py一致)
+    from openpyxl.styles import PatternFill, Font as XFont
+    tier_fill = {
+        "核心": PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),
+        "观察": PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid"),
+        "边缘": PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid"),
+    }
     for idx, stock in enumerate(selected):
         row = 2 + idx
         price = stock["price"]
         fund = calc_funding(price, result["total_asset"], result["cash"])
-        missing = []
-        if stock["ratio"] >= 60: missing.append("ratio=%d%%" % stock["ratio"])
-        if stock["dlp"] <= 0.8: missing.append("DL_P=%.2f" % stock["dlp"])
-        note = "接近确认,缺:" + "+".join(missing)
-        if fund["need_transfer"]: note += " | 需转入%.0f元" % fund["transfer"]
+        tier = stock.get("tier", "边缘")
+        tier_name = tier_display.get(tier, "边缘池")
+
+        # 备注列: 仅保留资金转入信息(分层已由列11公式自动计算)
+        note = ""
+        if fund["need_transfer"]: note = "需转入%.0f元" % fund["transfer"]
 
         ws.cell(row=row, column=1, value=today)
         ws.cell(row=row, column=2, value=stock.get("name", ""))
@@ -236,13 +297,23 @@ def run_full_scan():
         ws.cell(row=row, column=8, value=stock["dlp"])
         ws.cell(row=row, column=9, value=str(stock["valid"]))
         ws.cell(row=row, column=10, value="一买")
-        ws.cell(row=row, column=31, value=note)
+        # 列11: 分层Tier — 公式自动计算, 不硬写值
+        ws.cell(row=row, column=11, value=f'=IF($A{row}="","",IF(AND(G{row}<20%,H{row}>0.90),"核心池",IF(AND(H{row}>=0.85),"观察池",IF(AND(H{row}>=0.80),"边缘池",""))))')
+        ws.cell(row=row, column=11).font = XFont(bold=True, size=11)
+        # 行颜色: 按分层着色
+        fill = tier_fill.get(tier)
+        if fill:
+            for c in range(1, 32):
+                ws.cell(row=row, column=c).fill = fill
+        # 列31备注: 仅资金信息
+        if note:
+            ws.cell(row=row, column=31, value=note)
 
     wb.save(WB)
     recalc_result = recalc()
     errors = recalc_result.get("total_errors", -1)
 
-    print(f"\n候选池: 写入{len(selected)}只 (沪A{min(15,len(sha_near))}+深市{min(15,len(sz_near))})")
+    print(f"\n候选池: 写入{len(selected)}只 (核心{len([s for s in selected if s.get('tier')=='核心'])} + 观察{len([s for s in selected if s.get('tier')=='观察'])} + 边缘{len([s for s in selected if s.get('tier')=='边缘'])})")
     print(f"公式重算: {errors}个错误")
     return {
         "scan_result": result,
@@ -550,7 +621,13 @@ def run_intraday_scan():
     }
 
 def send_telegram(text, title=""):
-    """Send message to Telegram. Splits long messages automatically."""
+    """Send message to Telegram. Splits long messages automatically.
+
+    BUG修复 (2026-07-26): Telegram API默认解析HTML, 消息中的<被当作标签起始
+    根因: "现价8.03<下沿8.18" 中的 < 被解析为HTML标签 → HTTP 400
+    方案: 不使用parse_mode=HTML, 转义所有<>&为纯文本安全字符
+    """
+    import html as html_module
     # Try all possible env var names
     token = (os.environ.get('TELEGRAM_BOT_TOKEN')
              or os.environ.get('TG_TOKEN')
@@ -575,8 +652,20 @@ def send_telegram(text, title=""):
         print("=" * 40)
         return
 
+    # 转义HTML特殊字符 (不使用parse_mode, 但仍需转义避免400错误)
+    def escape_tg(s):
+        """转义Telegram消息中的特殊字符"""
+        if not s:
+            return s
+        # 将<替换为全角＜, >替换为全角＞, &替换为&amp; (Telegram纯文本模式仍会解析这些)
+        s = s.replace('&', '&amp;')
+        s = s.replace('<', '＜')   # 全角小于号, 视觉接近且不被解析
+        s = s.replace('>', '＞')   # 全角大于号
+        return s
+
     # Build message with title
     full_text = f"{title}\n{text}" if title else text
+    full_text = escape_tg(full_text)
 
     # Split into chunks of 4000 chars (Telegram limit is 4096)
     chunks = []
@@ -760,9 +849,532 @@ def format_compliance_summary(account, holdings, issues, ts):
     return '\n'.join(lines)
 
 
+def run_weekly_review():
+    """周复盘: 复利目标 + R值统计 + 账户增长 + 做T/建清仓 → 写入周复盘表W-AK列
+
+    列映射:
+      W(23) 日复利目标完成    X(24) 周复利目标完成    Y(25) 月复利目标完成
+      Z(26) 当下累计复利率    AA(27) 当下正期望R值    AB(28) 系统盈亏比
+      AC(29) 账户规模增长     AD(30) 增长目标进度      AE(31) 复利追踪备注
+      AF(32) 做T次数/成功率   AG(33) 建清仓成功率       AH(34) 平均持仓天数
+
+    修正 (2026-07-26):
+      - 本金取值: 列27(AA)=硬编码值, 改用 总资产-净入金后盈利(列43) = 实际投入本金
+      - 新增做T统计: 同日买卖识别 + 成功率
+      - 新增建清仓成功率: FIFO买卖配对完整周期
+    """
+    from openpyxl.styles import PatternFill, Font as XFont, Alignment, Border, Side
+
+    SUMMARY_START = 204  # 交易记录统计区域起始行
+
+    # ============================================================
+    # 1. 读取账户数据
+    # ============================================================
+    wb_d = load_workbook(WB, data_only=True)
+    ws_acc = wb_d['账户总表']
+    latest_row = 2
+    for r in range(2, ws_acc.max_row + 1):
+        if ws_acc.cell(row=r, column=1).value:
+            latest_row = r
+
+    current_asset = ws_acc.cell(row=latest_row, column=2).value or 0
+    if isinstance(current_asset, str): current_asset = 0
+    compound_dev = ws_acc.cell(row=latest_row, column=31).value or 0
+    if isinstance(compound_dev, str): compound_dev = 0
+
+    # ============================================================
+    # 双复利模型 (2026-07-26修订):
+    #   主用TWR: 以总资产为基数, 投入本金为基准 (合规审计/国际标准)
+    #   辅用动态本金: 以持仓市值为基数 (交易信号评估)
+    # ============================================================
+    position_value = ws_acc.cell(row=latest_row, column=4).value or 0
+    if isinstance(position_value, str): position_value = 0
+    cash = ws_acc.cell(row=latest_row, column=3).value or 0
+    if isinstance(cash, str): cash = 0
+
+    # 持仓市值可能为0(历史数据缺失), 从持仓表重新计算
+    if position_value == 0:
+        ws_hold_d = wb_d['持仓表']
+        for r in range(2, ws_hold_d.max_row + 1):
+            name = ws_hold_d.cell(row=r, column=2).value
+            if not name:
+                continue
+            shares = ws_hold_d.cell(row=r, column=7).value or 0
+            close = ws_hold_d.cell(row=r, column=9).value or 0
+            waived = ws_hold_d.cell(row=r, column=4).value
+            if shares and close and not isinstance(shares, str) and not isinstance(close, str):
+                if float(shares) > 0 and float(close) > 0:
+                    position_value += float(shares) * float(close)
+
+    # 动态本金 = 持仓市值 (复利基数 - 辅用)
+    dynamic_principal = position_value
+    position_ratio = position_value / current_asset if current_asset > 0 else 0
+
+    # 净盈利(列43)
+    real_pnl = ws_acc.cell(row=latest_row, column=43).value or 0
+    if isinstance(real_pnl, str): real_pnl = 0
+
+    # ============================================================
+    # TWR复利模型 (总资产基数 - 国际标准/合规审计用)
+    #   twr_principal = 总资产 - 净盈利 = 实际投入本金
+    # ============================================================
+    twr_principal = current_asset - float(real_pnl)
+    if twr_principal <= 0:
+        # 回退: 用列27硬编码值
+        for r in range(2, latest_row + 1):
+            v = ws_acc.cell(row=r, column=27).value
+            if v is not None and not str(v).startswith('=') and not isinstance(v, str):
+                twr_principal = float(v)
+                break
+
+    # 投入本金(参考)
+    invested_capital = twr_principal
+
+    # 运行月数
+    start_date = datetime(2026, 1, 31)
+    end_date = datetime.now()
+    months_running = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+    if end_date.day < start_date.day:
+        months_running -= 1
+    months_precise = months_running + (end_date.day - start_date.day if end_date.day >= start_date.day else end_date.day + 31 - start_date.day) / 31.0
+
+    # 目标年化: 基于总资产的TWR目标 (随账户阶段递减)
+    #   婴儿(<3W): 3%    幼儿(3W-10W): 2.5%    成长(10W-30W): 2%    成熟(30W+): 1.5%
+    if current_asset < 30000:
+        target_annual = 0.03
+    elif current_asset < 100000:
+        target_annual = 0.025
+    elif current_asset < 300000:
+        target_annual = 0.02
+    else:
+        target_annual = 0.015
+
+    total_profit = float(real_pnl)
+
+    # 1. TWR复利 (总资产基数 - 主用)
+    twr_total_return = (current_asset - twr_principal) / twr_principal if twr_principal > 0 else 0
+    twr_annualized_return = ((current_asset / twr_principal) ** (12 / months_precise) - 1) if twr_principal > 0 and months_precise > 0 else 0
+
+    # 2. 动态本金复利 (持仓市值基数 - 辅用)
+    dynamic_total_return = total_profit / dynamic_principal if dynamic_principal > 0 else 0
+    dynamic_annualized_return = ((1 + dynamic_total_return) ** (12 / months_precise) - 1) if dynamic_total_return > 0 and months_precise > 0 else 0
+
+    # 复利目标: 日/周/月 (基于动态本金)
+    daily_target = (1 + target_annual) ** (1/250) - 1
+    weekly_target = (1 + target_annual) ** (5/250) - 1
+    monthly_target = (1 + target_annual) ** (1/12) - 1
+
+    # ============================================================
+    # 2. 读取周复盘数据 — 双模型收益率计算
+    # ============================================================
+    ws_rev_d = wb_d['周复盘']
+    week_start = ws_rev_d.cell(row=2, column=2).value or 0
+    week_end = ws_rev_d.cell(row=2, column=3).value or 0
+    week_return = ws_rev_d.cell(row=2, column=4).value or 0
+    if isinstance(week_start, str): week_start = 0
+    if isinstance(week_end, str): week_end = 0
+    if isinstance(week_return, str): week_return = 0
+
+    # 周利润 = 周末总资产 - 周初总资产 (排除入金)
+    week_profit = week_end - week_start
+
+    # TWR周收益率 (主用): 利润 / 周初总资产
+    twr_weekly_actual = week_profit / week_start if week_start > 0 else 0
+    twr_daily_actual = (1 + twr_weekly_actual) ** (1/5) - 1 if twr_weekly_actual > -1 else 0
+
+    # 动态本金周收益率 (辅用): 利润 / 持仓市值
+    dynamic_weekly_actual = week_profit / dynamic_principal if dynamic_principal > 0 else 0
+    dynamic_daily_actual = (1 + dynamic_weekly_actual) ** (1/5) - 1 if dynamic_weekly_actual > -1 else 0
+
+    # 月复利: 上月末总资产 → 当前
+    jun_end_asset = 18504.0  # 默认值
+    for r in range(latest_row, 1, -1):
+        d = ws_acc.cell(row=r, column=1).value
+        if d and hasattr(d, 'month') and d.month == end_date.month - 1:
+            jun_end_asset = ws_acc.cell(row=r, column=2).value or jun_end_asset
+            break
+    month_profit = current_asset - jun_end_asset
+
+    # TWR月收益率 (主用)
+    twr_monthly_actual = month_profit / jun_end_asset if jun_end_asset > 0 else 0
+
+    # 动态本金月收益率 (辅用)
+    dynamic_monthly_actual = month_profit / dynamic_principal if dynamic_principal > 0 else 0
+
+    # 目标完成情况 (以TWR为主)
+    daily_complete = "是" if twr_daily_actual >= daily_target else "否"
+    weekly_complete = "是" if twr_weekly_actual >= weekly_target else "否"
+    monthly_complete = "是" if twr_monthly_actual >= monthly_target else "否"
+
+    # ============================================================
+    # 3. 计算R值 (从交易记录) — FIFO买卖配对 + 代理止损
+    # ============================================================
+    # 修复 (2026-07-26):
+    #   问题1: 买入行 buy_price(列22)=None, 实际买入价在 price(列6)
+    #   问题2: 买入行 stop(列12)=None, 大部分无止损记录
+    #   问题3: 同代码多次买卖, buy_map覆盖导致只匹配最后一笔
+    #   方案: FIFO队列配对 + price列6作买入价 + 无止损时用5%代理止损
+    ws_tr = wb_d['交易记录']
+    trades = []
+    buy_queues = {}  # code -> [buy_trade, ...] FIFO队列
+
+    for r in range(2, SUMMARY_START):
+        name = ws_tr.cell(row=r, column=2).value
+        if not name:
+            continue
+        code = str(ws_tr.cell(row=r, column=3).value or "")
+        direction = str(ws_tr.cell(row=r, column=4).value or "")
+        price = ws_tr.cell(row=r, column=6).value      # 成交价格(买入行=买入价)
+        shares = ws_tr.cell(row=r, column=7).value
+        total = ws_tr.cell(row=r, column=8).value       # 成交金额
+        stop = ws_tr.cell(row=r, column=12).value        # 止损价
+        risk_col = ws_tr.cell(row=r, column=23).value    # W列止损风险额(可能为0)
+        raw_date = ws_tr.cell(row=r, column=1).value     # 交易日期
+
+        price = float(price) if not isinstance(price, str) and price is not None else 0
+        shares = float(shares) if not isinstance(shares, str) and shares is not None else 0
+        total = float(total) if not isinstance(total, str) and total is not None else 0
+        stop = float(stop) if not isinstance(stop, str) and stop is not None else 0
+        risk_col = float(risk_col) if not isinstance(risk_col, str) and risk_col is not None else 0
+        date_str = raw_date.strftime('%Y-%m-%d') if isinstance(raw_date, datetime) else str(raw_date or "")
+
+        t = {"row": r, "name": str(name), "code": code, "direction": direction,
+             "price": price, "shares": shares, "total": total,
+             "stop": stop, "risk_col": risk_col, "date_str": date_str}
+        trades.append(t)
+        if direction == "买入":
+            buy_queues.setdefault(code, []).append(t)
+
+    # FIFO配对计算R值
+    r_values = []
+    r_by_row = {}
+    for t in trades:
+        if t["direction"] not in ("卖出", "一卖"):
+            continue
+        queue = buy_queues.get(t["code"])
+        if not queue:
+            continue
+        buy = queue.pop(0)  # FIFO: 取最早的买入
+
+        # 买入价: 优先用buy行price(列6), 回退到sell行buy_price(列22)
+        buy_price = buy["price"] if buy["price"] > 0 else 0
+
+        # 止损风险额: 优先用W列记录值, 回退到(stop计算), 再回退到5%代理止损
+        if buy["risk_col"] > 0:
+            risk = buy["risk_col"]
+        elif buy["stop"] > 0 and buy_price > 0:
+            risk = (buy_price - buy["stop"]) * buy["shares"]
+        else:
+            # 代理止损: 买入价的5% (日线级别常见止损幅度)
+            proxy_stop = buy_price * 0.95
+            risk = (buy_price - proxy_stop) * buy["shares"] if buy_price > 0 else 0
+
+        if risk > 0:
+            r = (t["total"] - buy["total"]) / risk
+        else:
+            r = 0
+        r = round(r, 6)
+        r_values.append(r)
+        r_by_row[t["row"]] = r
+
+    avg_r = sum(r_values) / len(r_values) if r_values else 0
+    total_r = sum(r_values)
+    max_r = max(r_values) if r_values else 0
+    max_loss_r = min(r_values) if r_values else 0
+    wins = [r for r in r_values if r > 0]
+    losses = [r for r in r_values if r < 0]
+    if wins and losses:
+        win_loss_ratio = (sum(wins) / len(wins)) / abs(sum(losses) / len(losses))
+    elif wins:
+        win_loss_ratio = float('inf')
+    else:
+        win_loss_ratio = 0
+    win_rate = len(wins) / len(r_values) * 100 if r_values else 0
+    system_status = "正期望系统 ✅" if avg_r >= 0.5 else ("边缘系统 ⚠️" if avg_r >= 0.2 else "负期望系统 ❌")
+
+    # ============================================================
+    # 3.5 做T统计 + 建清仓周期 + 持仓天数
+    # ============================================================
+    from collections import defaultdict
+    t0_count = 0
+    t0_wins = 0
+    cycle_count = 0
+    cycle_wins = 0
+    hold_days_list = []
+
+    # 按日期+代码分组识别做T(同日买卖)
+    by_date_code = defaultdict(list)
+    for t in trades:
+        date_str = t.get("date_str", "")
+        if not date_str:
+            # 从交易记录原始行重新读取日期
+            raw_date = ws_tr.cell(row=t["row"], column=1).value
+            if isinstance(raw_date, datetime):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(raw_date or "")
+            t["date_str"] = date_str
+        by_date_code[(date_str, t["code"])].append(t)
+
+    for (d, code), group in by_date_code.items():
+        buys = [g for g in group if g["direction"] == "买入"]
+        sells = [g for g in group if g["direction"] in ("卖出", "一卖")]
+        if buys and sells:
+            buy_total = sum(b["total"] for b in buys)
+            sell_total = sum(s["total"] for s in sells)
+            t0_count += 1
+            if sell_total > buy_total:
+                t0_wins += 1
+    t0_rate = t0_wins / t0_count * 100 if t0_count > 0 else 0
+
+    # 建清仓周期: FIFO配对(复用buy_queues已消费的队列, 需重新构建)
+    code_trades = defaultdict(list)
+    for t in trades:
+        if t["direction"] in ("买入", "卖出", "一卖"):
+            code_trades[t["code"]].append(t)
+    for code, ctrades in code_trades.items():
+        ctrades.sort(key=lambda x: x["row"])
+        current_buy = None
+        for t in ctrades:
+            if t["direction"] == "买入":
+                if current_buy is None:
+                    current_buy = dict(t)
+                else:
+                    current_buy["total"] += t["total"]
+                    current_buy["shares"] += t["shares"]
+            elif t["direction"] in ("卖出", "一卖") and current_buy:
+                pnl = t["total"] - current_buy["total"]
+                cycle_count += 1
+                if pnl > 0:
+                    cycle_wins += 1
+                # 持仓天数
+                try:
+                    buy_d = datetime.strptime(current_buy.get("date_str", ""), '%Y-%m-%d')
+                    sell_d = datetime.strptime(t.get("date_str", ""), '%Y-%m-%d')
+                    hold_days_list.append((sell_d - buy_d).days)
+                except:
+                    pass
+                current_buy = None
+    cycle_rate = cycle_wins / cycle_count * 100 if cycle_count > 0 else 0
+    avg_hold_days = sum(hold_days_list) / len(hold_days_list) if hold_days_list else 0
+
+    # ============================================================
+    # 4. 账户增长 (2026-07-26修订: 围绕"幼儿"目标重新定义阶段)
+    #   婴儿: <3W   (当前, 今年目标养到幼儿)
+    #   幼儿: 3W-10W (今年目标, 围绕幼儿执行)
+    #   成长: 10W-30W
+    #   成熟: 30W+
+    # ============================================================
+    growth_target_1 = 30000   # 婴儿→幼儿
+    growth_target_2 = 100000  # 幼儿→成长
+    growth_target_3 = 300000  # 成长→成熟
+    if current_asset < 30000:
+        current_stage = "婴儿"
+        growth_progress = (current_asset / growth_target_1) * 100
+        next_target = growth_target_1
+        next_stage = "幼儿"
+    elif current_asset < 100000:
+        current_stage = "幼儿"
+        growth_progress = (current_asset / growth_target_2) * 100
+        next_target = growth_target_2
+        next_stage = "成长"
+    elif current_asset < 300000:
+        current_stage = "成长"
+        growth_progress = (current_asset / growth_target_3) * 100
+        next_target = growth_target_3
+        next_stage = "成熟"
+    else:
+        current_stage = "成熟"
+        growth_progress = 100
+        next_target = current_asset
+        next_stage = "成熟"
+
+    # ============================================================
+    # 5. 写入Excel
+    # ============================================================
+    wb = load_workbook(WB)
+    ws_rev = wb['周复盘']
+
+    # 新列表头 (如果不存在则添加)
+    new_headers = {
+        23: "日复利目标完成", 24: "周复利目标完成", 25: "月复利目标完成",
+        26: "当下累计复利率", 27: "当下正期望R值", 28: "系统盈亏比",
+        29: "账户规模增长", 30: "增长目标进度", 31: "复利追踪备注",
+        32: "做T统计", 33: "建清仓成功率", 34: "平均持仓天数",
+    }
+    header_font = XFont(bold=True, size=11, color="FFFFFF")
+    header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+    for col, title in new_headers.items():
+        cell = ws_rev.cell(row=1, column=col)
+        if not cell.value:
+            cell.value = title
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+            cell.border = thin_border
+
+    # 写数据行 (行2 = 当前周)
+    row = 2
+    data_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    data_font = XFont(size=10)
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+    # 列23-25: 以TWR为主的目标完成, 备注中标注动态本金
+    ws_rev.cell(row=row, column=23, value=f'{daily_complete} (TWR{twr_daily_actual*100:.3f}% vs目标{daily_target*100:.4f}%)')
+    ws_rev.cell(row=row, column=24, value=f'{weekly_complete} (TWR{twr_weekly_actual*100:.3f}% vs目标{weekly_target*100:.4f}%)')
+    ws_rev.cell(row=row, column=25, value=f'{monthly_complete} (TWR{twr_monthly_actual*100:.3f}% vs目标{monthly_target*100:.4f}%)')
+    # 列26: 双复利累计收益率 [主]TWR + [辅]动态本金
+    ws_rev.cell(row=row, column=26, value=f'[主]TWR:{twr_total_return*100:.1f}%年化{twr_annualized_return*100:.1f}% [辅]动态:{dynamic_total_return*100:.1f}%年化{dynamic_annualized_return*100:.1f}%')
+    ws_rev.cell(row=row, column=27, value=f'平均R={avg_r:.4f}, 累计R={total_r:.4f}, 最大R={max_r:.4f}, 最大亏损R={max_loss_r:.4f}')
+    ws_rev.cell(row=row, column=28, value=round(win_loss_ratio, 2) if win_loss_ratio != float('inf') else "∞")
+    ws_rev.cell(row=row, column=29, value=f'{current_stage}阶段, ¥{current_asset:,.0f}/¥{next_target:,}目标({next_stage})')
+    ws_rev.cell(row=row, column=30, value=f'{growth_progress:.1f}%')
+    # 列31: 双复利基数详情
+    ws_rev.cell(row=row, column=31, value=f'主:TWR本金¥{twr_principal:,.0f} 辅:动态¥{dynamic_principal:,.0f}({position_ratio:.0%}仓位) 系统={system_status} 胜率{win_rate:.0f}% 距{next_stage}差¥{next_target-current_asset:,.0f}')
+
+    # 做T/建清仓/持仓天数 (新增3列)
+    t0_rate_str = f'{t0_rate:.0f}%' if t0_count > 0 else 'N/A'
+    ws_rev.cell(row=row, column=32, value=f'{t0_count}次, 成功率{t0_rate_str} ({t0_wins}/{t0_count})' if t0_count > 0 else '0次')
+    ws_rev.cell(row=row, column=33, value=f'{cycle_rate:.0f}% ({cycle_wins}/{cycle_count})' if cycle_count > 0 else 'N/A')
+    ws_rev.cell(row=row, column=34, value=f'{avg_hold_days:.0f}天' if avg_hold_days > 0 else 'N/A')
+
+    # 绿色标注完成
+    for col, complete in [(23, daily_complete), (24, weekly_complete), (25, monthly_complete)]:
+        if complete == "是":
+            ws_rev.cell(row=row, column=col).fill = green_fill
+        ws_rev.cell(row=row, column=col).alignment = data_align
+        ws_rev.cell(row=row, column=col).font = data_font
+
+    for col in range(26, 35):
+        ws_rev.cell(row=row, column=col).alignment = data_align
+        ws_rev.cell(row=row, column=col).font = data_font
+        ws_rev.cell(row=row, column=col).border = thin_border
+
+    # 修复交易记录R值 (值模式, 覆盖公式)
+    ws_tr_fix = wb['交易记录']
+    cumul_r = 0
+    for t in trades:
+        r = t["row"]
+        if t["direction"] in ("卖出", "一卖") and r in r_by_row:
+            ws_tr_fix.cell(row=r, column=24, value=r_by_row[r])
+            cumul_r += r_by_row[r]
+        else:
+            ws_tr_fix.cell(row=r, column=24, value=0)
+        ws_tr_fix.cell(row=r, column=25, value=round(cumul_r, 6))
+
+    # 统计区域写入正确值
+    last_trade_row = max(t["row"] for t in trades) if trades else 19
+    ws_tr_fix.cell(row=209, column=2, value=round(avg_r, 6))
+    ws_tr_fix.cell(row=210, column=2, value=round(total_r, 6))
+    ws_tr_fix.cell(row=211, column=2, value=round(max_r, 6))
+    ws_tr_fix.cell(row=212, column=2, value=round(max_loss_r, 6))
+    ws_tr_fix.cell(row=215, column=2, value=0)
+    ws_tr_fix.cell(row=216, column=2, value=round(win_loss_ratio, 6) if win_loss_ratio != float('inf') else 999)
+    ws_tr_fix.cell(row=217, column=2, value=system_status)
+
+    wb.save(WB)
+    recalc_result = recalc()
+
+    print(f"\n周复盘完成 (双复利模型):")
+    print(f"  [主] TWR复利(总资产基数): 本金¥{twr_principal:,.0f}")
+    print(f"       累计{twr_total_return*100:.1f}% 年化{twr_annualized_return*100:.1f}%")
+    print(f"       日{daily_complete} 周{weekly_complete} 月{monthly_complete}")
+    print(f"  [辅] 动态本金(持仓市值): ¥{dynamic_principal:,.0f} (仓位{position_ratio:.0%})")
+    print(f"       累计{dynamic_total_return*100:.1f}% 年化{dynamic_annualized_return*100:.1f}%")
+    print(f"  R值: 平均R={avg_r:.4f}, 累计R={total_r:.4f}, 盈亏比={win_loss_ratio:.2f}")
+    print(f"  胜率: {win_rate:.0f}% ({len(wins)}/{len(r_values)})")
+    print(f"  做T: {t0_count}次, 成功率{t0_rate:.0f}%")
+    print(f"  建清仓: {cycle_count}次, 成功率{cycle_rate:.0f}%")
+    print(f"  平均持仓: {avg_hold_days:.0f}天")
+    print(f"  账户增长: {current_stage}, {growth_progress:.1f}% → ¥{next_target:,}({next_stage})")
+
+    return {
+        "daily": {"complete": daily_complete, "actual": twr_daily_actual, "target": daily_target,
+                  "dynamic_actual": dynamic_daily_actual},
+        "weekly": {"complete": weekly_complete, "actual": twr_weekly_actual, "target": weekly_target,
+                   "dynamic_actual": dynamic_weekly_actual},
+        "monthly": {"complete": monthly_complete, "actual": twr_monthly_actual, "target": monthly_target,
+                    "dynamic_actual": dynamic_monthly_actual},
+        "compound": {
+            "twr_total_return": twr_total_return, "twr_annualized": twr_annualized_return,
+            "dynamic_total_return": dynamic_total_return, "dynamic_annualized": dynamic_annualized_return,
+            "deviation": compound_dev, "dynamic_principal": dynamic_principal,
+            "twr_principal": twr_principal,
+            "position_ratio": position_ratio, "invested_capital": invested_capital},
+        "r_values": {"avg": avg_r, "total": total_r, "max": max_r, "max_loss": max_loss_r,
+                      "win_loss_ratio": win_loss_ratio, "win_rate": win_rate, "system": system_status},
+        "trading": {"t0_count": t0_count, "t0_wins": t0_wins, "t0_rate": t0_rate,
+                     "cycle_count": cycle_count, "cycle_wins": cycle_wins, "cycle_rate": cycle_rate,
+                     "avg_hold_days": avg_hold_days},
+        "growth": {"stage": current_stage, "progress": growth_progress,
+                    "next_target": next_target, "next_stage": next_stage,
+                    "current_asset": current_asset},
+    }
+
+
+def format_weekly_review_summary(data, ts):
+    """格式化周复盘摘要为Telegram消息"""
+    lines = [f"📊 周复盘报告 {ts}", ""]
+
+    # 复利目标
+    lines.append("【复利目标完成情况 (以TWR为主)】")
+    d = data["daily"]
+    w = data["weekly"]
+    m = data["monthly"]
+    lines.append(f"  日复利: {d['complete']} (TWR{d['actual']*100:.3f}% vs目标{d['target']*100:.4f}%)")
+    lines.append(f"  周复利: {w['complete']} (TWR{w['actual']*100:.3f}% vs目标{w['target']*100:.4f}%)")
+    lines.append(f"  月复利: {m['complete']} (TWR{m['actual']*100:.3f}% vs目标{m['target']*100:.4f}%)")
+    lines.append("")
+
+    # 双复利累计
+    c = data["compound"]
+    lines.append("【双复利水平】")
+    lines.append(f"  [主] TWR(总资产基数): 本金¥{c.get('twr_principal', 0):,.0f}")
+    lines.append(f"       累计{c['twr_total_return']*100:.1f}% 年化{c['twr_annualized']*100:.1f}%")
+    lines.append(f"  [辅] 动态本金(持仓市值): ¥{c.get('dynamic_principal', 0):,.0f} (仓位{c.get('position_ratio', 0):.0%})")
+    lines.append(f"       累计{c['dynamic_total_return']*100:.1f}% 年化{c['dynamic_annualized']*100:.1f}%")
+    lines.append("")
+
+    # R值
+    r = data["r_values"]
+    lines.append("【正期望值R统计】")
+    lines.append(f"  平均R: {r['avg']:.4f}")
+    lines.append(f"  累计R: {r['total']:.4f}")
+    lines.append(f"  最大R: {r['max']:.4f}")
+    lines.append(f"  最大亏损R: {r['max_loss']:.4f}")
+    lines.append(f"  盈亏比: {r['win_loss_ratio']:.2f}")
+    lines.append(f"  胜率: {r['win_rate']:.0f}%")
+    lines.append(f"  系统: {r['system']}")
+    lines.append("")
+
+    # 交易行为
+    t = data.get("trading", {})
+    lines.append("【交易行为统计】")
+    lines.append(f"  做T: {t.get('t0_count', 0)}次, 成功率{t.get('t0_rate', 0):.0f}%")
+    lines.append(f"  建清仓: {t.get('cycle_count', 0)}次, 成功率{t.get('cycle_rate', 0):.0f}%")
+    lines.append(f"  平均持仓: {t.get('avg_hold_days', 0):.0f}天")
+    lines.append("")
+
+    # 账户增长
+    g = data["growth"]
+    lines.append("【账户规模增长目标】")
+    lines.append(f"  当前阶段: {g['stage']}")
+    lines.append(f"  当前资产: ¥{g['current_asset']:,.0f}")
+    lines.append(f"  下阶段目标: ¥{g['next_target']:,} ({g['next_stage']})")
+    lines.append(f"  完成进度: {g['progress']:.1f}%")
+    lines.append(f"  距离目标: ¥{g['next_target'] - g['current_asset']:,.0f}")
+
+    return '\n'.join(lines)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("用法: daily_workflow.py [compliance|scan|account|holdings]")
+        print("用法: daily_workflow.py [compliance|scan|intraday|account|holdings|weekly]")
         return
     cmd = sys.argv[1]
     ts = datetime.now().strftime('%m-%d %H:%M')
@@ -790,6 +1402,10 @@ def main():
         elif cmd == "holdings":
             h = get_today_holdings()
             print(json.dumps(h, ensure_ascii=False, indent=2))
+        elif cmd == "weekly":
+            review_data = run_weekly_review()
+            msg = format_weekly_review_summary(review_data, ts)
+            send_telegram(msg)
         else:
             print(f"未知命令: {cmd}")
     except Exception as e:

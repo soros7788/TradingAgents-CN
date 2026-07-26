@@ -173,6 +173,34 @@ def full_scan(total_asset=20326.12, cash=7847.12, silent=False):
     if not silent:
         print(f"完成: {len(all_stocks)}只, 耗时{elapsed:.0f}秒")
 
+    # ============================================================
+    # 分层候选池 (2026-07-26)
+    # 问题: DL_P跨0.8阈值的标的每天进出候选池, 无法用于调仓
+    # 方案: 按DL_P+ratio分3层, 不同层不同稳定性
+    #   核心池: DL_P>0.90 + ratio<20% → 1-2周稳定, 调仓首选
+    #   观察池: DL_P 0.85-0.90       → 3-5天稳定, 核心池不足时补充
+    #   边缘池: DL_P 0.80-0.85       → 每天变动, 仅观察不买入
+    # ============================================================
+    def assign_tier(stock):
+        dlp = stock["dlp"]
+        ratio = stock["ratio"]
+        if dlp > 0.90 and ratio < 20:
+            return "核心"
+        elif dlp >= 0.85:
+            return "观察"
+        else:
+            return "边缘"
+
+    for s in confirmed:
+        s["tier"] = assign_tier(s)
+
+    core = [s for s in confirmed if s["tier"] == "核心"]
+    watch = [s for s in confirmed if s["tier"] == "观察"]
+    edge = [s for s in confirmed if s["tier"] == "边缘"]
+
+    if not silent:
+        print(f"分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只")
+
     return {
         "total_scanned": len(all_stocks),
         "success": scanned,
@@ -183,6 +211,9 @@ def full_scan(total_asset=20326.12, cash=7847.12, silent=False):
         "total_near": len(unique_near),
         "total_asset": total_asset,
         "cash": cash,
+        "core": core,
+        "watch": watch,
+        "edge": edge,
     }
 
 
