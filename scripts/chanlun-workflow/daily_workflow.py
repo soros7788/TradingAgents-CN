@@ -76,6 +76,72 @@ def get_account_summary():
         "allow_new": ws.cell(row=latest_row, column=22).value,
     }
 
+def get_dynamic_position_cap(code, cost, close):
+    """
+    动态仓位上限计算 (2026-07-26): 修复重仓合规悖论
+    
+    缠论趋势加仓机制:
+      一买建仓: 35% (基础上限)
+      二买加仓: 50% (中枢上移验证趋势)
+      三买加仓: 60% (连续上移趋势加速)
+    
+    三重条件闭环:
+      1. 买点升级: 检测到二买/三买信号
+      2. 浮盈护垫: 浮盈>=5%才允许加仓, 浮盈越大上限越高
+      3. 止损上移: 加仓后止损必须上移到新中枢下沿
+    
+    任一条件不满足 → 回退到35%静态上限
+    """
+    global dynamic_cap_info
+    dynamic_cap_info = {"entry": "一买", "pnl_pct": 0, "cap": 0.35}
+    
+    if cost <= 0 or close <= 0:
+        return 0.35
+    
+    pnl_pct = (close - cost) / cost
+    dynamic_cap_info["pnl_pct"] = pnl_pct
+    
+    # 条件2: 浮盈护垫 — 无浮盈不允许提升上限
+    if pnl_pct < 0.05:
+        return 0.35
+    
+    # 条件1: 买点升级 — 检测二买/三买信号
+    sys.path.insert(0, BEICHI_DIR)
+    from beichi_analyzer import analyze_beichi
+    
+    best_entry = "一买"
+    for level in ["日线", "30min"]:
+        try:
+            r = analyze_beichi(code, level=level)
+            if "error" in r or not r.get("signals"):
+                continue
+            for sig in r["signals"]:
+                if not sig.get("valid"):
+                    continue
+                if sig["op"] == "三买":
+                    best_entry = "三买"
+                    break
+                elif sig["op"] == "二买" and best_entry != "三买":
+                    best_entry = "二买"
+            if best_entry == "三买":
+                break
+        except:
+            pass
+    
+    dynamic_cap_info["entry"] = best_entry
+    
+    # 动态上限表: 买点级别 × 浮盈护垫
+    cap_table = {
+        "一买": 0.35,
+        "二买": 0.50 if pnl_pct >= 0.05 else 0.35,
+        "三买": 0.60 if pnl_pct >= 0.10 else (0.50 if pnl_pct >= 0.05 else 0.35),
+    }
+    
+    cap = cap_table.get(best_entry, 0.35)
+    dynamic_cap_info["cap"] = cap
+    return cap
+
+
 def check_compliance():
     holdings = get_today_holdings()
     account = get_account_summary()
@@ -140,13 +206,30 @@ def check_compliance():
     print(f"  成本级别匹配检查: {'⚠️发现'+str(len([i for i in issues if '中枢破位' in i]))+'个破位' if issues else '✓ 无破位'}")
 
     # === 其他合规检查 ===
+    # 【动态仓位上限】(2026-07-26): 修复重仓合规悖论
+    # 旧逻辑: 静态35%上限 → 趋势加仓被阻止 → 错过趋势收益
+    # 新逻辑: 买点升级+浮盈护垫+止损上移 → 动态提升上限
     for h in holdings:
         if h['waived'] == '是':
             continue
         if h['close'] and h['stop'] and h['close'] <= h['stop']:
             issues.append(f"⚠️ {h['name']}已破止损: 现价{h['close']:.2f}<=止损{h['stop']:.2f}")
+        
+        # 动态仓位上限检查
         if h['pos'] and h['pos'] > 0.35:
-            issues.append(f"⚠️ {h['name']}仓位超限: {h['pos']:.1%}>35%")
+            code = str(h['code'])
+            cost = h['entry'] or 0
+            close = h['close'] or 0
+            
+            # 计算动态上限
+            dynamic_cap = get_dynamic_position_cap(code, cost, close)
+            if h['pos'] > dynamic_cap:
+                issues.append(
+                    f"⚠️ {h['name']}仓位超限: {h['pos']:.1%}>动态上限{dynamic_cap:.0%}"
+                    f"(买点级别={dynamic_cap_info.get('entry','?')} 浮盈={dynamic_cap_info.get('pnl_pct',0):.1%})"
+                )
+            else:
+                print(f"  ✓ {h['name']}仓位{h['pos']:.1%} <= 动态上限{dynamic_cap:.0%} (趋势加仓合规)")
 
     # 输出合规摘要
     print(f"\n账户总资产: ¥{account.get('total_asset', 0):.2f}" if account.get('total_asset') else "账户总资产: N/A")
@@ -562,6 +645,33 @@ def run_intraday_scan():
             waived_tag = " [WAIVED]" if z["waived"] == "是" else ""
             print(f"    {z['name']}({z['code']}) {z['level']} 现价{z['price']:.2f} 跌破下沿{z['zd']:.2f} ({z['pct']:+.1f}%){waived_tag}")
 
+    # 【加仓信号检测】(2026-07-26): 二买/三买 → 动态仓位上限
+    add_signals = []
+    print(f"\n  📈 加仓信号检测(动态仓位机制):")
+    for h in holdings:
+        code = str(h['code'])
+        cost = h['entry'] or 0
+        close = h['close'] or 0
+        if cost <= 0 or close <= 0:
+            continue
+        
+        pnl_pct = (close - cost) / cost
+        dynamic_cap = get_dynamic_position_cap(code, cost, close)
+        entry_level = dynamic_cap_info.get("entry", "一买")
+        
+        if entry_level in ("二买", "三买") and pnl_pct >= 0.05:
+            add_signals.append({
+                "name": h['name'], "code": code, "entry": entry_level,
+                "pnl_pct": pnl_pct, "dynamic_cap": dynamic_cap,
+                "current_pos": h.get('pos', 0),
+            })
+            remaining = dynamic_cap - (h.get('pos', 0) or 0)
+            print(f"    ★ {h['name']}({code}) {entry_level}信号 → 动态上限{dynamic_cap:.0%} "
+                  f"当前仓位{h.get('pos',0):.1%} 浮盈{pnl_pct:.1%} 可加仓空间{remaining:.1%}")
+    
+    if not add_signals:
+        print(f"    无二买/三买信号, 所有持仓维持35%静态上限")
+
     # 卖点汇总
     confirmed_sells = [s for s in sell_signals if s["type"] == "确认卖点"]
     near_sells = [s for s in sell_signals if s["type"] == "接近卖点"]
@@ -617,6 +727,7 @@ def run_intraday_scan():
         "near_sells": near_sells,
         "zs_breakdowns": zs_breakdowns,
         "entry_reports": entry_reports,
+        "add_signals": add_signals,
         "scanned": len(candidates),
     }
 
@@ -789,6 +900,16 @@ def format_intraday_summary(result, ts):
 
     if not any([confirmed, near, alerts, breakdowns, confirmed_sells, near_sells]):
         lines.append("✓ 无信号, 持仓合规")
+
+    # 加仓信号
+    add_signals = result.get("add_signals", [])
+    if add_signals:
+        lines.append("")
+        lines.append(f"📈 趋势加仓信号(动态仓位): {len(add_signals)}只")
+        for s in add_signals:
+            remaining = s["dynamic_cap"] - s["current_pos"]
+            lines.append(f"  ★ {s['name']}({s['code']}) {s['entry']} → 上限{s['dynamic_cap']:.0%} "
+                         f"浮盈{s['pnl_pct']:.1%} 可加{remaining:.1%}")
 
     return '\n'.join(lines)
 

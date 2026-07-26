@@ -592,6 +592,67 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                 "post_reason": post_reason,
             })
 
+    # ============================================================
+    # 二买/三买信号检测 (2026-07-26)
+    # 缠论定义:
+    #   二买: 一买后反弹形成新中枢, 回踩不破前低 → 趋势确认
+    #   三买: 二买后新中枢形成, 回踩不破二买中枢上沿 → 趋势加速
+    # 实现: 基于已有中枢序列判断中枢上移模式
+    # ============================================================
+    bull_signals = [s for s in signals if s["op"] == "一买" and s["valid"]]
+    if len(zss) >= 2 and bull_signals:
+        for i in range(1, len(zss)):
+            prev_zs = zss[i - 1]
+            curr_zs = zss[i]
+
+            # 二买: 当前中枢下沿 > 前中枢上沿(中枢上移) + 回踩到当前中枢
+            if curr_zs["zd"] > prev_zs["zg"] and price > 0:
+                if curr_zs["zd"] <= price <= curr_zs["zg"]:
+                    signals.append({
+                        "type": "盘整背驰",
+                        "dir": "看多",
+                        "op": "二买",
+                        "ratio": 50,
+                        "dl_prob": 0.75,
+                        "zs": curr_zs,
+                        "pre_dir": "down",
+                        "post_dir": "up",
+                        "pre_ok": True,
+                        "post_ok": True,
+                        "valid": True,
+                        "aligned": True,
+                        "overall_dir": overall_dir,
+                        "pre_range": f"中枢{i}",
+                        "post_range": f"中枢{i+1}",
+                        "pre_reason": "中枢上移",
+                        "post_reason": "回踩确认",
+                    })
+
+            # 三买: 两个中枢连续上移 + 回踩不破第二中枢上沿
+            if i >= 2 and curr_zs["zd"] > prev_zs["zg"]:
+                prev2_zs = zss[i - 2]
+                if prev_zs["zd"] > prev2_zs["zg"] and price > 0:
+                    if price > curr_zs["zg"]:
+                        signals.append({
+                            "type": "盘整背驰",
+                            "dir": "看多",
+                            "op": "三买",
+                            "ratio": 40,
+                            "dl_prob": 0.80,
+                            "zs": curr_zs,
+                            "pre_dir": "down",
+                            "post_dir": "up",
+                            "pre_ok": True,
+                            "post_ok": True,
+                            "valid": True,
+                            "aligned": True,
+                            "overall_dir": overall_dir,
+                            "pre_range": f"中枢{i-1}",
+                            "post_range": f"中枢{i+1}",
+                            "pre_reason": "连续上移",
+                            "post_reason": "突破加速",
+                        })
+
     signals.sort(key=lambda x: -x['zs']['e'])
 
     result = {
