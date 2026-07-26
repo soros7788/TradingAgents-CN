@@ -71,6 +71,66 @@ def check_compliance():
     holdings = get_today_holdings()
     account = get_account_summary()
     issues = []
+
+    # === 合规审查首项: 成本价-破位级别匹配检查 (策略C, 2026-07-26) ===
+    # 规则: 以成本价确定买点级别, 只执行该级别的卖点/破位
+    #       现价小级别买点不构成加仓/持有理由
+    #       破位级别必须与成本买点级别匹配才触发操作
+    print(f"{'='*50}")
+    print(f"📝 合规核查 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*50}")
+    print(f"【首项】成本价-破位级别匹配检查 (策略C)")
+    print(f"  规则: 成本价定买点级别 → 只执行该级别卖点/破位")
+    print(f"  原则: 买入卖出同级别闭环, 避免级别错配")
+
+    level_mismatch_count = 0
+    for h in holdings:
+        if h['waived'] == '是':
+            continue
+        code = str(h['code'])
+        cost = h['entry'] or 0
+        close = h['close'] or 0
+        if cost <= 0:
+            continue
+
+        entry_data = detect_entry_level(code, cost)
+        entry_level = entry_data["entry_level"]
+        sell_levels = entry_data["sell_levels"]
+        zone = entry_data["entry_info"].get(entry_level, {}).get("zone", "未知") if entry_level else "未确定"
+
+        # 检查成本对应级别是否破位
+        level_bd = False
+        for level in sell_levels:
+            try:
+                r = analyze_beichi(code, level=level)
+                if "error" in r or not r.get("zss"):
+                    continue
+                last_zs = r["zss"][-1]
+                if close < last_zs["zd"]:
+                    pct = ((close - last_zs["zd"]) / last_zs["zd"]) * 100
+                    issues.append(f"🔴 {h['name']}({code}) {level}中枢破位{pct:+.1f}% (成本{cost:.2f}对应{entry_level}买点, 现价{close:.2f}<下沿{last_zs['zd']:.2f})")
+                    level_bd = True
+            except:
+                pass
+
+        # 检查是否有更小级别买点(策略C明确忽略)
+        if entry_level and level_bd:
+            level_idx = ["日线", "30min", "5min", "1min"].index(entry_level)
+            smaller_levels = ["日线", "30min", "5min", "1min"][level_idx+1:]
+            for level in smaller_levels:
+                try:
+                    r = analyze_beichi(code, level=level)
+                    if "error" in r:
+                        continue
+                    for sig in r.get("signals", []):
+                        if sig["op"] == "一买" and sig["ratio"] < 60 and sig["dl_prob"] > 0.8 and sig["valid"]:
+                            issues.append(f"⚠️ {h['name']}({code}) {level}有确认一买但非成本对应级别, 不构成加仓理由(策略C)")
+                except:
+                    pass
+
+    print(f"  成本级别匹配检查: {'⚠️发现'+str(len([i for i in issues if '中枢破位' in i]))+'个破位' if issues else '✓ 无破位'}")
+
+    # === 其他合规检查 ===
     for h in holdings:
         if h['waived'] == '是':
             continue
@@ -79,11 +139,8 @@ def check_compliance():
         if h['pos'] and h['pos'] > 0.35:
             issues.append(f"⚠️ {h['name']}仓位超限: {h['pos']:.1%}>35%")
 
-    # 输出合规摘要(可读格式, 供 Telegram 推送)
-    print(f"{'='*50}")
-    print(f"📝 合规核查 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"{'='*50}")
-    print(f"账户总资产: ¥{account.get('total_asset', 0):.2f}" if account.get('total_asset') else "账户总资产: N/A")
+    # 输出合规摘要
+    print(f"\n账户总资产: ¥{account.get('total_asset', 0):.2f}" if account.get('total_asset') else "账户总资产: N/A")
     print(f"现金: ¥{account.get('cash', 0):.2f}" if account.get('cash') else "现金: N/A")
     print(f"仓位比例: {account.get('position_ratio', 0):.1%}" if account.get('position_ratio') else "仓位比例: N/A")
     print(f"持仓数量: {len(holdings)}只")
@@ -196,9 +253,14 @@ def run_full_scan():
 def detect_entry_level(code, cost):
     """根据成本价判断属于哪个级别的买点区间, 返回对应卖点级别列表
 
-    逻辑: 成本落在某级别中枢区间内 → 该级别为买点级别 → 对应同级卖点
-    成本在中枢下方 → 更大级别的买点 → 监控更大级别卖点
-    成本在所有中枢上方 → 基础级别买点 → 监控所有级别卖点
+    策略C (2026-07-26修订):
+    逻辑: 成本落在某级别中枢区间内 → 该级别为买点级别 → 只监控该级别卖点/破位
+          成本在最新中枢下方 → 该级别一买区 → 只监控该级别卖点/破位
+          成本在所有中枢上方 → 基础级别买点 → 默认监控日线级别
+
+    核心原则: 买入逻辑和卖出逻辑在同一级别闭环, 避免级别错配
+    - 不扩展到更小级别(避免1min破位噪音干扰日线买点持仓)
+    - 不看现价小级别买点(避免"现价有1min买点所以可以加仓"的误判)
     """
     sys.path.insert(0, BEICHI_DIR)
     from beichi_analyzer import analyze_beichi
@@ -215,16 +277,12 @@ def detect_entry_level(code, cost):
             first_zs = zss[0]
 
             if last_zs["zd"] <= cost <= last_zs["zg"]:
-                # 成本在最新中枢区间内 → 该级别买点
                 entry_info[level] = {"zone": "中枢内", "zs": last_zs}
             elif cost < last_zs["zd"]:
-                # 成本在最新中枢下方 → 该级别一买区
                 entry_info[level] = {"zone": "中枢下方(一买区)", "zs": last_zs}
             elif cost < first_zs["zd"]:
-                # 成本在所有中枢下方 → 深度一买区
                 entry_info[level] = {"zone": "全中枢下方(深度一买区)", "zs": first_zs}
             else:
-                # 成本在中枢上方 → 不是该级别的买点
                 entry_info[level] = {"zone": "中枢上方", "zs": last_zs}
         except:
             pass
@@ -237,12 +295,12 @@ def detect_entry_level(code, cost):
             best_entry_level = level
             break
 
-    # 卖点监控级别: 买点级别 + 更小级别(精确止盈)
+    # 卖点监控级别: 只监控成本对应的买点级别(策略C)
+    # 不扩展到更小级别, 避免小级别噪音造成过度交易
     if best_entry_level:
-        idx = levels_priority.index(best_entry_level)
-        sell_levels = levels_priority[idx:]  # 买点级别及更小级别
+        sell_levels = [best_entry_level]  # 只监控该级别
     else:
-        sell_levels = levels_priority  # 无法确定则全监控
+        sell_levels = ["日线"]  # 无法确定则默认日线
 
     return {
         "entry_level": best_entry_level,
