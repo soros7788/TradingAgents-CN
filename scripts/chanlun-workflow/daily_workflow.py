@@ -616,6 +616,28 @@ def run_intraday_scan():
             sell_levels = ["日线", "30min"]
             print(f"  📌 {name}({code}) 无成本价 → 默认监控: 日线+30min")
 
+        # 【BUG修复 (2026-07-26)】一买区持仓中枢破位误报
+        #
+        # BUG根因:
+        #   detect_entry_level判断成本在中枢下方 → zone="中枢下方(一买区)"
+        #   即: 成本 < last_zs["zd"] (成本本就低于中枢下沿)
+        #   此时若现价也低于zd(正常,因为一买区持仓本就在中枢下方)
+        #   中枢破位检查 close_price < zd 会触发误报
+        #
+        #   日志证据(2026-07-27 07:29运行):
+        #     创力集团 成本8.02 中枢下方(一买区) 现价8.03 跌破下沿8.18
+        #     新五丰 成本4.80 中枢下方(一买区) 现价4.73 跌破下沿4.88
+        #     方盛制药 成本9.27 中枢下方(一买区) 现价8.96 跌破下沿9.89
+        #     建研院 成本3.97 中枢下方(一买区) 现价4.02 跌破下沿4.03
+        #     曲美家居 成本3.14 中枢下方(一买区) 现价3.09 跌破下沿3.18
+        #   → 全部是一买区持仓, 现价<zd是正常状态, 不是破位
+        #
+        # 修复策略:
+        #   一买区持仓(cost < zd): 中枢破位判定改为"现价跌破成本价"而非"跌破中枢下沿"
+        #   中枢内持仓(zd <= cost <= zg): 维持原逻辑"跌破中枢下沿"
+        #   中枢上方持仓(cost > zg): 维持原逻辑"跌破中枢下沿"
+        is_one_buy_zone = zone_desc in ("中枢下方(一买区)", "全中枢下方(深度一买区)") if cost > 0 else False
+
         # 3b. 止损检查
         if waived != '是':
             if close_price and h['stop'] and close_price <= h['stop']:
@@ -629,18 +651,32 @@ def run_intraday_scan():
                     continue
 
                 # 中枢破位检查: 现价跌破最新中枢下沿
+                # 【BUG修复】一买区持仓: 改为跌破成本价才算破位
                 zss = r.get("zss", [])
                 if zss and close_price > 0:
                     last_zs = zss[-1]
                     zd = last_zs["zd"]
                     zg = last_zs["zg"]
-                    if close_price < zd:
-                        pct = ((close_price - zd) / zd) * 100
-                        zs_breakdowns.append({
-                            "name": name, "code": code, "level": level,
-                            "price": close_price, "zd": zd, "zg": zg, "pct": pct,
-                            "waived": waived,
-                        })
+                    if is_one_buy_zone:
+                        # 一买区持仓: 现价跌破成本价才是破位
+                        if cost > 0 and close_price < cost:
+                            pct = ((close_price - cost) / cost) * 100
+                            zs_breakdowns.append({
+                                "name": name, "code": code, "level": level,
+                                "price": close_price, "zd": cost, "zg": zg, "pct": pct,
+                                "waived": waived,
+                                "breakdown_type": "一买区跌破成本",
+                            })
+                    else:
+                        # 正常持仓: 现价跌破中枢下沿才是破位
+                        if close_price < zd:
+                            pct = ((close_price - zd) / zd) * 100
+                            zs_breakdowns.append({
+                                "name": name, "code": code, "level": level,
+                                "price": close_price, "zd": zd, "zg": zg, "pct": pct,
+                                "waived": waived,
+                                "breakdown_type": "跌破中枢下沿",
+                            })
 
                 # 背驰卖点检查
                 for sig in r.get("signals", []):
@@ -676,7 +712,8 @@ def run_intraday_scan():
         print(f"  🔻 中枢破位: {len(zs_breakdowns)}个")
         for z in zs_breakdowns:
             waived_tag = " [WAIVED]" if z["waived"] == "是" else ""
-            print(f"    {z['name']}({z['code']}) {z['level']} 现价{z['price']:.2f} 跌破下沿{z['zd']:.2f} ({z['pct']:+.1f}%){waived_tag}")
+            bd_type = z.get("breakdown_type", "跌破中枢下沿")
+            print(f"    {z['name']}({z['code']}) {z['level']} 现价{z['price']:.2f} {bd_type}{z['zd']:.2f} ({z['pct']:+.1f}%){waived_tag}")
 
     # 【加仓信号检测】(2026-07-26): 二买/三买 → 动态仓位上限
     add_signals = []
@@ -917,7 +954,8 @@ def format_intraday_summary(result, ts):
         non_waived = [z for z in breakdowns if z["waived"] != "是"]
         lines.append(f"🔻 中枢破位: {len(breakdowns)}个 (非WAIVED {len(non_waived)}个)")
         for z in non_waived[:5]:
-            lines.append(f"  {z['name']}({z['code']}) {z['level']} ¥{z['price']:.2f} 跌破下沿{z['zd']:.2f} ({z['pct']:+.1f}%)")
+            bd_type = z.get("breakdown_type", "跌破中枢下沿")
+            lines.append(f"  {z['name']}({z['code']}) {z['level']} ¥{z['price']:.2f} {bd_type}{z['zd']:.2f} ({z['pct']:+.1f}%)")
         if len(non_waived) > 5:
             lines.append(f"  ...还有{len(non_waived)-5}个")
         lines.append("")
