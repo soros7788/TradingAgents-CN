@@ -78,70 +78,76 @@ def get_account_summary():
 
 def get_dynamic_position_cap(code, cost, close):
     """
-    动态仓位上限计算 (2026-07-26): 修复重仓合规悖论
-    
-    缠论趋势加仓机制:
+    动态仓位上限计算 V3 (2026-07-26): 多级别DL_P共振
+
+    替代单级别二买/三买检测, 用DL_P+Ratio+valid+多级别共振
+    解决: 一买DL_P变动导致核心池不稳定 + ratio/级别本身有bug
+
+    多级别共振机制:
       一买建仓: 35% (基础上限)
-      二买加仓: 50% (中枢上移验证趋势)
-      三买加仓: 60% (连续上移趋势加速)
-    
-    三重条件闭环:
-      1. 买点升级: 检测到二买/三买信号
-      2. 浮盈护垫: 浮盈>=5%才允许加仓, 浮盈越大上限越高
-      3. 止损上移: 加仓后止损必须上移到新中枢下沿
-    
-    任一条件不满足 → 回退到35%静态上限
+      二买加仓: 50% (日线一买valid + 30min+5min DL_P确认)
+      三买加仓: 60% (日线趋势up + 30min+5min 双趋势背驰)
+
+    候选池分层(核心池不再因一买DL_P每天变动而改变):
+      核心池: 日线DL_P>=0.6 + 30min DL_P>=0.6 (双趋势背驰, 1-2周稳定)
+      观察池: 日线DL_P>=0.6 + 30min DL_P>=0.4 (3-5天稳定)
+      边缘池: 日线DL_P>=0.4 (每天变动, 仅观察)
+
+    条件闭环:
+      1. 买点升级: 多级别DL_P共振确认
+      2. 浮盈护垫: 浮盈>=5%才允许加仓
     """
     global dynamic_cap_info
-    dynamic_cap_info = {"entry": "一买", "pnl_pct": 0, "cap": 0.35}
-    
+    dynamic_cap_info = {"entry": "一买", "pnl_pct": 0, "cap": 0.35, "tier": "边缘池"}
+
     if cost <= 0 or close <= 0:
         return 0.35
-    
+
     pnl_pct = (close - cost) / cost
     dynamic_cap_info["pnl_pct"] = pnl_pct
-    
-    # 条件2: 浮盈护垫 — 无浮盈不允许提升上限
+
+    # 条件2: 浮盈护垫
     if pnl_pct < 0.05:
         return 0.35
-    
-    # 条件1: 买点升级 — 检测二买/三买信号(需DL_P验证)
+
+    # 条件1: 多级别DL_P共振检测
     sys.path.insert(0, BEICHI_DIR)
-    from beichi_analyzer import analyze_beichi
-    
+    from beichi_analyzer import detect_multilevel_buy_signals
+
+    try:
+        ml = detect_multilevel_buy_signals(code, price=close)
+    except:
+        ml = {}
+
+    tier = ml.get("tier", "边缘池")
+    ermai = ml.get("ermai")
+    sanmai = ml.get("sanmai")
+
+    dynamic_cap_info["tier"] = tier
+    dynamic_cap_info["daily_dl_p"] = ml.get("daily_dl_p", 0)
+    dynamic_cap_info["30min_dl_p"] = ml.get("30min_dl_p", 0)
+    dynamic_cap_info["5min_dl_p"] = ml.get("5min_dl_p", 0)
+
     best_entry = "一买"
     best_dl_prob = 0
-    for level in ["日线", "30min"]:
-        try:
-            r = analyze_beichi(code, level=level)
-            if "error" in r or not r.get("signals"):
-                continue
-            for sig in r["signals"]:
-                if not sig.get("valid"):
-                    continue
-                dl_prob = sig.get("dl_prob", 0)
-                if sig["op"] == "三买" and dl_prob >= 0.45 and dl_prob > best_dl_prob:
-                    best_entry = "三买"
-                    best_dl_prob = dl_prob
-                    break
-                elif sig["op"] == "二买" and dl_prob >= 0.40 and dl_prob > best_dl_prob and best_entry != "三买":
-                    best_entry = "二买"
-                    best_dl_prob = dl_prob
-            if best_entry == "三买":
-                break
-        except:
-            pass
-    
+
+    if sanmai and sanmai.get("valid"):
+        best_entry = "三买"
+        best_dl_prob = sanmai.get("dl_prob", 0)
+    elif ermai and ermai.get("valid"):
+        best_entry = "二买"
+        best_dl_prob = ermai.get("dl_prob", 0)
+
     dynamic_cap_info["entry"] = best_entry
     dynamic_cap_info["dl_prob"] = best_dl_prob
-    
+
     # 动态上限表: 买点级别 × 浮盈护垫
     cap_table = {
         "一买": 0.35,
         "二买": 0.50 if pnl_pct >= 0.05 else 0.35,
         "三买": 0.60 if pnl_pct >= 0.10 else (0.50 if pnl_pct >= 0.05 else 0.35),
     }
-    
+
     cap = cap_table.get(best_entry, 0.35)
     dynamic_cap_info["cap"] = cap
     return cap
@@ -228,13 +234,15 @@ def check_compliance():
             
             # 计算动态上限
             dynamic_cap = get_dynamic_position_cap(code, cost, close)
+            tier = dynamic_cap_info.get("tier", "边缘池")
             if h['pos'] > dynamic_cap:
                 issues.append(
                     f"⚠️ {h['name']}仓位超限: {h['pos']:.1%}>动态上限{dynamic_cap:.0%}"
-                    f"(买点级别={dynamic_cap_info.get('entry','?')} 浮盈={dynamic_cap_info.get('pnl_pct',0):.1%})"
+                    f"(买点={dynamic_cap_info.get('entry','?')} 分层={tier} 浮盈={dynamic_cap_info.get('pnl_pct',0):.1%})"
                 )
             else:
-                print(f"  ✓ {h['name']}仓位{h['pos']:.1%} <= 动态上限{dynamic_cap:.0%} (趋势加仓合规)")
+                print(f"  ✓ {h['name']}仓位{h['pos']:.1%} <= 动态上限{dynamic_cap:.0%} "
+                      f"[{tier}] (多级别共振合规)")
 
     # 输出合规摘要
     print(f"\n账户总资产: ¥{account.get('total_asset', 0):.2f}" if account.get('total_asset') else "账户总资产: N/A")
@@ -303,41 +311,61 @@ def run_full_scan():
         print("\n候选池: 无确认标的(排除持仓后), 跳过写入")
         return result
 
-    # 分层: 核心池优先, 观察池补充, 边缘池末尾
+    # ============================================================
+    # 婴儿级候选池 V2 (2026-07-26): 旧分层逻辑 + 沪深各5只共10只
+    #
+    # 保留:
+    #   - 分层: 核心/观察/边缘 (ratio<20%限制)
+    #   - 颜色: 黄(核心)/蓝(观察)/灰(边缘)
+    #   - 列11公式自动分层
+    # 仅修改:
+    #   - 沪深各15只 → 沪深各5只 (共10只)
+    # ============================================================
     core = [r for r in all_confirmed if r.get("tier") == "核心"]
     watch = [r for r in all_confirmed if r.get("tier") == "观察"]
     edge = [r for r in all_confirmed if r.get("tier") == "边缘"]
 
-    # 沪深各取, 优先核心池
+    # 沪深各取, 优先核心池 (10W规模以下不考虑300/301创业板)
     def split_sz_sha(stocks):
         sha = sorted([r for r in stocks if r["code"].startswith("6")], key=lambda x: (-x["dlp"], x["ratio"]))
         sza = sorted([r for r in stocks if r["code"].startswith("0")], key=lambda x: (-x["dlp"], x["ratio"]))
         return sha, sza
 
-    # 核心池先选
+    # 核心池先选 (沪深各5只)
     core_sha, core_sz = split_sz_sha(core)
-    selected = core_sha[:15] + core_sz[:15]
+    selected = core_sha[:5] + core_sz[:5]
 
-    # 核心池不足15只/边, 用观察池补
-    if len(core_sha) < 15:
+    # 核心池不足5只/边, 用观察池补
+    if len(core_sha) < 5:
         watch_sha, _ = split_sz_sha(watch)
-        selected += watch_sha[:15 - len(core_sha)]
-    if len(core_sz) < 15:
+        selected += watch_sha[:5 - len(core_sha)]
+    if len(core_sz) < 5:
         _, watch_sz = split_sz_sha(watch)
-        selected += watch_sz[:15 - len(core_sz)]
+        selected += watch_sz[:5 - len(core_sz)]
 
-    # 仍不足, 用边缘池补
+    # 仍不足, 用边缘池按沪深分别补
     selected_codes = {s["code"] for s in selected}
-    remaining = [r for r in all_confirmed if r["code"] not in selected_codes]
-    if len(selected) < 30:
-        remaining_sha, remaining_sz = split_sz_sha(remaining)
-        need = 30 - len(selected)
-        selected += (remaining_sha + remaining_sz)[:need]
+    # 统计当前沪深数量
+    cur_sha_cnt = sum(1 for s in selected if s["code"].startswith("6"))
+    cur_sz_cnt = sum(1 for s in selected if s["code"].startswith("0"))
+    sha_need = max(0, 5 - cur_sha_cnt)
+    sz_need = max(0, 5 - cur_sz_cnt)
+    # 边缘池按沪深分别补
+    edge_sha, edge_sz = split_sz_sha(edge)
+    selected += edge_sha[:sha_need]
+    selected += edge_sz[:sz_need]
+    # 边缘池仍不足, 用剩余观察池补
+    if len(selected) < 10:
+        still_need = 10 - len(selected)
+        watch_remaining = [r for r in watch if r["code"] not in selected_codes]
+        wr_sha, wr_sz = split_sz_sha(watch_remaining)
+        selected += (wr_sha + wr_sz)[:still_need]
 
     selected.sort(key=lambda x: (0 if x.get("tier") == "核心" else 1 if x.get("tier") == "观察" else 2, -x["dlp"]))
 
-    print(f"\n分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只")
-    print(f"写入: {len(selected)}只 (核心{len([s for s in selected if s.get('tier')=='核心'])} + 观察{len([s for s in selected if s.get('tier')=='观察'])} + 边缘{len([s for s in selected if s.get('tier')=='边缘'])})")
+    print(f"\n[婴儿级候选池] 分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只")
+    print(f"写入: {len(selected)}只 (沪深各5只, 共10只)")
+    print(f"  核心{len([s for s in selected if s.get('tier')=='核心'])} + 观察{len([s for s in selected if s.get('tier')=='观察'])} + 边缘{len([s for s in selected if s.get('tier')=='边缘'])}")
 
     wb = load_workbook(WB)
     ws = wb['候选池']
@@ -357,12 +385,12 @@ def run_full_scan():
         "观察": "观察池",
         "边缘": "边缘池",
     }
-    # 分层颜色 (与fix_tier.py一致)
+    # 分层颜色 (与fix_tier.py一致): 黄/蓝/灰
     from openpyxl.styles import PatternFill, Font as XFont
     tier_fill = {
-        "核心": PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),
-        "观察": PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid"),
-        "边缘": PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid"),
+        "核心": PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),  # 黄
+        "观察": PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid"),  # 蓝
+        "边缘": PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid"),  # 灰
     }
     for idx, stock in enumerate(selected):
         row = 2 + idx
@@ -385,10 +413,10 @@ def run_full_scan():
         ws.cell(row=row, column=8, value=stock["dlp"])
         ws.cell(row=row, column=9, value=str(stock["valid"]))
         ws.cell(row=row, column=10, value="一买")
-        # 列11: 分层Tier — 公式自动计算, 不硬写值
+        # 列11: 分层Tier — 公式自动计算(ratio<20%+DL_P>0.90=核心池)
         ws.cell(row=row, column=11, value=f'=IF($A{row}="","",IF(AND(G{row}<20%,H{row}>0.90),"核心池",IF(AND(H{row}>=0.85),"观察池",IF(AND(H{row}>=0.80),"边缘池",""))))')
         ws.cell(row=row, column=11).font = XFont(bold=True, size=11)
-        # 行颜色: 按分层着色
+        # 行颜色: 按分层着色 (黄/蓝/灰)
         fill = tier_fill.get(tier)
         if fill:
             for c in range(1, 32):
@@ -652,30 +680,38 @@ def run_intraday_scan():
 
     # 【加仓信号检测】(2026-07-26): 二买/三买 → 动态仓位上限
     add_signals = []
-    print(f"\n  📈 加仓信号检测(动态仓位机制):")
+    print(f"\n  📈 加仓信号检测(多级别DL_P共振):")
     for h in holdings:
         code = str(h['code'])
         cost = h['entry'] or 0
         close = h['close'] or 0
         if cost <= 0 or close <= 0:
             continue
-        
+
         pnl_pct = (close - cost) / cost
         dynamic_cap = get_dynamic_position_cap(code, cost, close)
         entry_level = dynamic_cap_info.get("entry", "一买")
-        
+        tier = dynamic_cap_info.get("tier", "边缘池")
+        d_dp = dynamic_cap_info.get("daily_dl_p", 0)
+        m30_dp = dynamic_cap_info.get("30min_dl_p", 0)
+        m5_dp = dynamic_cap_info.get("5min_dl_p", 0)
+
         if entry_level in ("二买", "三买") and pnl_pct >= 0.05:
             add_signals.append({
                 "name": h['name'], "code": code, "entry": entry_level,
                 "pnl_pct": pnl_pct, "dynamic_cap": dynamic_cap,
-                "current_pos": h.get('pos', 0),
+                "current_pos": h.get('pos', 0), "tier": tier,
             })
             remaining = dynamic_cap - (h.get('pos', 0) or 0)
-            print(f"    ★ {h['name']}({code}) {entry_level}信号 → 动态上限{dynamic_cap:.0%} "
+            print(f"    ★ {h['name']}({code}) {entry_level}信号 [{tier}] → 动态上限{dynamic_cap:.0%} "
                   f"当前仓位{h.get('pos',0):.1%} 浮盈{pnl_pct:.1%} 可加仓空间{remaining:.1%}")
-    
+            print(f"      DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
+        else:
+            print(f"    · {h['name']}({code}) [{tier}] 上限{dynamic_cap:.0%} "
+                  f"DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
+
     if not add_signals:
-        print(f"    无二买/三买信号, 所有持仓维持35%静态上限")
+        print(f"    无多级别共振信号, 所有持仓维持35%静态上限")
 
     # 卖点汇总
     confirmed_sells = [s for s in sell_signals if s["type"] == "确认卖点"]

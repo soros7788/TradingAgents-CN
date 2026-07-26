@@ -591,34 +591,6 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
             direction = "看多" if pre_d == "down" else "看空"
             op = "一买" if pre_d == "down" else "一卖"
 
-            # 【BUG-3修复 (2026-07-26)】价格新低/新高检查
-            #
-            # BUG根因:
-            #   旧代码只比较MACD面积比ratio, 未检查价格是否创新低/新高
-            #   底背驰定义: 价格新低 + MACD不新低
-            #   顶背驰定义: 价格新高 + MACD不新高
-            #   → 即使post段价格高于pre段(非新低), 只要MACD面积小就被判为背驰
-            #
-            # 修复策略: 不丢弃信号(避免机会成本), 仅校正type
-            #   一买: post段最低价 < pre段最低价 → 保持背驰判定
-            #         post段最低价 >= pre段最低价 → 降级为"无背驰"(非底背驰)
-            #   一卖: post段最高价 > pre段最高价 → 保持背驰判定
-            #         post段最高价 <= pre段最高价 → 降级为"无背驰"(非顶背驰)
-            price_new_extreme = False
-            if pre_d == "down":
-                # 一买: 检查价格新低
-                pre_low = min(C[pre_s:pre_e + 1])
-                post_low = min(C[post_s:post_e + 1])
-                price_new_extreme = post_low < pre_low
-            else:
-                # 一卖: 检查价格新高
-                pre_high = max(C[pre_s:pre_e + 1])
-                post_high = max(C[post_s:post_e + 1])
-                price_new_extreme = post_high > pre_high
-
-            if not price_new_extreme and sig_type != "无背驰":
-                sig_type = "无背驰"
-
             # 【BUG-1修复 (2026-07-26)】趋势背驰 vs 盘整背驰校正
             #
             # 缠论分类思想(借鉴):
@@ -660,7 +632,6 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                 "aligned": aligned,
                 "overall_dir": overall_dir,
                 "has_downtrend": has_downtrend,  # BUG-1: 下跌趋势标记
-                "price_new_extreme": price_new_extreme,  # BUG-3: 价格新低/新高标记
                 "pre_range": f"{times[pre_s]}~{times[pre_e]}",
                 "post_range": f"{times[post_s]}~{times[post_e]}",
                 "pre_reason": pre_reason,

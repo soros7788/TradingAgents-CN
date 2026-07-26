@@ -539,21 +539,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         if zs_e >= n - post_min_bars[level]:
             continue
 
-        # 【BUG-2修复 (2026-07-26)】pre段定义: 固定根数 → 前中枢结束点
-        #
-        # BUG根因:
-        #   旧代码: pre_s = max(0, zs_s - pre_bars_map[level]) (固定回溯25根)
-        #   pre段可能包含前一个中枢的部分, 不是纯粹的"前一段下跌走势"
-        #   → MACD面积计算不准, ratio失真
-        #
-        # 修复策略:
-        #   有前中枢: pre_s = prev_zs["e"] + 1 (前中枢结束后)
-        #   无前中枢: 保持原逻辑(固定根数), 但标注为盘整背驰(无趋势)
-        if i_zs > 0:
-            prev_zs_for_pre = zss[i_zs - 1]
-            pre_s = max(0, prev_zs_for_pre["e"] + 1)
-        else:
-            pre_s = max(0, zs_s - pre_bars_map[level])
+        pre_s = max(0, zs_s - pre_bars_map[level])
         pre_e = zs_s - 1
         post_s = zs_e + 1
         post_e = n - 1
@@ -590,34 +576,6 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
             sig_type = dl_sig_type
             direction = "看多" if pre_d == "down" else "看空"
             op = "一买" if pre_d == "down" else "一卖"
-
-            # 【BUG-3修复 (2026-07-26)】价格新低/新高检查
-            #
-            # BUG根因:
-            #   旧代码只比较MACD面积比ratio, 未检查价格是否创新低/新高
-            #   底背驰定义: 价格新低 + MACD不新低
-            #   顶背驰定义: 价格新高 + MACD不新高
-            #   → 即使post段价格高于pre段(非新低), 只要MACD面积小就被判为背驰
-            #
-            # 修复策略: 不丢弃信号(避免机会成本), 仅校正type
-            #   一买: post段最低价 < pre段最低价 → 保持背驰判定
-            #         post段最低价 >= pre段最低价 → 降级为"无背驰"(非底背驰)
-            #   一卖: post段最高价 > pre段最高价 → 保持背驰判定
-            #         post段最高价 <= pre段最高价 → 降级为"无背驰"(非顶背驰)
-            price_new_extreme = False
-            if pre_d == "down":
-                # 一买: 检查价格新低
-                pre_low = min(C[pre_s:pre_e + 1])
-                post_low = min(C[post_s:post_e + 1])
-                price_new_extreme = post_low < pre_low
-            else:
-                # 一卖: 检查价格新高
-                pre_high = max(C[pre_s:pre_e + 1])
-                post_high = max(C[post_s:post_e + 1])
-                price_new_extreme = post_high > pre_high
-
-            if not price_new_extreme and sig_type != "无背驰":
-                sig_type = "无背驰"
 
             # 【BUG-1修复 (2026-07-26)】趋势背驰 vs 盘整背驰校正
             #
@@ -660,7 +618,6 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                 "aligned": aligned,
                 "overall_dir": overall_dir,
                 "has_downtrend": has_downtrend,  # BUG-1: 下跌趋势标记
-                "price_new_extreme": price_new_extreme,  # BUG-3: 价格新低/新高标记
                 "pre_range": f"{times[pre_s]}~{times[pre_e]}",
                 "post_range": f"{times[post_s]}~{times[post_e]}",
                 "pre_reason": pre_reason,
@@ -729,31 +686,12 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                 except:
                     dl_prob_ermai = 0.50  # DL不可用时保守估计
 
-                # 二买: 回调不破一买低点(BUG-4修复)
-                #
-                # BUG-4根因:
-                #   旧代码: curr_zs["zd"] <= price <= curr_zs["zg"]
-                #   → 检查"回踩中枢区间", 但一买低点与中枢下沿ZD是不同概念
-                #   → 价格可能在中枢区间内却已跌破一买低点(趋势仍下跌)
-                #   → 价格可能在一买低点上方但不在中枢区间内(错过真实二买)
-                #
-                # 修复策略:
-                #   计算一买低点(一买中枢的最低价)
-                #   二买条件改为: price >= one_buy_low (回调不破一买低点)
-                #   中枢上移条件保留(趋势确认)
-                one_buy_low = None
-                one_buy_sig = None
-                for sig in bull_signals:
-                    sig_zs = sig["zs"]
-                    if sig_zs["e"] <= prev_zs["s"]:
-                        sig_low = min(C[sig_zs["s"]:sig_zs["e"]+1])
-                        if one_buy_low is None or sig_low < one_buy_low:
-                            one_buy_low = sig_low
-                            one_buy_sig = sig
-
-                if one_buy_low is not None and price >= one_buy_low:
+                # 二买: 回踩到当前中枢区间内(不追高)
+                if curr_zs["zd"] <= price <= curr_zs["zg"]:
                     # 条件2: 一买信号的时间必须在中枢上移之前
-                    one_buy_before = one_buy_sig is not None
+                    one_buy_before = any(
+                        sig["zs"]["e"] <= prev_zs["s"] for sig in bull_signals
+                    )
                     # 条件3: DL_P >= 0.4 (盘整背驰门槛, 二买要求较低)
                     if one_buy_before and dl_prob_ermai >= 0.4:
                         signals.append({
@@ -770,11 +708,10 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                             "valid": dl_prob_ermai >= 0.4 and one_buy_before,
                             "aligned": True,
                             "overall_dir": overall_dir,
-                            "one_buy_low": one_buy_low,  # BUG-4: 一买低点
                             "pre_range": f"中枢{i}",
                             "post_range": f"中枢{i+1}",
-                            "pre_reason": f"中枢上移+一买低点{one_buy_low:.2f}",
-                            "post_reason": f"回调不破一买低点(现价{price:.2f})",
+                            "pre_reason": "中枢上移+一买前提",
+                            "post_reason": "回踩确认",
                         })
 
                 # 三买: 连续两个中枢上移 + 突破后回踩不破第二中枢上沿
