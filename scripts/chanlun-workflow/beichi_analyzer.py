@@ -539,19 +539,34 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         if zs_e >= n - post_min_bars[level]:
             continue
 
-        # 【BUG-2修复 (2026-07-26)】pre段定义: 固定根数 → 前中枢结束点
+        # 【BUG-10修复 (2026-07-27)】中枢首尾相接导致pre段=0
         #
         # BUG根因:
-        #   旧代码: pre_s = max(0, zs_s - pre_bars_map[level]) (固定回溯25根)
-        #   pre段可能包含前一个中枢的部分, 不是纯粹的"前一段下跌走势"
-        #   → MACD面积计算不准, ratio失真
+        #   BUG-2修复用 pre_s = prev_zs["e"] + 1, 假设中枢之间有足够间距
+        #   但30min/5min的find_zhongshu用min_amp=0.1%, 产生大量首尾相接的中枢
+        #   → prev_zs["e"] + 1 >= zs_s → pre段长度=0或负数
+        #   → seg_direction(flat) → 信号过滤条件永远不满足
+        #   → 30min/5min级别24/23个中枢却0个信号, 二买永远无法触发
+        #
+        # 典型案例: 丽珠集团 000513
+        #   30min: 24个中枢在30~31.5狭窄区间, 0个信号
+        #   5min: 23个中枢, 0个信号
+        #   日线: 中枢间距大, 正常产出信号
         #
         # 修复策略:
-        #   有前中枢: pre_s = prev_zs["e"] + 1 (前中枢结束后)
-        #   无前中枢: 保持原逻辑(固定根数), 但标注为盘整背驰(无趋势)
+        #   有前中枢且间距>=min_gap: 用BUG-2逻辑 pre_s = prev_zs["e"] + 1
+        #   有前中枢但间距<min_gap(首尾相接): 回退到固定根数 pre_s = zs_s - pre_bars
+        #   无前中枢: 保持原逻辑(固定根数)
         if i_zs > 0:
             prev_zs_for_pre = zss[i_zs - 1]
-            pre_s = max(0, prev_zs_for_pre["e"] + 1)
+            raw_pre_s = prev_zs_for_pre["e"] + 1
+            min_gap = 3  # 前中枢结束后至少隔3根K线才用BUG-2逻辑
+            if raw_pre_s + min_gap <= zs_s:
+                # 中枢间距足够 → 用BUG-2逻辑
+                pre_s = raw_pre_s
+            else:
+                # 中枢首尾相接 → 回退固定根数, 标注为盘整背驰
+                pre_s = max(0, zs_s - pre_bars_map[level])
         else:
             pre_s = max(0, zs_s - pre_bars_map[level])
         pre_e = zs_s - 1
