@@ -56,13 +56,19 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -o pipefail  # 确保python退出码不被tee掩盖
-          # 定时任务根据cron时间自动选择命令, 手动触发用输入值
+          # 【BUG-9修复 (2026-07-27)】TZ/command选择不匹配
+          #
+          # 旧代码用 date '+%H' 获取小时, 但 TZ=Asia/Shanghai 使date返回北京时间
+          # 而代码检查的是UTC小时("07"), 导致15:05的scan和15:30的compliance
+          # 都被误判为intraday → 候选池永不更新 + 合规检查永不执行
+          #
+          # 修复: 直接用 github.event.schedule 匹配cron表达式
+          #       无需依赖时间判断, 彻底消除TZ和延迟问题
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            HOUR=$(date '+%H')
-            MINUTE=$(date '+%M')
-            if [ "$HOUR" = "07" ] && [ "$MINUTE" = "05" ]; then
+            SCHEDULE="${{ github.event.schedule }}"
+            if [ "$SCHEDULE" = "5 7 * * 1-5" ]; then
               CMD="scan"          # 15:05 收盘后日线全市场扫描 + 更新候选池
-            elif [ "$HOUR" = "07" ] && [ "$MINUTE" = "30" ]; then
+            elif [ "$SCHEDULE" = "30 7 * * 1-5" ]; then
               CMD="compliance"    # 15:30 合规核查
             else
               CMD="intraday"      # 盘中30min扫描 + 持仓止损检查
@@ -73,7 +79,6 @@ jobs:
           echo "=== $CMD $(date '+%Y-%m-%d %H:%M') ==="
           cd scripts/chanlun-workflow
           python daily_workflow.py $CMD 2>&1 | tee /tmp/workflow_output.txt
-          echo "exit_code=$?" >> $GITHUB_OUTPUT
 
       - name: Commit Excel changes
         if: success()

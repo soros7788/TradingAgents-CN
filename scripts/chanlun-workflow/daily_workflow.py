@@ -530,43 +530,47 @@ def run_intraday_scan():
     held_codes = {str(h['code']) for h in holdings if h.get('code')}
 
     # 1. 候选池30min扫描
+    # 【BUG-9修复 (2026-07-27)】候选池为空时不再跳过持仓检查
+    # 旧代码: candidates为空 → return early → 持仓止损/卖点检查全部跳过
+    # 根因: BUG-9导致scan命令从未执行 → 候选池可能为空 → 持仓监控静默失效
+    # 修复: 候选池为空时跳过候选扫描, 但继续执行持仓检查(步骤3)
     candidates = get_candidate_pool()
     candidates = [c for c in candidates if c["code"] not in held_codes]
-    if not candidates:
-        print("候选池为空(排除持仓后), 跳过盘中扫描")
-        return {"confirmed_30m": [], "near_30m": [], "alerts": [], "scanned": 0}
-    print(f"[1/3] 候选池30min扫描 ({len(candidates)}只)...")
-    t0 = _time.time()
     confirmed_30m = []
     near_30m = []
-    for s in candidates:
-        try:
-            r = analyze_beichi(s["code"], level="30min")
-            if "error" in r:
-                continue
-            close = r["C"][-1] if r.get("C") else s["price"]
-            if s["price"] > 0 and close > 0 and (close / s["price"] > 10 or s["price"] / close > 10):
-                close = s["price"]
-            for sig in r.get("signals", []):
-                if sig["op"] != "一买":
+    if not candidates:
+        print("[1/3] 候选池为空(排除持仓后), 跳过候选扫描, 继续持仓检查")
+    else:
+        print(f"[1/3] 候选池30min扫描 ({len(candidates)}只)...")
+        t0 = _time.time()
+        for s in candidates:
+            try:
+                r = analyze_beichi(s["code"], level="30min")
+                if "error" in r:
                     continue
-                ratio = sig["ratio"]
-                dlp = sig["dl_prob"]
-                valid = sig["valid"]
-                confirmed = ratio < 60 and dlp > 0.8 and valid
-                near = (ratio < 60 and dlp > 0.6 and valid) or (ratio < 85 and dlp > 0.8 and valid)
-                entry = {
-                    "code": s["code"], "name": s["name"], "price": close or s["price"],
-                    "ratio": ratio, "dlp": dlp, "valid": valid,
-                }
-                if confirmed:
-                    confirmed_30m.append(entry)
-                elif near:
-                    near_30m.append(entry)
-        except:
-            pass
-    elapsed_30m = _time.time() - t0
-    print(f"  30min: 确认{len(confirmed_30m)}只, 接近{len(near_30m)}只, 耗时{elapsed_30m:.0f}s")
+                close = r["C"][-1] if r.get("C") else s["price"]
+                if s["price"] > 0 and close > 0 and (close / s["price"] > 10 or s["price"] / close > 10):
+                    close = s["price"]
+                for sig in r.get("signals", []):
+                    if sig["op"] != "一买":
+                        continue
+                    ratio = sig["ratio"]
+                    dlp = sig["dl_prob"]
+                    valid = sig["valid"]
+                    confirmed = ratio < 60 and dlp > 0.8 and valid
+                    near = (ratio < 60 and dlp > 0.6 and valid) or (ratio < 85 and dlp > 0.8 and valid)
+                    entry = {
+                        "code": s["code"], "name": s["name"], "price": close or s["price"],
+                        "ratio": ratio, "dlp": dlp, "valid": valid,
+                    }
+                    if confirmed:
+                        confirmed_30m.append(entry)
+                    elif near:
+                        near_30m.append(entry)
+            except:
+                pass
+        elapsed_30m = _time.time() - t0
+        print(f"  30min: 确认{len(confirmed_30m)}只, 接近{len(near_30m)}只, 耗时{elapsed_30m:.0f}s")
 
     # 2. 30min确认标的 → 5min精确买点
     confirmed_5m = []
@@ -758,6 +762,12 @@ def run_intraday_scan():
             print(f"    {z['name']}({z['code']}) {z['level']} 现价{z['price']:.2f} {bd_type}{z['zd']:.2f} ({z['pct']:+.1f}%){waived_tag}")
 
     # 【加仓信号检测】(2026-07-26): 二买/三买 → 动态仓位上限
+    # 【BUG-9修复 (2026-07-27)】dynamic_cap_info未初始化导致NameError
+    # 旧代码: 若所有持仓cost=0或close=0, get_dynamic_position_cap从未被调用
+    #         → dynamic_cap_info全局变量未定义 → NameError崩溃 → Telegram推送失败
+    # 修复: 在循环前初始化默认值
+    dynamic_cap_info = {"entry": "一买", "pnl_pct": 0, "cap": 0.35, "tier": "边缘池",
+                         "daily_dl_p": 0, "30min_dl_p": 0, "5min_dl_p": 0}
     add_signals = []
     print(f"\n  📈 加仓信号检测(多级别DL_P共振):")
     for h in holdings:
