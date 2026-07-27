@@ -448,10 +448,16 @@ def detect_entry_level(code, cost):
     核心原则: 买入逻辑和卖出逻辑在同一级别闭环, 避免级别错配
     - 不扩展到更小级别(避免1min破位噪音干扰日线买点持仓)
     - 不看现价小级别买点(避免"现价有1min买点所以可以加仓"的误判)
+
+    【BUG-8修复 (2026-07-27)】跳过1min级别
+    问题: 1min级别需要build_1min_from_5min → 2次网络请求/只
+          7只持仓 × 2 = 14次额外请求, 每次最多10秒timeout
+          → GitHub Actions 10分钟超时, 工作流卡死
+    修复: intraday scan中跳过1min级别(持仓级别判断不需要1min精度)
     """
     sys.path.insert(0, BEICHI_DIR)
     from beichi_analyzer import analyze_beichi
-    levels_priority = ["日线", "30min", "5min", "1min"]
+    levels_priority = ["日线", "30min", "5min"]  # BUG-8: 跳过1min(网络开销过大)
     entry_info = {}
 
     for level in levels_priority:
