@@ -513,7 +513,6 @@ def run_intraday_scan():
     """盘中扫描: 30min级别扫描候选池(排除持仓股) + 5min确认 + 持仓止损检查"""
     sys.path.insert(0, BEICHI_DIR)
     from beichi_analyzer import analyze_beichi
-    from beichi_analyzer import detect_sell_signals
     import time as _time
 
     now = datetime.now()
@@ -704,41 +703,6 @@ def run_intraday_scan():
             except:
                 pass
 
-        # 3d. 【BUG-7修复 (2026-07-27)】接入 detect_sell_signals 综合卖出评估
-        #
-        # 问题: detect_sell_signals 函数存在但从未被调用
-        #   包含5条规则: 日线down+30min看空→减仓, 弱信号+密集看空→清仓, 亏损+down→清仓
-        #   这些规则比 ratio/dlp 硬阈值更贴近实战, 能捕获"卖点未确认但风险已高"的场景
-        #
-        # 修复: 对每只持仓调用 detect_sell_signals, should_clear 自动升级为确认卖点
-        if cost > 0 and close_price > 0 and waived != '是':
-            try:
-                sell_eval = detect_sell_signals(code, cost, close_price)
-                if sell_eval["should_clear"]:
-                    # should_clear 最高优先级 → 直接升级为确认卖点
-                    sell_signals.append({
-                        "name": name, "code": code, "level": "综合",
-                        "op": "清仓", "ratio": 0, "dlp": 0, "valid": True,
-                        "type": "确认卖点",
-                        "reason": sell_eval["reason"],
-                        "risk_level": sell_eval["risk_level"],
-                        "source": "detect_sell_signals",
-                    })
-                    print(f"  🔴 {name}({code}) 综合清仓信号: {sell_eval['reason']} [风险={sell_eval['risk_level']}]")
-                elif sell_eval["should_reduce"]:
-                    # should_reduce → 接近卖点(附带原因)
-                    sell_signals.append({
-                        "name": name, "code": code, "level": "综合",
-                        "op": "减仓", "ratio": 0, "dlp": 0, "valid": True,
-                        "type": "接近卖点",
-                        "reason": sell_eval["reason"],
-                        "risk_level": sell_eval["risk_level"],
-                        "source": "detect_sell_signals",
-                    })
-                    print(f"  🟡 {name}({code}) 综合减仓信号: {sell_eval['reason']} [风险={sell_eval['risk_level']}]")
-            except:
-                pass
-
     if alerts:
         for a in alerts:
             print(f"  {a}")
@@ -787,44 +751,16 @@ def run_intraday_scan():
         print(f"    无多级别共振信号, 所有持仓维持35%静态上限")
 
     # 卖点汇总
-    # 【BUG-7修复 (2026-07-27)】中枢破位 + 接近卖点 = 自动升级为确认卖点
-    #
-    # 问题: 跌破中枢后一卖/二卖因 ratio/dlp/valid 未同时达标而停在"接近卖点"
-    #       等待确认期间价格继续下跌 → 大幅回撤
-    #
-    # 修复: 同一股票同时出现"中枢破位"和"接近卖点"时, 自动升级为确认卖点
-    #       理由: 中枢破位 = 趋势结构已破坏, 接近卖点 = 卖点正在形成
-    #             两者叠加 = 不需等 ratio/dlp 完全确认, 应立即行动
     confirmed_sells = [s for s in sell_signals if s["type"] == "确认卖点"]
     near_sells = [s for s in sell_signals if s["type"] == "接近卖点"]
-
-    # 中枢破位 + 接近卖点 → 自动升级
-    if zs_breakdowns and near_sells:
-        breakdown_codes = {z["code"] for z in zs_breakdowns if z["waived"] != "是"}
-        upgraded = []
-        remaining_near = []
-        for s in near_sells:
-            if s["code"] in breakdown_codes:
-                s["type"] = "确认卖点"
-                s["upgraded_from"] = "中枢破位+接近卖点自动升级"
-                upgraded.append(s)
-            else:
-                remaining_near.append(s)
-        if upgraded:
-            near_sells = remaining_near
-            confirmed_sells.extend(upgraded)
-            print(f"  ⚡ 自动升级: {len(upgraded)}只接近卖点(中枢破位叠加) → 确认卖点")
-            for s in upgraded:
-                print(f"    ↗ {s['name']}({s['code']}) {s['level']} {s['op']} → 确认卖出")
-
     if confirmed_sells:
         print(f"  🔴 确认卖点: {len(confirmed_sells)}个")
     if near_sells:
         print(f"  🟡 接近卖点: {len(near_sells)}个")
         for s in near_sells[:5]:
             missing = []
-            if s.get("ratio", 0) >= 60: missing.append("ratio=%d%%" % s["ratio"])
-            if s.get("dlp", 0) <= 0.8: missing.append("DL_P=%.2f" % s["dlp"])
+            if s["ratio"] >= 60: missing.append("ratio=%d%%" % s["ratio"])
+            if s["dlp"] <= 0.8: missing.append("DL_P=%.2f" % s["dlp"])
             print(f"    {s['name']}({s['code']}) {s['level']} {s['op']} 缺:{'+'.join(missing)}")
     if not alerts and not confirmed_sells and not near_sells and not zs_breakdowns:
         print(f"  持仓{len(holdings)}只, 止损合规, 无背驰卖点, 无中枢破位")
@@ -1030,27 +966,15 @@ def format_intraday_summary(result, ts):
     if confirmed_sells:
         lines.append(f"🔴 确认卖点: {len(confirmed_sells)}个 (建议卖出)")
         for s in confirmed_sells:
-            src = s.get("source", "")
-            reason = s.get("reason", "")
-            upgraded = s.get("upgraded_from", "")
-            if src == "detect_sell_signals":
-                lines.append(f"  {s['name']}({s['code']}) {s['op']} {reason}")
-            elif upgraded:
-                lines.append(f"  {s['name']}({s['code']}) {s['level']} {s['op']} [{upgraded}]")
-            else:
-                lines.append(f"  {s['name']}({s['code']}) {s['level']} {s['op']} ratio={s.get('ratio',0):.0f}% DL_P={s.get('dlp',0):.2f}")
+            lines.append(f"  {s['name']}({s['code']}) {s['level']} {s['op']} ratio={s['ratio']:.0f}% DL_P={s['dlp']:.2f}")
         lines.append("")
     if near_sells:
         lines.append(f"🟡 接近卖点: {len(near_sells)}个")
         for s in near_sells[:5]:
-            reason = s.get("reason", "")
-            if reason:
-                lines.append(f"  {s['name']}({s['code']}) {s['op']} {reason}")
-            else:
-                missing = []
-                if s.get("ratio", 0) >= 60: missing.append(f"ratio={s['ratio']:.0f}%")
-                if s.get("dlp", 0) <= 0.8: missing.append(f"DL_P={s['dlp']:.2f}")
-                lines.append(f"  {s['name']}({s['code']}) {s['level']} {s['op']} 缺:{'+'.join(missing)}")
+            missing = []
+            if s["ratio"] >= 60: missing.append(f"ratio={s['ratio']:.0f}%")
+            if s["dlp"] <= 0.8: missing.append(f"DL_P={s['dlp']:.2f}")
+            lines.append(f"  {s['name']}({s['code']}) {s['level']} {s['op']} 缺:{'+'.join(missing)}")
         lines.append("")
 
     if not any([confirmed, near, alerts, breakdowns, confirmed_sells, near_sells]):
