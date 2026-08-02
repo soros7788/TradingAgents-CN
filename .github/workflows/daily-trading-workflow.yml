@@ -31,7 +31,7 @@ env:
 jobs:
   daily-workflow:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # BUG-8: 10→15分钟, 留出网络延迟余量
+    timeout-minutes: 45  # 15→45分钟, scan_then_compliance需要双步骤时间
     permissions:
       contents: write
     steps:
@@ -84,20 +84,20 @@ jobs:
           if [ "$CMD" = "scan_then_compliance" ]; then
             echo "=== scan → compliance $(date '+%Y-%m-%d %H:%M') ==="
             cd scripts/chanlun-workflow
-            python daily_workflow.py scan 2>&1 | tee /tmp/scan_output.txt
+            python -u daily_workflow.py scan 2>&1 | tee /tmp/scan_output.txt
             SCAN_EXIT=$?
             if [ $SCAN_EXIT -ne 0 ]; then
               echo "scan失败(exit=$SCAN_EXIT), 跳过compliance"
               exit 1
             fi
             echo "=== scan完成, 开始compliance ==="
-            python daily_workflow.py compliance 2>&1 | tee /tmp/compliance_output.txt
+            python -u daily_workflow.py compliance 2>&1 | tee /tmp/compliance_output.txt
             exit $?
           fi
 
           echo "=== $CMD $(date '+%Y-%m-%d %H:%M') ==="
           cd scripts/chanlun-workflow
-          python daily_workflow.py $CMD 2>&1 | tee /tmp/workflow_output.txt
+          python -u daily_workflow.py $CMD 2>&1 | tee /tmp/workflow_output.txt
 
       - name: Commit Excel changes
         if: success()
