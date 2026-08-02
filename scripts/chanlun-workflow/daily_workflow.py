@@ -385,7 +385,7 @@ def get_dynamic_position_cap(code, cost, close):
     #   跳过了多级别信号检测 → dynamic_cap_info中entry永远是"一买"
     #   → 合规审查无法发现"二买已确认但浮盈不足"的情况
     sys.path.insert(0, BEICHI_DIR)
-    from beichi_analyzer import detect_multilevel_buy_signals
+    from beichi_analyzer import detect_multilevel_buy_signals, detect_zhongyin
 
     try:
         ml = detect_multilevel_buy_signals(code, price=close)
@@ -406,6 +406,11 @@ def get_dynamic_position_cap(code, cost, close):
     # BUG修复 (2026-07-30): 一买低点 — 用于加仓风控和破位止损
     one_buy_low = ml.get("one_buy_low")
     dynamic_cap_info["one_buy_low"] = one_buy_low
+
+    # P1 (2026-08-02): 中阴状态检测 — 仓位压制依据
+    zhongyin_info = ml.get("zhongyin", {})
+    dynamic_cap_info["zhongyin"] = zhongyin_info
+    dynamic_cap_info["daily_confidence"] = ml.get("daily_confidence", 0)
 
     best_entry = "一买"
     best_dl_prob = 0
@@ -476,7 +481,27 @@ def get_dynamic_position_cap(code, cost, close):
     }
 
     cap = cap_table.get(best_entry, 0.35)
-    dynamic_cap_info["cap"] = cap
+
+    # P1 (2026-08-02): 中阴状态仓位压制
+    # 中阴 = 背驰信号存在但趋势未确认 → 仓位减半
+    # NotChasing = 背驰存在但价格脱离中枢 → 不加仓
+    zy = zhongyin_info
+    if zy.get("is_zhongyin"):
+        cap = cap * 0.5
+        dynamic_cap_info["cap"] = cap
+        dynamic_cap_info["note"] = (
+            f"{best_entry}信号存在但中阴状态(趋势未确认), 仓位压制至{cap:.0%}"
+            f"({zy.get('reason', '')})"
+        )
+    elif zy.get("action") == "NotChasing":
+        cap = 0.35  # 不允许提升上限
+        dynamic_cap_info["cap"] = cap
+        dynamic_cap_info["note"] = (
+            f"{best_entry}信号存在但NotChasing({zy.get('reason', '')}), "
+            f"维持35%上限不加仓"
+        )
+    else:
+        dynamic_cap_info["cap"] = cap
     return cap
 
 
@@ -727,6 +752,7 @@ def check_sell_compliance():
                 daily_dlp = ml.get('daily_dl_p', 0)
                 current_hold_count = len(get_today_holdings())
                 obl = ml.get('one_buy_low')
+                zy_info = ml.get('zhongyin', {})
 
                 # 条件A: DL_P < 0.8 + 持仓过多 → 去弱留强
                 if daily_dlp < 0.8 and current_hold_count > INFANT_MAX_HOLD:
@@ -769,6 +795,17 @@ def check_sell_compliance():
                             f"二买失败止损(现价{sell_price:.2f}<一买低{obl:.2f}, "
                             f"跌{pct_below:+.1f}%, DL_P={daily_dlp:.2f}但二买已失效)"
                         )
+
+                # 条件C (P1, 2026-08-02): 中阴状态 → 仓位压制/NotChasing
+                # 中阴 = 背驰信号存在但趋势未确认 → 允许减仓释放资金
+                # NotChasing = 背驰存在但价格脱离中枢 → 标记不加仓
+                elif zy_info.get('is_zhongyin') and current_hold_count > INFANT_MAX_HOLD:
+                    has_sell_signal = True
+                    signal_desc = (
+                        f"中阴减仓(背驰存在但趋势未确认, "
+                        f"{zy_info.get('reason', '')}, "
+                        f"持仓{current_hold_count}只>{INFANT_MAX_HOLD}只)"
+                    )
             except:
                 pass
 
@@ -1754,25 +1791,35 @@ def run_intraday_scan():
         m5_dp = dynamic_cap_info.get("5min_dl_p", 0)
 
         if entry_level in ("二买", "三买") and pnl_pct >= 0.05:
-            add_signals.append({
-                "name": h['name'], "code": code, "entry": entry_level,
-                "pnl_pct": pnl_pct, "dynamic_cap": dynamic_cap,
-                "current_pos": h.get('pos', 0), "tier": tier,
-            })
-            remaining = dynamic_cap - (h.get('pos', 0) or 0)
-            print(f"    ★ {h['name']}({code}) {entry_level}信号 [{tier}] → 动态上限{dynamic_cap:.0%} "
-                  f"当前仓位{h.get('pos',0):.1%} 浮盈{pnl_pct:.1%} 可加仓空间{remaining:.1%}")
-            print(f"      DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
-            # BUG修复 (2026-07-30): 显示一买低点距离
-            obl = dynamic_cap_info.get("one_buy_low")
-            dist_to_low = dynamic_cap_info.get("dist_to_one_buy_low")
-            if obl and dist_to_low is not None:
-                if dist_to_low < 0.03:
-                    print(f"      ⚠️ 一买低={obl:.2f} 现价离一买低仅{dist_to_low:.1%}<3% → 不宜加仓(破位风险)")
-                else:
-                    print(f"      ✓ 一买低={obl:.2f} 现价离一买低{dist_to_low:.1%}(安全)")
+            # P1 (2026-08-02): 中阴状态拦截 — NotChasing不加仓
+            zy = dynamic_cap_info.get("zhongyin", {})
+            if zy.get("is_zhongyin") or zy.get("action") == "NotChasing":
+                print(f"    ⛔ {h['name']}({code}) {entry_level}信号但{zy.get('action','')} — "
+                      f"中阴/NotChasing, 不加仓({zy.get('reason','')[:40]})")
             else:
-                print(f"      ℹ️ 一买低点未检测到")
+                add_signals.append({
+                    "name": h['name'], "code": code, "entry": entry_level,
+                    "pnl_pct": pnl_pct, "dynamic_cap": dynamic_cap,
+                    "current_pos": h.get('pos', 0), "tier": tier,
+                })
+                remaining = dynamic_cap - (h.get('pos', 0) or 0)
+                print(f"    ★ {h['name']}({code}) {entry_level}信号 [{tier}] → 动态上限{dynamic_cap:.0%} "
+                      f"当前仓位{h.get('pos',0):.1%} 浮盈{pnl_pct:.1%} 可加仓空间{remaining:.1%}")
+                print(f"      DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
+                # P3 (2026-08-02): 显示综合置信度
+                conf = dynamic_cap_info.get("daily_confidence", 0)
+                if conf > 0:
+                    print(f"      综合置信度: {conf:.2%}")
+                # BUG修复 (2026-07-30): 显示一买低点距离
+                obl = dynamic_cap_info.get("one_buy_low")
+                dist_to_low = dynamic_cap_info.get("dist_to_one_buy_low")
+                if obl and dist_to_low is not None:
+                    if dist_to_low < 0.03:
+                        print(f"      ⚠️ 一买低={obl:.2f} 现价离一买低仅{dist_to_low:.1%}<3% → 不宜加仓(破位风险)")
+                    else:
+                        print(f"      ✓ 一买低={obl:.2f} 现价离一买低{dist_to_low:.1%}(安全)")
+                else:
+                    print(f"      ℹ️ 一买低点未检测到")
         else:
             print(f"    · {h['name']}({code}) [{tier}] 上限{dynamic_cap:.0%} "
                   f"DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")

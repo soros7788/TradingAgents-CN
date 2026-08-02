@@ -1,5 +1,6 @@
 import time
 import json
+import re
 
 # 导入统一日志系统
 from tradingagents.utils.logging_init import get_logger
@@ -7,7 +8,99 @@ from tradingagents.agents.utils.instrument_utils import build_instrument_context
 logger = get_logger("default")
 
 
-def create_risk_manager(llm, memory):
+# ============================================================
+# 动态仓位风控拦截 (P2, 2026-08-02)
+#
+# Gemini PDF建议: 增加 MoneyLosingScore/MaxDrawdown 程序化拦截
+# 在LLM决策前注入风险提示, 在LLM决策后拦截违规操作
+#
+# MoneyLosingScore: 连续亏损次数评分 (0-5)
+#   0-2: 正常, 3+: 仓位压制, 5: 禁止新建仓
+# MaxDrawdown: 历史最大回撤百分比
+#   >15%: 禁止新建仓, 10-15%: 谨慎, <10%: 正常
+# ============================================================
+
+def _compute_risk_gates(past_memories):
+    """
+    从历史记忆中计算风险指标
+
+    参数:
+        past_memories: memory.get_memories() 返回的列表
+
+    返回: {
+        "money_losing_score": int (0-5),
+        "max_consecutive_losses": int,
+        "max_drawdown_pct": float,
+        "risk_level": "高"/"中"/"低",
+        "warning": str,
+        "block_buy": bool,
+    }
+    """
+    consecutive_losses = 0
+    max_consecutive_losses = 0
+    max_drawdown_pct = 0.0
+
+    loss_keywords = ["亏损", "止损", "赔", "亏", "loss", "止损清仓", "破位"]
+
+    for rec in past_memories:
+        recommendation = rec.get("recommendation", "") if isinstance(rec, dict) else str(rec)
+
+        # 检测连续亏损
+        if any(kw in recommendation for kw in loss_keywords):
+            consecutive_losses += 1
+            max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
+        else:
+            consecutive_losses = 0
+
+        # 提取回撤百分比
+        dd_match = re.search(r'回撤[：:\s]*(\d+\.?\d*)\s*%', recommendation)
+        if dd_match:
+            dd = float(dd_match.group(1))
+            max_drawdown_pct = max(max_drawdown_pct, dd)
+
+    # MoneyLosingScore: 0-5
+    money_losing_score = min(5, max_consecutive_losses)
+
+    # 风控判定
+    if max_drawdown_pct > 15 or money_losing_score >= 5:
+        block_buy = True
+        risk_level = "高"
+    elif max_drawdown_pct > 10 or money_losing_score >= 3:
+        block_buy = False
+        risk_level = "中"
+    else:
+        block_buy = False
+        risk_level = "低"
+
+    # 构建风险提示
+    warnings = []
+    if money_losing_score >= 3:
+        warnings.append(
+            f"MoneyLosingScore={money_losing_score}/5 "
+            f"(连续亏损{max_consecutive_losses}次), 建议降低仓位至50%以下"
+        )
+    if max_drawdown_pct > 15:
+        warnings.append(
+            f"MaxDrawdown={max_drawdown_pct:.1f}%超过15%阈值, 禁止新建仓"
+        )
+    elif max_drawdown_pct > 10:
+        warnings.append(
+            f"MaxDrawdown={max_drawdown_pct:.1f}%接近阈值, 谨慎建仓"
+        )
+
+    warning = "\n".join(warnings) if warnings else "无特殊风险提示"
+
+    return {
+        "money_losing_score": money_losing_score,
+        "max_consecutive_losses": max_consecutive_losses,
+        "max_drawdown_pct": max_drawdown_pct,
+        "risk_level": risk_level,
+        "warning": warning,
+        "block_buy": block_buy,
+    }
+
+
+def create_risk_manager(llm, memory, knowledge_retriever=None):
     def risk_manager_node(state) -> dict:
 
         company_name = state["company_of_interest"]
@@ -34,6 +127,32 @@ def create_risk_manager(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
+        # P2 (2026-08-02): 动态仓位风控拦截 — MoneyLosingScore/MaxDrawdown
+        risk_gates = _compute_risk_gates(past_memories)
+        risk_gate_str = ""
+        if risk_gates["risk_level"] != "低":
+            risk_gate_str = f"""
+**动态风控拦截 (P2):**
+- 风险等级: {risk_gates['risk_level']}
+- MoneyLosingScore: {risk_gates['money_losing_score']}/5 (连续亏损{risk_gates['max_consecutive_losses']}次)
+- MaxDrawdown: {risk_gates['max_drawdown_pct']:.1f}%
+- 风控提示: {risk_gates['warning']}
+- 买入拦截: {'是' if risk_gates['block_buy'] else '否'}
+
+**注意**: 若风险等级为"高", 禁止建议买入; 若为"中", 建议降低仓位至50%以下。
+"""
+
+        # RAG 升级: 检索外部知识库
+        kb_context_str = ""
+        if knowledge_retriever is not None:
+            try:
+                kb_results = knowledge_retriever.retrieve_for_agent(
+                    query=curr_situation, agent_role="risk_manager"
+                )
+                kb_context_str = knowledge_retriever.format_context(kb_results)
+            except Exception as e:
+                logger.warning(f"⚠️ [RAG] risk_manager 知识检索失败: {e}")
+
         prompt = f"""作为风险管理委员会主席和辩论主持人，您的目标是评估三位风险分析师——激进、中性和安全/保守——之间的辩论，并确定交易员的最佳行动方案。您的决策必须产生明确的建议：买入、卖出或持有。只有在有具体论据强烈支持时才选择持有，而不是在所有方面都似乎有效时作为后备选择。力求清晰和果断。
 
 决策指导原则：
@@ -41,6 +160,8 @@ def create_risk_manager(llm, memory):
 2. **提供理由**：用辩论中的直接引用和反驳论点支持您的建议。
 3. **完善交易员计划**：从交易员的原始计划**{trader_plan}**开始，根据分析师的见解进行调整。
 4. **从过去的错误中学习**：使用**{past_memory_str}**中的经验教训来解决先前的误判，改进您现在做出的决策，确保您不会做出错误的买入/卖出/持有决定而亏损。
+{kb_context_str}
+{risk_gate_str}
 
 交付成果：
 - 明确且可操作的建议：买入、卖出或持有。
@@ -159,7 +280,28 @@ def create_risk_manager(llm, memory):
         }
 
         logger.info(f"📋 [Risk Manager] 最终决策生成完成，内容长度: {len(response_content)} 字符")
-        
+
+        # P2 (2026-08-02): 后置风控拦截 — block_buy时禁止买入建议
+        if risk_gates["block_buy"]:
+            # 检测LLM是否建议买入
+            buy_keywords = ["买入", "建仓", "加仓", "买进"]
+            if any(kw in response_content for kw in buy_keywords):
+                logger.warning(
+                    f"⛔ [Risk Manager] 风控拦截: block_buy=True "
+                    f"(MoneyLosingScore={risk_gates['money_losing_score']}, "
+                    f"MaxDrawdown={risk_gates['max_drawdown_pct']:.1f}%), "
+                    f"LLM建议买入 → 降级为持有"
+                )
+                response_content = (
+                    response_content +
+                    f"\n\n---\n**⚠️ 风控系统拦截 (P2)**\n"
+                    f"MoneyLosingScore={risk_gates['money_losing_score']}/5, "
+                    f"MaxDrawdown={risk_gates['max_drawdown_pct']:.1f}%\n"
+                    f"原建议包含买入操作, 因连续亏损/回撤超限, "
+                    f"系统强制降级为**持有**, 建议等待风险释放后再评估。\n"
+                    f"风控提示: {risk_gates['warning']}"
+                )
+
         return {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": response_content,

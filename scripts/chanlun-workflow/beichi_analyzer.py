@@ -1265,6 +1265,10 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                                         "post_reason": "突破加速",
                                     })
 
+    # P3 (2026-08-02): 为每个信号计算综合置信度
+    for s in signals:
+        s["confidence"] = compute_confidence_score(s)
+
     signals.sort(key=lambda x: -x['zs']['e'])
 
     # BUG修复 (2026-07-29): result未返回H/L → 外部调用者r.get("H",[])返回空
@@ -1287,6 +1291,175 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
     }
     analyze_beichi._cache[cache_key] = result
     return result
+
+
+# ============================================================
+# 中阴状态检测 (P1, 2026-08-02)
+#
+# 中阴定义 (缠论): 背驰信号已出现但新趋势尚未确认的过渡期
+#   - 有背驰信号(一买/一卖valid)但无二买/二卖确认
+#   - 价格在最后一个中枢区间内震荡
+#   - MACD DIF在零轴附近(动能不明)
+#
+# 操作含义:
+#   NotChasing — 不追涨杀跌, 等待趋势确认
+#   仓位压制 — 持仓不超过原计划的50%
+#
+# Gemini PDF建议: 防止背驰后假反转导致的止损触发
+# ============================================================
+
+def detect_zhongyin(result):
+    """
+    检测中阴状态(过渡态)
+
+    参数:
+        result: analyze_beichi() 的返回值
+
+    返回: {
+        "is_zhongyin": True/False,
+        "reason": str,
+        "action": "NotChasing" / "仓位压制" / "正常",
+        "price_vs_zs": "中枢内" / "中枢上" / "中枢下",
+        "has_one_signal": bool,
+        "has_two_signal": bool,
+        "dif_near_zero": bool,
+    }
+    """
+    if result.get("error") or not result.get("zss"):
+        return {
+            "is_zhongyin": False, "reason": "无中枢数据",
+            "action": "正常", "price_vs_zs": "未知",
+            "has_one_signal": False, "has_two_signal": False,
+            "dif_near_zero": False,
+        }
+
+    signals = result.get("signals", [])
+    price = result.get("price", 0)
+    zss = result["zss"]
+    last_zs = zss[-1]
+    zg = last_zs["zg"]
+    zd = last_zs["zd"]
+
+    # 条件1: 有背驰信号(一买/一卖valid)但无二买/二卖确认
+    has_one = any(
+        s.get("op") in ("一买", "一卖") and s.get("valid")
+        for s in signals
+    )
+    has_two = any(
+        s.get("op") in ("二买", "二卖") and s.get("valid")
+        for s in signals
+    )
+
+    # 条件2: 价格相对中枢位置
+    in_zs = zd <= price <= zg
+    if in_zs:
+        price_vs_zs = "中枢内"
+    elif price > zg:
+        price_vs_zs = "中枢上"
+    else:
+        price_vs_zs = "中枢下"
+
+    # 条件3: MACD DIF在零轴附近
+    # DIF绝对值 < DEA绝对值 * 0.5 → 动能不明
+    C = result.get("C", [])
+    dif_near_zero = False
+    if len(C) >= 30:
+        try:
+            dif, dea, bar = calc_macd(C)
+            last_dif = dif[-1] if dif else 0
+            last_dea = dea[-1] if dea else 0
+            if last_dea != 0:
+                dif_near_zero = abs(last_dif) < abs(last_dea) * 0.5
+            else:
+                dif_near_zero = abs(last_dif) < 0.01
+        except:
+            dif_near_zero = False
+
+    # 中阴判定: 有背驰信号但无趋势确认 + 价格在中枢内
+    is_zy = has_one and not has_two and in_zs
+
+    if is_zy:
+        action = "仓位压制"
+        reason = (
+            f"中阴: 背驰信号存在但二买/二卖未确认, "
+            f"价格在中枢[{zd:.2f},{zg:.2f}]内震荡, DIF近零轴={dif_near_zero}"
+        )
+    elif has_one and not has_two and not in_zs:
+        action = "NotChasing"
+        reason = (
+            f"背驰信号存在但趋势未确认, 价格{price_vs_zs}, "
+            f"不追涨(等待二买/二卖确认)"
+        )
+    else:
+        action = "正常"
+        reason = "趋势已确认或无背驰信号"
+
+    return {
+        "is_zhongyin": is_zy,
+        "reason": reason,
+        "action": action,
+        "price_vs_zs": price_vs_zs,
+        "has_one_signal": has_one,
+        "has_two_signal": has_two,
+        "dif_near_zero": dif_near_zero,
+    }
+
+
+# ============================================================
+# 综合置信度评分 (P3, 2026-08-02)
+#
+# Gemini PDF建议: 信号输出增加综合置信度
+# 替代单纯DL_P阈值, 综合多维度量化信号可靠性
+#
+# 评分维度 (权重):
+#   DL_P 背驰概率      — 0.40 (核心: 背驰结构是否存在)
+#   EP_L 反转概率      — 0.30 (验证: 反转是否在发生)
+#   ratio归一化        — 0.15 (面积比越低越强)
+#   方向对齐(aligned)  — 0.15 (与大级别方向一致)
+# ============================================================
+
+def compute_confidence_score(signal):
+    """
+    计算信号综合置信度
+
+    参数:
+        signal: analyze_beichi() 返回的 signals 列表中的单个信号 dict
+
+    返回: float [0, 1]
+    """
+    # 1. DL_P 背驰概率 (0-1) → 权重0.40
+    dl_prob = signal.get("dl_prob", 0)
+    dl_score = min(1.0, dl_prob)
+
+    # 2. EP_L 反转概率 (0-1) → 权重0.30
+    ep_prob = signal.get("ep_prob", 0)
+    ep_score = min(1.0, ep_prob)
+
+    # 3. ratio归一化 → 权重0.15
+    # ratio < 20% → 1.0 (强背驰)
+    # ratio 20-60% → 线性递减
+    # ratio > 60% → 0.2 (弱背驰)
+    ratio = signal.get("ratio", 999)
+    if ratio < 20:
+        ratio_score = 1.0
+    elif ratio < 60:
+        ratio_score = 1.0 - (ratio - 20) / 40 * 0.8
+    else:
+        ratio_score = 0.2
+
+    # 4. 方向对齐 → 权重0.15
+    aligned = signal.get("aligned", False)
+    align_score = 1.0 if aligned else 0.3
+
+    # 加权汇总
+    confidence = (
+        dl_score * 0.40 +
+        ep_score * 0.30 +
+        ratio_score * 0.15 +
+        align_score * 0.15
+    )
+
+    return round(confidence, 4)
 
 
 # ============================================================
@@ -1544,6 +1717,13 @@ def detect_multilevel_buy_signals(code, price=None):
         "min30_dir": min30_dir,
         # BUG修复 (2026-07-30): 一买低点, 用于加仓风控和破位止损
         "one_buy_low": daily_one_buy_low,
+        # P1 (2026-08-02): 中阴状态检测
+        "zhongyin": detect_zhongyin(daily) if daily else {
+            "is_zhongyin": False, "reason": "无日线数据",
+            "action": "正常", "price_vs_zs": "未知",
+        },
+        # P3 (2026-08-02): 最佳一买信号的综合置信度
+        "daily_confidence": daily_best.get("confidence", 0) if daily_best else 0,
     }
 
 
