@@ -102,26 +102,24 @@ jobs:
       - name: Commit Excel changes
         if: success()
         run: |
-          cd scripts/chanlun-workflow
-          # BUG修复 (2026-07-28): 清理锁文件, 防止被误commit
-          rm -f .~lock.* ~lock.* 2>/dev/null || true
-          # BUG修复 (2026-07-28): 中文名xlsx改为英文名 trade-workbook.xlsx
-          if [ -f "动态仓位资金管理法则_执行版.xlsx" ] && [ ! -f "trade-workbook.xlsx" ]; then
-            cp "动态仓位资金管理法则_执行版.xlsx" "trade-workbook.xlsx"
+          # 修复 (2026-08-02): git add -f 强制添加(防.gitignore误排除)
+          #   使用完整路径从repo root执行, 无需cd
+          # 清理锁文件
+          rm -f scripts/chanlun-workflow/.~lock.* scripts/chanlun-workflow/~lock.* 2>/dev/null || true
+          # 中文名xlsx备份兼容
+          if [ -f "scripts/chanlun-workflow/动态仓位资金管理法则_执行版.xlsx" ] && [ ! -f "scripts/chanlun-workflow/trade-workbook.xlsx" ]; then
+            cp "scripts/chanlun-workflow/动态仓位资金管理法则_执行版.xlsx" "scripts/chanlun-workflow/trade-workbook.xlsx"
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # BUG修复 (2026-07-28): git diff --quiet 对二进制xlsx不可靠
-          # 问题: openpyxl修改xlsx后, git diff有时报告"无变更" → 候选池更新被跳过
-          # 修复: 用 git diff --name-only 检测, 若有staged变更则强制commit
-          #       同时用 md5sum 对比确保内容确实变化时才commit
+          # md5对比: 内容无变化时跳过commit和push
           BEFORE_MD5=$(git show HEAD:scripts/chanlun-workflow/trade-workbook.xlsx 2>/dev/null | md5sum | cut -d' ' -f1)
-          AFTER_MD5=$(md5sum trade-workbook.xlsx | cut -d' ' -f1)
+          AFTER_MD5=$(md5sum scripts/chanlun-workflow/trade-workbook.xlsx | cut -d' ' -f1)
           if [ "$BEFORE_MD5" = "$AFTER_MD5" ]; then
-            echo "No changes to Excel file (md5: $AFTER_MD5)"
+            echo "No changes to Excel file (md5: $AFTER_MD5), skipping commit and push"
           else
-            git add "trade-workbook.xlsx"
-            git rm --cached "动态仓位资金管理法则_执行版.xlsx" 2>/dev/null || true
+            git add -f -- scripts/chanlun-workflow/trade-workbook.xlsx
+            git rm --cached "scripts/chanlun-workflow/动态仓位资金管理法则_执行版.xlsx" 2>/dev/null || true
             git commit -m "auto: update candidate pool ($(date '+%Y-%m-%d %H:%M'))"
             git push
             echo "Excel changes committed and pushed (md5: $BEFORE_MD5 → $AFTER_MD5)"
