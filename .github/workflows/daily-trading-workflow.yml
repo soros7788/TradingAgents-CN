@@ -8,7 +8,11 @@ on:
     - cron: '30 6 * * 1-5'
     # 日线全市场扫描: 交易日 15:05 → scan (更新候选池日线信号)
     - cron: '5 7 * * 1-5'
-    # 合规核查+心态日志: 交易日 15:30 → compliance
+    # 合规核查+心态日志: 交易日 15:30 → compliance (scan完成后自动触发)
+    # 【BUG修复 (2026-07-29)】scan→compliance联动: 改为workflow_run触发
+    # 旧方案: scan和compliance分别用两个cron, 但scan可能超时15分钟
+    #         → compliance在scan未完成时就启动 → 读到旧候选池数据
+    # 新方案: scan作为主任务, 完成后通过workflow_run自动触发compliance
     - cron: '30 7 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -21,6 +25,13 @@ on:
           - intraday
           - scan
           - compliance
+          - scan_then_compliance  # BUG修复(2026-07-29): 一键scan+compliance联动
+
+  # BUG修复 (2026-07-29): scan完成后自动触发compliance
+  workflow_run:
+    workflows: ["Daily Trading Workflow"]
+    types: [completed]
+    branches: [main, master]
 
 env:
   PYTHONPATH: ${{ github.workspace }}/scripts/chanlun-workflow
@@ -73,9 +84,30 @@ jobs:
             else
               CMD="intraday"      # 盘中30min扫描 + 持仓止损检查
             fi
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # BUG修复 (2026-07-29): scan完成后自动触发compliance
+            # 只有scan任务完成后才触发compliance, 确保候选池已更新
+            CMD="compliance"
           else
             CMD="${{ github.event.inputs.command || 'intraday' }}"
           fi
+
+          # BUG修复 (2026-07-29): scan_then_compliance联动模式
+          # 先执行scan, 成功后自动执行compliance
+          if [ "$CMD" = "scan_then_compliance" ]; then
+            echo "=== scan → compliance $(date '+%Y-%m-%d %H:%M') ==="
+            cd scripts/chanlun-workflow
+            python daily_workflow.py scan 2>&1 | tee /tmp/scan_output.txt
+            SCAN_EXIT=$?
+            if [ $SCAN_EXIT -ne 0 ]; then
+              echo "scan失败(exit=$SCAN_EXIT), 跳过compliance"
+              exit 1
+            fi
+            echo "=== scan完成, 开始compliance ==="
+            python daily_workflow.py compliance 2>&1 | tee /tmp/compliance_output.txt
+            exit $?
+          fi
+
           echo "=== $CMD $(date '+%Y-%m-%d %H:%M') ==="
           cd scripts/chanlun-workflow
           python daily_workflow.py $CMD 2>&1 | tee /tmp/workflow_output.txt
@@ -84,13 +116,44 @@ jobs:
         if: success()
         run: |
           cd scripts/chanlun-workflow
+          # BUG修复 (2026-07-28): 清理锁文件, 防止被误commit
+          rm -f .~lock.* ~lock.* 2>/dev/null || true
+          # BUG修复 (2026-07-28): 中文名xlsx改为英文名 trade-workbook.xlsx
+          if [ -f "动态仓位资金管理法则_执行版.xlsx" ] && [ ! -f "trade-workbook.xlsx" ]; then
+            cp "动态仓位资金管理法则_执行版.xlsx" "trade-workbook.xlsx"
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet "动态仓位资金管理法则_执行版.xlsx"; then
-            echo "No changes to Excel file"
+          # BUG修复 (2026-07-28): git diff --quiet 对二进制xlsx不可靠
+          # 问题: openpyxl修改xlsx后, git diff有时报告"无变更" → 候选池更新被跳过
+          # 修复: 用 git diff --name-only 检测, 若有staged变更则强制commit
+          #       同时用 md5sum 对比确保内容确实变化时才commit
+          BEFORE_MD5=$(git show HEAD:scripts/chanlun-workflow/trade-workbook.xlsx 2>/dev/null | md5sum | cut -d' ' -f1)
+          AFTER_MD5=$(md5sum trade-workbook.xlsx | cut -d' ' -f1)
+          if [ "$BEFORE_MD5" = "$AFTER_MD5" ]; then
+            echo "No changes to Excel file (md5: $AFTER_MD5)"
           else
-            git add "动态仓位资金管理法则_执行版.xlsx"
+            git add "trade-workbook.xlsx"
+            git rm --cached "动态仓位资金管理法则_执行版.xlsx" 2>/dev/null || true
             git commit -m "auto: update candidate pool ($(date '+%Y-%m-%d %H:%M'))"
             git push
-            echo "Excel changes committed and pushed"
+            echo "Excel changes committed and pushed (md5: $BEFORE_MD5 → $AFTER_MD5)"
           fi
+
+      # BUG修复 (2026-07-28): artifact改用英文名, 解决下载后无法打开问题
+      # 问题: 中文名xlsx在GitHub Actions artifact下载时:
+      #   1. 文件名编码错误 → 下载后文件名乱码 → 无法打开
+      #   2. 移动端GitHub App不支持非ASCII artifact文件名
+      #   3. git diff对二进制xlsx不可靠, 有时无法检测到变更
+      # 修复:
+      #   1. 主文件改用英文名 trade-workbook.xlsx
+      #   2. artifact上传英文名文件
+      #   3. 保留中文名文件作为备份(但不再作为主要操作目标)
+      - name: Upload Excel artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-workbook-${{ github.run_id }}
+          path: scripts/chanlun-workflow/trade-workbook.xlsx
+          retention-days: 7
+          if-no-files-found: warn

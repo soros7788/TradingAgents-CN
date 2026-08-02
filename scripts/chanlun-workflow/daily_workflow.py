@@ -16,13 +16,285 @@ from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WB = os.environ.get('TRADE_WB', os.path.join(SCRIPT_DIR, '动态仓位资金管理法则_执行版.xlsx'))
+# BUG修复 (2026-07-28): 中文名xlsx在GitHub Actions artifact下载和移动端打开失败
+# 修复: 主文件改用英文名 trade-workbook.xlsx
+# 兼容: 若英文名不存在但中文名存在, 自动复制一份
+WB_EN = os.path.join(SCRIPT_DIR, 'trade-workbook.xlsx')
+WB_CN = os.path.join(SCRIPT_DIR, '动态仓位资金管理法则_执行版.xlsx')
+if os.environ.get('TRADE_WB'):
+    WB = os.environ.get('TRADE_WB')
+elif os.path.exists(WB_EN):
+    WB = WB_EN
+elif os.path.exists(WB_CN):
+    # 向后兼容: 中文名存在但英文名不存在 → 复制为英文名
+    import shutil
+    shutil.copy2(WB_CN, WB_EN)
+    WB = WB_EN
+else:
+    WB = WB_EN  # 默认用英文名(运行时会报错提示文件不存在)
 RECALC = os.path.join(SCRIPT_DIR, 'recalc.py')
 BEICHI_DIR = SCRIPT_DIR
 
-def recalc():
-    r = subprocess.run(['python', RECALC, WB, '30'], capture_output=True, text=True)
-    return json.loads(r.stdout) if r.stdout else {"status": "error"}
+def clean_lock_files():
+    """清理LibreOffice残留锁文件 — 防止xlsx无法打开
+
+    BUG修复 (2026-07-28): LibreOffice recalc超时/崩溃后残留 .~lock.* 文件
+    导致: openpyxl打开报错 / Excel提示"文件被锁定" / git commit锁文件
+    修复: 每次操作前清理锁文件
+    """
+    import glob
+    for pattern in ['.~lock.*#', '.~lock.*', '~lock.*']:
+        for f in glob.glob(os.path.join(SCRIPT_DIR, pattern)):
+            try:
+                os.remove(f)
+                print(f"[锁文件清理] 删除: {os.path.basename(f)}")
+            except:
+                pass
+
+def safe_load_wb(data_only=False):
+    """安全加载Excel — 自动清理锁文件后打开
+
+    BUG修复 (2026-07-28): load_workbook直接打开时,
+    若残留 .~lock 文件 → 报错"文件被锁定" → 工作流崩溃
+    修复: 加载前先清理锁文件
+    """
+    clean_lock_files()
+    return load_workbook(WB, data_only=data_only)
+
+def safe_save_wb(wb, fix_formulas=True):
+    """安全保存Excel — 保存后清理锁文件, 可选修复公式行号
+
+    BUG修复 (2026-07-28): wb.save()后LibreOffice可能残留锁文件
+    修复: 保存后立即清理
+
+    BUG修复 (2026-07-29): 子表联动失效
+    根因: openpyxl写入数据后, 公式行号与新数据行不匹配
+    修复: 保存前调用 fix_cross_sheet_formulas() 修正所有子表公式行号
+    """
+    if fix_formulas:
+        fix_cross_sheet_formulas(wb)
+    wb.save(WB)
+    clean_lock_files()
+
+def fix_cross_sheet_formulas(wb):
+    """修复所有子表的公式行号错配 — 确保跨表联动正确
+
+    BUG修复 (2026-07-29): 子表联动失效
+    问题: 持仓表J~Z列公式有系统性+8行号偏移(Row2引用Row10)
+         原因: 原始Excel中Row2-9是显示区, Row10+是数据区, 公式跨区引用
+    修复: 用正则将每行公式中的行号引用替换为当前行号(自引用)
+         对跨表引用(如 账户总表!$A$10)只替换MATCH中的本表行号
+
+    联动链路: 候选池(写入) → 持仓表(引用候选池) → 账户总表(引用持仓表) → 心态日志
+    """
+    import re
+
+    # 1. 修复持仓表
+    if '持仓表' in wb.sheetnames:
+        _fix_sheet_formula_rows(wb['持仓表'], data_col=2, cross_refs=['账户总表', '候选池'])
+
+    # 2. 修复账户总表 + 删除重复行
+    if '账户总表' in wb.sheetnames:
+        _remove_duplicate_date_rows(wb['账户总表'])
+        _fix_sheet_formula_rows(wb['账户总表'], data_col=1, cross_refs=['持仓表', '候选池'])
+
+    # 3. 修复心态日志
+    if '心态日志' in wb.sheetnames:
+        ws = wb['心态日志']
+        # 修复typo: k-4 → K2
+        for r in range(2, min(ws.max_row + 1, 250)):
+            for c in range(1, ws.max_column + 1):
+                v = ws.cell(row=r, column=c).value
+                if v and 'k-4' in str(v).lower():
+                    ws.cell(row=r, column=c, value=str(v).replace('k-4', 'K2').replace('K-4', 'K2'))
+        _fix_sheet_formula_rows(ws, data_col=1, cross_refs=[])
+
+    # 4. 修复候选池历史
+    if '候选池历史' in wb.sheetnames:
+        _fix_sheet_formula_rows(wb['候选池历史'], data_col=1, cross_refs=[])
+
+def _fix_sheet_formula_rows(ws, data_col, cross_refs, max_row=250):
+    """将每行公式中的行号引用替换为当前行号(自引用)
+
+    对含跨表引用的公式,只替换MATCH($A<r>中的本表行号,保留跨表整列引用
+    """
+    import re
+    fixed = 0
+    for r in range(2, min(ws.max_row + 1, max_row + 1)):
+        if not ws.cell(row=r, column=data_col).value:
+            continue
+        for col in range(1, ws.max_column + 1):
+            v = ws.cell(row=r, column=col).value
+            if not v or not str(v).startswith('='):
+                continue
+            formula = str(v)
+
+            if cross_refs and any(f"{ref}!" in formula for ref in cross_refs):
+                new_formula = _fix_mixed_formula(formula, r, cross_refs)
+            else:
+                new_formula = _fix_local_formula(formula, r)
+
+            if new_formula != formula:
+                ws.cell(row=r, column=col, value=new_formula)
+                fixed += 1
+    return fixed
+
+def _fix_local_formula(formula, target_row):
+    """修复纯本表引用公式: 将所有行号替换为target_row"""
+    import re
+    def repl(m):
+        prefix, col_letters, old_row = m.group(1), m.group(2), int(m.group(3))
+        if old_row < 200:
+            return f"{prefix}{col_letters}{target_row}"
+        return m.group(0)
+    return re.sub(r'(?<![:!])(\$?)([A-Z]{1,3})(\d{1,3})(?![:])', repl, formula)
+
+def _fix_mixed_formula(formula, target_row, cross_refs):
+    """修复含跨表引用的公式: 本表部分替换行号, 跨表部分只替换MATCH中的行号"""
+    import re
+    pattern = '|'.join(f'(?:{ref}!)' for ref in cross_refs)
+    parts = re.split(f'({"|".join(ref + "!" for ref in cross_refs)})', formula)
+
+    result = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if i + 1 < len(parts) and any(part == ref + '!' for ref in cross_refs):
+            # 跨表引用开始
+            result.append(part)
+            i += 1
+            if i < len(parts):
+                cross_part = parts[i]
+                # 只替换 MATCH($A<r> 中的行号, 不替换整列引用
+                def repl_cross(m):
+                    prefix, col_letters, old_row = m.group(1), m.group(2), int(m.group(3))
+                    if old_row < 200:
+                        return f"{prefix}{col_letters}{target_row}"
+                    return m.group(0)
+                # 只替换 $A<r> 格式的引用(带$前缀的通常是MATCH参数)
+                cross_part = re.sub(r'(\$)([A-Z]{1,3})(\d{1,3})', repl_cross, cross_part)
+                result.append(cross_part)
+        else:
+            # 本表引用部分
+            result.append(_fix_local_formula(part, target_row))
+        i += 1
+
+    return ''.join(result)
+
+def _remove_duplicate_date_rows(ws):
+    """删除账户总表中日期重复的行(保留最后一行)"""
+    from openpyxl.utils import get_column_letter
+    date_rows = {}
+    for r in range(2, ws.max_row + 1):
+        date_val = ws.cell(row=r, column=1).value
+        if date_val:
+            date_str = str(date_val)[:10] if not isinstance(date_val, str) else date_val[:10]
+            if date_str not in date_rows:
+                date_rows[date_str] = []
+            date_rows[date_str].append(r)
+
+    rows_to_delete = []
+    for date_str, rows in date_rows.items():
+        if len(rows) > 1:
+            keep_row = rows[-1]
+            for r in rows[:-1]:
+                # 合并数据: 旧行有值但新行没值的, 复制过来
+                for c in range(1, ws.max_column + 1):
+                    old_val = ws.cell(row=r, column=c).value
+                    new_val = ws.cell(row=keep_row, column=c).value
+                    if old_val and not new_val:
+                        ws.cell(row=keep_row, column=c, value=old_val)
+                rows_to_delete.append(r)
+
+    # 从后往前删除
+    rows_to_delete.sort(reverse=True)
+    for row_num in rows_to_delete:
+        ws.delete_rows(row_num, 1)
+
+def recalc(timeout=60, retries=2):
+    """重算Excel公式 — 带重试、状态检查和缓存值验证
+
+    BUG修复 (2026-07-28): 子表联动失效
+    根因1: openpyxl保存后公式缓存值全部清空为None → data_only=True读取返回None
+    根因2: 旧recalc超时30秒不够(10000+公式), 超时后不报错继续 → 缓存值仍为None
+    根因3: recalc返回error时调用方不检查status → 程序静默继续用None值
+    修复: 超时增至60秒, 失败重试2次, 返回status供调用方检查
+
+    BUG修复 (2026-07-29): recalc成功但缓存值仍为None
+    根因: LibreOffice在某些环境下recalc不写入缓存值
+    修复: recalc后抽样验证3个关键单元格, 若为None则重试
+    """
+    import time as _time
+    for attempt in range(retries):
+        clean_lock_files()
+        r = subprocess.run(
+            ['python', RECALC, WB, str(timeout)],
+            capture_output=True, text=True
+        )
+        clean_lock_files()
+        if r.stdout:
+            result = json.loads(r.stdout)
+            if result.get("status") in ("success", "errors_found"):
+                # 验证缓存值: 抽样检查3个关键单元格
+                if _verify_cached_values():
+                    if attempt > 0:
+                        print(f"  [recalc] 第{attempt+1}次重试成功, 缓存值验证通过")
+                    return result
+                else:
+                    print(f"  [recalc] 第{attempt+1}次重算成功但缓存值为None, 需重试")
+            else:
+                print(f"  [recalc] 第{attempt+1}次失败: {result.get('error', 'unknown')}")
+        else:
+            print(f"  [recalc] 第{attempt+1}次无输出, stderr={r.stderr[:200] if r.stderr else 'none'}")
+        if attempt < retries - 1:
+            _time.sleep(2)
+    print(f"  [recalc] {retries}次重试全部失败, 公式缓存值可能为None")
+    return {"status": "error", "total_errors": -1}
+
+def _verify_cached_values():
+    """验证recalc后公式缓存值是否确实写入 — 抽样3个关键单元格
+
+    检查点:
+    1. 持仓表 N列(持仓占比) — 引用账户总表
+    2. 账户总表 E列(总仓位) — 引用持仓表
+    3. 候选池 K列(分层) — 引用账户总表
+    """
+    try:
+        wb = load_workbook(WB, data_only=True)
+        checks = []
+
+        if '持仓表' in wb.sheetnames:
+            ws = wb['持仓表']
+            val = ws.cell(row=2, column=14).value  # N列=持仓占比
+            checks.append(('持仓表!N2', val))
+
+        if '账户总表' in wb.sheetnames:
+            ws = wb['账户总表']
+            # 找到最后一行有数据的
+            last_row = 2
+            for r in range(2, min(ws.max_row + 1, 50)):
+                if ws.cell(row=r, column=1).value:
+                    last_row = r
+            val = ws.cell(row=last_row, column=5).value  # E列=总仓位
+            checks.append((f'账户总表!E{last_row}', val))
+
+        if '候选池' in wb.sheetnames:
+            ws = wb['候选池']
+            val = ws.cell(row=2, column=11).value  # K列=分层
+            checks.append(('候选池!K2', val))
+
+        wb.close()
+
+        # 所有抽样值都不为None才算通过
+        none_count = sum(1 for _, v in checks if v is None)
+        if none_count > 0:
+            print(f"  [recalc验证] {none_count}/{len(checks)} 个单元格缓存值为None: "
+                  + ", ".join(f"{loc}={val}" for loc, val in checks if val is None))
+            return False
+        return True
+    except Exception as e:
+        print(f"  [recalc验证] 异常: {e}")
+        return False
 
 def get_today_holdings():
     """读取持仓表, 按代码去重(取最后一次出现的行)
@@ -31,7 +303,7 @@ def get_today_holdings():
     根因: 持仓表存在多日重复录入, 旧行(100股)和新行(0股)共存
     修复: 以代码为key, 后出现的行覆盖先出现的行
     """
-    wb = load_workbook(WB, data_only=True)
+    wb = safe_load_wb(data_only=True)
     ws = wb['持仓表']
     code_map = {}  # 按代码去重, 取最后一行
     for r in range(2, ws.max_row + 1):
@@ -47,18 +319,20 @@ def get_today_holdings():
         action = ws.cell(row=r, column=28).value
         profit = ws.cell(row=r, column=13).value
         pos = ws.cell(row=r, column=14).value
+        t1_lock = ws.cell(row=r, column=35).value
         # 始终用后出现的行覆盖 (最新数据)
         code_map[code] = {
             "name": name, "code": code, "waived": waived,
             "shares": shares, "entry": entry, "close": close,
-            "stop": stop, "action": action, "profit": profit, "pos": pos
+            "stop": stop, "action": action, "profit": profit, "pos": pos,
+            "t1_lock": t1_lock
         }
     # 过滤掉0股的(已清仓)
     holdings = [h for h in code_map.values() if h.get('shares') and h['shares'] > 0]
     return holdings
 
 def get_account_summary():
-    wb = load_workbook(WB, data_only=True)
+    wb = safe_load_wb(data_only=True)
     ws = wb['账户总表']
     latest_row = 2
     for r in range(2, ws.max_row + 1):
@@ -106,11 +380,10 @@ def get_dynamic_position_cap(code, cost, close):
     pnl_pct = (close - cost) / cost
     dynamic_cap_info["pnl_pct"] = pnl_pct
 
-    # 条件2: 浮盈护垫
-    if pnl_pct < 0.05:
-        return 0.35
-
-    # 条件1: 多级别DL_P共振检测
+    # 条件1: 多级别DL_P共振检测 (无论浮盈多少都要检测)
+    # BUG修复 (2026-07-29): 旧代码在pnl_pct<0.05时直接return 0.35,
+    #   跳过了多级别信号检测 → dynamic_cap_info中entry永远是"一买"
+    #   → 合规审查无法发现"二买已确认但浮盈不足"的情况
     sys.path.insert(0, BEICHI_DIR)
     from beichi_analyzer import detect_multilevel_buy_signals
 
@@ -125,21 +398,75 @@ def get_dynamic_position_cap(code, cost, close):
 
     dynamic_cap_info["tier"] = tier
     dynamic_cap_info["daily_dl_p"] = ml.get("daily_dl_p", 0)
+    dynamic_cap_info["daily_ep_p"] = ml.get("daily_ep_p", 0)
     dynamic_cap_info["30min_dl_p"] = ml.get("30min_dl_p", 0)
+    dynamic_cap_info["30min_ep_p"] = ml.get("30min_ep_p", 0)
     dynamic_cap_info["5min_dl_p"] = ml.get("5min_dl_p", 0)
+    dynamic_cap_info["5min_ep_p"] = ml.get("5min_ep_p", 0)
+    # BUG修复 (2026-07-30): 一买低点 — 用于加仓风控和破位止损
+    one_buy_low = ml.get("one_buy_low")
+    dynamic_cap_info["one_buy_low"] = one_buy_low
 
     best_entry = "一买"
     best_dl_prob = 0
+    best_ep_prob = 0  # EP_L反转概率
+    best_ermai_score = 0  # 二买综合确认强度
 
     if sanmai and sanmai.get("valid"):
         best_entry = "三买"
         best_dl_prob = sanmai.get("dl_prob", 0)
+        best_ep_prob = sanmai.get("ep_prob", 0)
+        best_ermai_score = sanmai.get("ermai_dl_prob", sanmai.get("dl_prob", 0))
     elif ermai and ermai.get("valid"):
         best_entry = "二买"
         best_dl_prob = ermai.get("dl_prob", 0)
+        best_ep_prob = ermai.get("ep_prob", 0)
+        best_ermai_score = ermai.get("ermai_dl_prob", 0)
 
     dynamic_cap_info["entry"] = best_entry
     dynamic_cap_info["dl_prob"] = best_dl_prob
+    dynamic_cap_info["ep_prob"] = best_ep_prob
+    dynamic_cap_info["ermai_dl_prob"] = best_ermai_score
+
+    # 条件2: 浮盈护垫 — 决定是否实际提升仓位上限
+    # 信号检测已完成(dynamic_cap_info已更新), 但浮盈不足时不提升cap
+    if pnl_pct < 0.05:
+        # 信号已检测但浮盈不足 → cap保持35%, entry已记录
+        dynamic_cap_info["cap"] = 0.35
+        dynamic_cap_info["note"] = f"{best_entry}信号存在但浮盈{pnl_pct:.1%}<5%护垫, 暂不提升上限"
+        return 0.35
+
+    # ============================================================
+    # BUG修复 (2026-07-30): 一买低点距离检查 — 防止加仓后破位回撤
+    #
+    # 核心风险场景:
+    #   去弱留强 → 卖V形(浮盈大) → 加U形(浮盈小但>=5%)
+    #   → U形二买无法确认 → 价格破一买低点 → 重仓大幅回撤
+    #
+    # 修复策略:
+    #   二买/三买加仓前, 检查当前价格离一买低点的距离
+    #   距离<3% → 二买结构脆弱, 随时可能破位 → 不允许提升仓位上限
+    #
+    # 3%阈值的依据:
+    #   A股日内波动通常1-2%, 3%相当于1.5个ATR
+    #   距离<3%意味着一个日内波动就可能破位
+    #   且30min中枢幅度通常3-8%, 3%已在中枢下沿附近
+    # ============================================================
+    MIN_DIST_FROM_ONE_BUY_LOW = 0.03  # 3%
+    if one_buy_low and one_buy_low > 0 and close > 0:
+        dist_to_low = (close - one_buy_low) / one_buy_low
+        dynamic_cap_info["dist_to_one_buy_low"] = dist_to_low
+        if dist_to_low < MIN_DIST_FROM_ONE_BUY_LOW:
+            # 价格离一买低点太近 → 二买破位风险极高, 不允许加仓
+            dynamic_cap_info["cap"] = 0.35
+            dynamic_cap_info["note"] = (
+                f"{best_entry}信号存在且浮盈{pnl_pct:.1%}>=5%, "
+                f"但价格离一买低点仅{dist_to_low:.1%}<{MIN_DIST_FROM_ONE_BUY_LOW:.0%}, "
+                f"二买破位风险高, 暂不提升上限(一买低={one_buy_low:.2f})"
+            )
+            return 0.35
+    else:
+        dynamic_cap_info["dist_to_one_buy_low"] = None
 
     # 动态上限表: 买点级别 × 浮盈护垫
     cap_table = {
@@ -151,6 +478,306 @@ def get_dynamic_position_cap(code, cost, close):
     cap = cap_table.get(best_entry, 0.35)
     dynamic_cap_info["cap"] = cap
     return cap
+
+
+def check_buy_compliance(holdings):
+    """
+    检查买入标的是否在候选池内 (2026-07-29 BUG修复)
+
+    核心矛盾: 系统compliance只检查持仓止损/仓位/破位,
+              但不检查"买入标的是否经过full_scan确认入池".
+              → 沃华医药DL_P=0.93但不在候选池(被旧代码截断) → 手动检查时违规
+              → 系统不报违规 → 一会儿行一会儿不行
+
+    修复: 读取今日交易记录中的买入操作, 逐笔检查是否在候选池内.
+          同时允许事后背驰确认(DL_P>0.8)作为豁免条件.
+    """
+    issues = []
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    # 1. 从交易记录读取今日买入
+    # BUG修复 (2026-07-30): 旧代码用 today_str[:8]+"01" 过滤本月所有交易
+    #   → 7/22的万华化学卖出、7/24的建研院买入等历史交易全部被检查
+    #   → 12项违规中有9项是已平仓的历史交易误报
+    # 修复: 只检查今日的交易记录
+    try:
+        wb = safe_load_wb(data_only=True)
+    except Exception as e:
+        print(f"  买入合规检查: 无法读取Excel({e}), 跳过")
+        return issues
+
+    if '交易记录' not in wb.sheetnames:
+        print(f"  买入合规检查: 无交易记录sheet, 跳过")
+        return issues
+
+    ws_tr = wb['交易记录']
+    today_buys = []
+    for r in range(2, ws_tr.max_row + 1):
+        direction = str(ws_tr.cell(row=r, column=4).value or "")
+        if direction != "买入":
+            continue
+        raw_date = ws_tr.cell(row=r, column=1).value
+        date_str = ""
+        if raw_date:
+            if isinstance(raw_date, datetime):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            elif isinstance(raw_date, date):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(raw_date)[:10]
+        # 只检查今日的交易
+        if date_str == today_str:
+            name = ws_tr.cell(row=r, column=2).value or ""
+            code = str(ws_tr.cell(row=r, column=3).value or "")
+            price = ws_tr.cell(row=r, column=6).value or 0
+            today_buys.append({"name": name, "code": code, "price": price, "row": r, "date": date_str})
+
+    if not today_buys:
+        print(f"  买入合规检查: 无近期买入记录, 跳过")
+        return issues
+
+    # 2. 读取候选池 + 候选池更新日期
+    candidate_codes = set()
+    pool_date_str = ""
+    if '候选池' in wb.sheetnames:
+        ws_pool = wb['候选池']
+        for r in range(2, ws_pool.max_row + 1):
+            code = ws_pool.cell(row=r, column=3).value
+            if code:
+                candidate_codes.add(str(code))
+        # 读取候选池第一行数据的日期(即扫描日期)
+        pool_date_raw = ws_pool.cell(row=2, column=1).value
+        if pool_date_raw:
+            if isinstance(pool_date_raw, (datetime, date)):
+                pool_date_str = pool_date_raw.strftime('%Y-%m-%d')
+            else:
+                pool_date_str = str(pool_date_raw)[:10]
+
+    # 3. 读取候选池历史(用于判断买入时是否已在池内)
+    # BUG修复 (2026-07-31): 回溯合规问题
+    #   问题: 沃华医药买入时不在候选池 → 之后run_full_scan将持仓股写入候选池
+    #         → check_buy_compliance读取当前候选池 → 发现沃华在池内 → 判定"合规"
+    #         → 但买入时实际不在池内 = 回溯合规(假阳性)
+    #   修复: 对比买入日期与候选池更新日期
+    #         若候选池今日才更新 → 买入时(盘中)候选池可能未包含此股
+    #         → 标记为"回溯合规"而非完全合规
+    prev_pool_codes = set()
+    if '候选池历史' in wb.sheetnames:
+        ws_hist = wb['候选池历史']
+        for r in range(2, ws_hist.max_row + 1):
+            hist_date_raw = ws_hist.cell(row=r, column=1).value
+            hist_date_s = ""
+            if hist_date_raw:
+                if isinstance(hist_date_raw, (datetime, date)):
+                    hist_date_s = hist_date_raw.strftime('%Y-%m-%d')
+                else:
+                    hist_date_s = str(hist_date_raw)[:10]
+            # 只取非今日的历史记录
+            if hist_date_s and hist_date_s != today_str:
+                code = ws_hist.cell(row=r, column=3).value
+                if code:
+                    prev_pool_codes.add(str(code))
+
+    # 4. 逐笔检查
+    # BUG修复 (2026-07-30): 移除事后背驰确认豁免
+    #   旧逻辑: 不在候选池 → 事后运行analyze_beichi验证DL_P>0.8 → 豁免
+    #   问题: 豁免机制让"不在候选池"变得可接受 → 鼓励跳过full_scan直接买入
+    #   修复: 不在候选池 = 直接违规, 不做事后豁免
+    #         候选池现在包含持仓股(BUG-4修复), 所以持仓股加仓不会误报
+    #
+    # BUG修复 (2026-07-31): 回溯合规检测
+    #   候选池今日更新 → 买入时可能不在池内 → 当前在池内是回溯写入
+    #   通过候选池历史判断买入时是否已在池内
+    pool_updated_today = (pool_date_str == today_str)
+
+    for buy in today_buys:
+        code = buy["code"]
+        name = buy["name"]
+        if code in candidate_codes:
+            if pool_updated_today and code not in prev_pool_codes:
+                # 候选池今日更新且该股不在历史池中 → 回溯合规
+                issues.append(
+                    f"⚠️ {name}({code}) 当前在候选池内但可能为回溯合规"
+                    f"(候选池今日更新, 该股在历史池中未找到, 买入时可能未在池内)"
+                )
+            else:
+                print(f"  ✓ {name}({code}) 在候选池内, 买入合规")
+        else:
+            issues.append(f"🔴 {name}({code}) 不在候选池内, 买入违规 (应先通过full_scan纳入候选池再买入)")
+
+    return issues
+
+
+def check_sell_compliance():
+    """
+    检查卖出操作是否有信号支撑 (2026-07-29 BUG修复)
+
+    问题: 三力士违规卖出 → 系统只检测持仓是否有卖点信号,
+          但不检查实际卖出操作是否有对应信号 → 无信号卖出=违规
+    修复: 读取今日交易记录中的卖出操作, 逐笔检查是否有卖出信号.
+    """
+    issues = []
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        wb = safe_load_wb(data_only=True)
+    except Exception as e:
+        print(f"  卖出合规检查: 无法读取Excel({e}), 跳过")
+        return issues
+
+    if '交易记录' not in wb.sheetnames:
+        print(f"  卖出合规检查: 无交易记录sheet, 跳过")
+        return issues
+
+    ws_tr = wb['交易记录']
+    today_sells = []
+    for r in range(2, ws_tr.max_row + 1):
+        direction = str(ws_tr.cell(row=r, column=4).value or "")
+        if direction not in ("卖出", "一卖"):
+            continue
+        raw_date = ws_tr.cell(row=r, column=1).value
+        date_str = ""
+        if raw_date:
+            if isinstance(raw_date, datetime):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            elif isinstance(raw_date, date):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(raw_date)[:10]
+        # BUG修复 (2026-07-30): 同check_buy_compliance, 只检查今日交易
+        if date_str == today_str:
+            name = ws_tr.cell(row=r, column=2).value or ""
+            code = str(ws_tr.cell(row=r, column=3).value or "")
+            price = ws_tr.cell(row=r, column=6).value or 0
+            today_sells.append({"name": name, "code": code, "price": price, "row": r, "date": date_str})
+
+    if not today_sells:
+        print(f"  卖出合规检查: 无近期卖出记录, 跳过")
+        return issues
+
+    # 检查每笔卖出是否有信号支撑
+    sys.path.insert(0, BEICHI_DIR)
+    try:
+        from beichi_analyzer import analyze_beichi, detect_sell_signals
+    except Exception as e:
+        print(f"  卖出合规检查: 无法导入分析模块({e}), 跳过")
+        return issues
+
+    for sell in today_sells:
+        code = sell["code"]
+        name = sell["name"]
+        sell_price = sell["price"]
+
+        # 检查是否有卖出信号
+        has_sell_signal = False
+        signal_desc = ""
+
+        for level in ["日线", "30min"]:
+            try:
+                r = analyze_beichi(code, level=level)
+                if "error" in r:
+                    continue
+                for sig in r.get("signals", []):
+                    if sig["dir"] == "看空" and sig["valid"]:
+                        has_sell_signal = True
+                        signal_desc = f"{level} {sig['op']} DL_P={sig['dl_prob']:.2f}"
+                        break
+                if has_sell_signal:
+                    break
+            except:
+                pass
+
+        # 也检查综合卖出信号
+        if not has_sell_signal and sell_price > 0:
+            try:
+                # 获取成本价(从持仓记录)
+                cost_price = 0
+                ws_hold = wb.get('持仓表')
+                if ws_hold:
+                    for hr in range(2, ws_hold.max_row + 1):
+                        h_code = str(ws_hold.cell(row=hr, column=3).value or "")
+                        if h_code == code:
+                            cost_price = ws_hold.cell(row=hr, column=5).value or 0
+                            break
+
+                if cost_price > 0:
+                    sell_eval = detect_sell_signals(code, cost_price, sell_price)
+                    if sell_eval["should_clear"] or sell_eval["should_reduce"]:
+                        has_sell_signal = True
+                        signal_desc = f"综合 {sell_eval['reason']}"
+            except:
+                pass
+
+        # 去弱留强减仓依据 (2026-07-30):
+        # 前提: 持仓数 > 婴儿账户持股个数均值(5只)
+        # 条件: DL_P < 0.8 (未达确认标准) → 允许主动减仓
+        # 理由: 婴儿账户资金有限, 持仓过多稀释效率,
+        #       未达确认标准的持仓不值得保留仓位
+        # 注意: 使用detect_multilevel_buy_signals获取DL_P, 与full_scan一致
+        #
+        # BUG修复 (2026-07-30): 增加一买低点破位作为减仓依据
+        #   问题: 沃华DL_P=0.94>0.8 → 去弱留强不会触发 → 即使破一买低也不卖
+        #         但DL_P高≠无风险, 二买可能失效
+        #   修复: DL_P>=0.8但破一买低点 → 也允许减仓(二买失败优先于信号强度)
+        INFANT_MAX_HOLD = 5
+        if not has_sell_signal:
+            try:
+                from beichi_analyzer import detect_multilevel_buy_signals
+                ml = detect_multilevel_buy_signals(code, price=sell_price)
+                daily_dlp = ml.get('daily_dl_p', 0)
+                current_hold_count = len(get_today_holdings())
+                obl = ml.get('one_buy_low')
+
+                # 条件A: DL_P < 0.8 + 持仓过多 → 去弱留强
+                if daily_dlp < 0.8 and current_hold_count > INFANT_MAX_HOLD:
+                    has_sell_signal = True
+                    signal_desc = f"去弱留强(DL_P={daily_dlp:.2f}<0.8未确认, 持仓{current_hold_count}只>{INFANT_MAX_HOLD}只均值)"
+
+                # 条件B (BUG修复): 破一买低点 → 二买失败, 无论DL_P多高都允许减仓
+                #   这解决了"DL_P高但不破位"和"DL_P高但破位"的区分
+                #   沃华DL_P=0.94但如果破一买低 → 必须允许卖出止损
+                #
+                # BUG修复 (2026-07-31): 一买低点合理性校验
+                #   问题: 三力士成本3.31, 一买低4.23 → 成本<一买低(逻辑不可能)
+                #         成本价在买入时就应该在一买低上方, 否则不可能买入
+                #         一买低>成本 说明中枢检测有误(min_amp_pct过低产生噪音中枢)
+                #         → 错误触发"破一买低"卖出 → +3.14%浮盈被清仓 = 违规卖出
+                #   修复: 若 obl > cost_price → 一买低无效, 不触发条件B
+                #         额外校验: obl > 0 且 obl < cost_price * 1.5 (防止异常高值)
+                elif obl and obl > 0 and sell_price < obl:
+                    # 获取成本价做合理性校验
+                    _cost_for_check = cost_price
+                    if _cost_for_check <= 0:
+                        # 从持仓表重新获取成本
+                        ws_hold2 = wb.get('持仓表')
+                        if ws_hold2:
+                            for hr2 in range(2, ws_hold2.max_row + 1):
+                                if str(ws_hold2.cell(row=hr2, column=3).value or '') == code:
+                                    _cost_for_check = ws_hold2.cell(row=hr2, column=8).value or 0
+                                    break
+
+                    if _cost_for_check > 0 and obl > _cost_for_check:
+                        # 一买低 > 成本价 → 中枢检测异常, 一买低无效
+                        print(f"  ⚠️ {name}({code}) 一买低{obl:.2f}>成本{_cost_for_check:.2f}(逻辑异常, 跳过条件B)")
+                    elif _cost_for_check > 0 and obl > _cost_for_check * 1.5:
+                        # 一买低异常高 → 中枢检测可能错误
+                        print(f"  ⚠️ {name}({code}) 一买低{obl:.2f}>成本×1.5={_cost_for_check*1.5:.2f}(异常高, 跳过条件B)")
+                    else:
+                        has_sell_signal = True
+                        pct_below = ((sell_price - obl) / obl) * 100
+                        signal_desc = (
+                            f"二买失败止损(现价{sell_price:.2f}<一买低{obl:.2f}, "
+                            f"跌{pct_below:+.1f}%, DL_P={daily_dlp:.2f}但二买已失效)"
+                        )
+            except:
+                pass
+
+        if has_sell_signal:
+            print(f"  ✓ {name}({code}) 卖出有信号支撑: {signal_desc}")
+        else:
+            issues.append(f"🔴 {name}({code}) 卖出无信号支撑, 卖出违规")
+
+    return issues
 
 
 def check_compliance():
@@ -216,33 +843,170 @@ def check_compliance():
 
     print(f"  成本级别匹配检查: {'⚠️发现'+str(len([i for i in issues if '中枢破位' in i]))+'个破位' if issues else '✓ 无破位'}")
 
+    # === 买入候选池合规检查 (2026-07-29) ===
+    # BUG修复: check_compliance()不检查"买入标的是否在候选池内"
+    # 问题: 沃华医药DL_P=0.93但不在候选池(被截断) → 手动检查时违规
+    #       但系统compliance不检查这条 → 一会儿行一会儿不行
+    # 修复: 读取今日交易记录中的买入操作, 逐笔检查是否在候选池内
+    buy_compliance_issues = check_buy_compliance(holdings)
+    issues.extend(buy_compliance_issues)
+
+    # === 卖出信号合规检查 (2026-07-29) ===
+    # BUG修复: 三力士违规卖出 → 系统compliance不检查卖出是否有信号
+    # 修复: 读取今日交易记录中的卖出操作, 逐笔检查是否有卖出信号
+    sell_compliance_issues = check_sell_compliance()
+    issues.extend(sell_compliance_issues)
+
     # === 其他合规检查 ===
     # 【动态仓位上限】(2026-07-26): 修复重仓合规悖论
     # 旧逻辑: 静态35%上限 → 趋势加仓被阻止 → 错过趋势收益
     # 新逻辑: 买点升级+浮盈护垫+止损上移 → 动态提升上限
+
+    # ============================================================
+    # BUG修复 (2026-07-31): 一买低点破位检查 — 独立循环, 不受WAIVED限制
+    # 问题: 原代码在一行 for h in holdings: if waived == '是': continue 循环内
+    #       → WAIVED股票(东风股份)被continue跳过 → 一买低点检查永远不执行
+    # 修复: 将一买低点检查拆到独立循环, 对所有持仓无条件执行
+    # ============================================================
+    for h in holdings:
+        code = str(h['code'])
+        cost = h['entry'] or 0
+        close = h['close'] or 0
+
+        if cost > 0 and close > 0:
+            try:
+                from beichi_analyzer import detect_multilevel_buy_signals as _dml
+                _ml = _dml(code, price=close)
+                _obl = _ml.get("one_buy_low")
+                # 合理性校验: 一买低必须 < 成本价
+                if _obl and _obl > 0 and _obl < cost and close < _obl:
+                    _pct = ((close - _obl) / _obl) * 100
+                    issues.append(
+                        f"🔴 {h['name']}({code}) 破一买低点: 现价{close:.2f}<一买低{_obl:.2f} "
+                        f"(跌{_pct:+.1f}%) → 应立即清仓"
+                    )
+            except:
+                pass
+
     for h in holdings:
         if h['waived'] == '是':
             continue
         if h['close'] and h['stop'] and h['close'] <= h['stop']:
             issues.append(f"⚠️ {h['name']}已破止损: 现价{h['close']:.2f}<=止损{h['stop']:.2f}")
-        
-        # 动态仓位上限检查
-        if h['pos'] and h['pos'] > 0.35:
-            code = str(h['code'])
-            cost = h['entry'] or 0
-            close = h['close'] or 0
-            
-            # 计算动态上限
+
+        code = str(h['code'])
+        cost = h['entry'] or 0
+        close = h['close'] or 0
+
+        if cost > 0 and close > 0:
+            # 计算动态上限 (顺便更新dynamic_cap_info)
             dynamic_cap = get_dynamic_position_cap(code, cost, close)
             tier = dynamic_cap_info.get("tier", "边缘池")
-            if h['pos'] > dynamic_cap:
-                issues.append(
-                    f"⚠️ {h['name']}仓位超限: {h['pos']:.1%}>动态上限{dynamic_cap:.0%}"
-                    f"(买点={dynamic_cap_info.get('entry','?')} 分层={tier} 浮盈={dynamic_cap_info.get('pnl_pct',0):.1%})"
-                )
+            entry = dynamic_cap_info.get("entry", "一买")
+            pnl_pct = dynamic_cap_info.get("pnl_pct", 0)
+
+            # ============================================================
+            # BUG修复 (2026-07-29): 二买加仓合规检查缺失
+            #
+            # 问题: check_compliance()只检查"仓位超限", 不检查"二买信号已确认
+            #       但仓位未升级到50%"的合规告警.
+            #       加仓信号检测只在run_intraday_scan做信息展示, 不进入issues.
+            #       → 沃华医药有二买信号(valid)但合规不提示应加仓
+            #
+            # 修复: 在合规检查中增加三种场景:
+            #   A. 二买已确认 + 浮盈>=5% + 当前仓位<50% → 应加仓未加仓
+            #   B. 二买已确认 + 浮盈<5% + 当前仓位<50% → 信号存在但护垫不足
+            #   C. 二买已确认 + 浮盈<5% + 当前仓位>=50% → 需警惕护垫不足风险
+            # ============================================================
+            if entry in ("二买", "三买"):
+                target_cap = 0.50 if entry == "二买" else 0.60
+                cur_pos = h.get('pos', 0) or 0
+
+                # BUG修复 (2026-07-30): 获取一买低点距离
+                obl = dynamic_cap_info.get("one_buy_low")
+                dist_to_low = dynamic_cap_info.get("dist_to_one_buy_low")
+
+                if pnl_pct >= 0.05:
+                    # 场景A: 满足所有加仓条件, 应升级
+                    if cur_pos < target_cap:
+                        remaining = target_cap - cur_pos
+                        d_dp = dynamic_cap_info.get("daily_dl_p", 0)
+                        m30_ep = dynamic_cap_info.get("30min_ep_p", 0)
+                        ermai_score = dynamic_cap_info.get("ermai_dl_prob", 0)
+                        # BUG修复 (2026-07-30): 附带一买低点距离信息
+                        obl_info = ""
+                        if obl and dist_to_low is not None:
+                            if dist_to_low < 0.03:
+                                obl_info = f" ⚠️离一买低仅{dist_to_low:.1%}<3%, 不宜加仓"
+                            else:
+                                obl_info = f" (离一买低{dist_to_low:.1%})"
+                        issues.append(
+                            f"🟢 {h['name']}({code}) {entry}信号确认 + 浮盈{pnl_pct:.1%}>=5%, "
+                            f"仓位应升级到{target_cap:.0%}, 当前{cur_pos:.1%}, 可加仓{remaining:.1%} "
+                            f"(DL_P={d_dp:.2f} EP_L={m30_ep:.2f} 确认强度={ermai_score:.2f}){obl_info}"
+                        )
+                else:
+                    # 场景B/C: 二买信号存在但浮盈护垫不足
+                    if cur_pos < target_cap:
+                        print(f"  ℹ️ {h['name']}({code}) {entry}信号确认但浮盈{pnl_pct:.1%}<5%护垫, "
+                              f"暂不加仓(需涨至{cost * 1.05:.2f}方可触发)")
+                    else:
+                        issues.append(
+                            f"⚠️ {h['name']}({code}) {entry}信号确认但浮盈{pnl_pct:.1%}<5%护垫, "
+                            f"当前仓位{cur_pos:.1%}已超安全区, 注意风险"
+                        )
+
+                # ============================================================
+                # BUG修复 (2026-07-30): 加仓后一买低点风险检查
+                #
+                # 场景D: 已加仓(pos>35%) + 价格接近/破一买低点 → 风险告警
+                # 场景E: 已加仓(pos>35%) + 价格已破一买低点 → 严重违规
+                #
+                # 核心风险: 去弱留强加仓浮盈小的 → 二买无法确认 → 破一买 → 重仓回撤
+                # ============================================================
+                if obl and obl > 0 and close > 0:
+                    if close < obl:
+                        # 场景E: 已破一买低点
+                        if cur_pos > 0.35:
+                            issues.append(
+                                f"🔴 {h['name']}({code}) 已加仓(仓位{cur_pos:.1%}>35%)且现价{close:.2f}"
+                                f"<一买低{obl:.2f}, 二买失败! 应立即减仓至35%以下止损"
+                            )
+                    elif dist_to_low is not None and dist_to_low < 0.03:
+                        # 场景D: 接近一买低点(<3%)
+                        if cur_pos > 0.35:
+                            issues.append(
+                                f"🟠 {h['name']}({code}) 已加仓(仓位{cur_pos:.1%}>35%)且价格离一买低"
+                                f"仅{dist_to_low:.1%}<3%, 二买破位风险高, 建议减仓至35%"
+                            )
+
+            # T+1锁定豁免: 全部锁定的股票今日无法操作, 不因仓位超限告警
+            t1_lock = h.get('t1_lock', '')
+            pos_fmt = f"{h['pos']:.1%}" if h.get('pos') is not None else "N/A"
+            cap_fmt = f"{dynamic_cap:.0%}" if dynamic_cap is not None else "N/A"
+            if t1_lock == '全部锁定':
+                print(f"  ✓ {h['name']}仓位{pos_fmt} <= 动态上限{cap_fmt} "
+                      f"[{tier}] (T+1全部锁定, 豁免仓位检查)")
             else:
-                print(f"  ✓ {h['name']}仓位{h['pos']:.1%} <= 动态上限{dynamic_cap:.0%} "
-                      f"[{tier}] (多级别共振合规)")
+                # 动态仓位上限超限检查
+                if h['pos'] and h['pos'] > dynamic_cap:
+                    issues.append(
+                        f"⚠️ {h['name']}仓位超限: {pos_fmt}>动态上限{cap_fmt}"
+                        f"(买点={entry} 分层={tier} 浮盈={pnl_pct:.1%})"
+                    )
+                else:
+                    print(f"  ✓ {h['name']}仓位{pos_fmt} <= 动态上限{cap_fmt} "
+                          f"[{tier}] (多级别共振合规)")
+        elif h['pos'] and h['pos'] > 0.35:
+            # 无有效成本/现价时回退到静态检查
+            t1_lock = h.get('t1_lock', '')
+            pos_fmt = f"{h['pos']:.1%}" if h.get('pos') is not None else "N/A"
+            if t1_lock == '全部锁定':
+                print(f"  ✓ {h['name']}仓位{pos_fmt} (T+1全部锁定, 豁免静态上限检查)")
+            else:
+                issues.append(
+                    f"⚠️ {h['name']}仓位{pos_fmt}>35%静态上限 (无法计算动态上限, 缺少成本/现价)"
+                )
 
     # 输出合规摘要
     print(f"\n账户总资产: ¥{account.get('total_asset', 0):.2f}" if account.get('total_asset') else "账户总资产: N/A")
@@ -298,85 +1062,91 @@ def run_full_scan():
         silent=False,
     )
 
-    # 排除持仓股(已持有的不再推荐)
+    # 排除持仓股(已持有的不再推荐为新候选)
+    # BUG修复 (2026-07-30): 旧代码排除持仓股后, 沃华/贵绳不在候选池
+    #   → check_buy_compliance报"不在候选池=违规"
+    #   → 依赖事后背驰确认作为豁免 → "一会儿行一会儿不行"
+    # 修复: 持仓股仍写入候选池, 但标注为"持仓"不作为新推荐
+    #       这样买入合规检查能通过(在候选池内), 且不会重复推荐
     holdings = get_today_holdings()
     held_codes = {str(h['code']) for h in holdings if h.get('code')}
-    all_confirmed = [r for r in result["confirmed"] if r["code"] not in held_codes]
+    # 不再排除持仓股, 全部confirmed写入候选池
+    all_confirmed = result["confirmed"]
     if held_codes:
-        excluded = len(result["confirmed"]) - len(all_confirmed)
-        if excluded:
-            print(f"  排除持仓股: {excluded}只 ({', '.join(sorted(held_codes))})")
-
-    if not all_confirmed:
-        print("\n候选池: 无确认标的(排除持仓后), 跳过写入")
-        return result
+        held_in_pool = [r for r in all_confirmed if r["code"] in held_codes]
+        if held_in_pool:
+            print(f"  持仓股也在候选池: {len(held_in_pool)}只 ({', '.join(r['name'] for r in held_in_pool)})")
 
     # ============================================================
-    # 婴儿级候选池 V2 (2026-07-26): 旧分层逻辑 + 沪深各5只共10只
+    # 候选池 V3 (2026-07-29): 写入所有confirmed标的, 不截断
     #
-    # 保留:
-    #   - 分层: 核心/观察/边缘 (ratio<20%限制)
-    #   - 颜色: 黄(核心)/蓝(观察)/灰(边缘)
-    #   - 列11公式自动分层
-    # 仅修改:
-    #   - 沪深各15只 → 沪深各5只 (共10只)
+    # BUG修复 (2026-07-29): 候选池漏选导致合规审查矛盾
+    # 问题: 旧代码只写沪深各5只共10只 → DL_P=0.93的沃华医药被挤出
+    #       → 手动检查时"不在候选池=违规", 但系统compliance不检查这条
+    #       → 一会儿行一会儿不行
+    # 修复: 所有confirmed标的都写入候选池, 按分层排序
+    #       核心池全部写入, 观察池全部写入, 边缘池限20只
     # ============================================================
     core = [r for r in all_confirmed if r.get("tier") == "核心"]
     watch = [r for r in all_confirmed if r.get("tier") == "观察"]
     edge = [r for r in all_confirmed if r.get("tier") == "边缘"]
 
-    # 沪深各取, 优先核心池 (10W规模以下不考虑300/301创业板)
-    def split_sz_sha(stocks):
+    # 按DL_P降序排序, 核心池优先
+    def sort_by_dlp(stocks):
         sha = sorted([r for r in stocks if r["code"].startswith("6")], key=lambda x: (-x["dlp"], x["ratio"]))
         sza = sorted([r for r in stocks if r["code"].startswith("0")], key=lambda x: (-x["dlp"], x["ratio"]))
-        return sha, sza
+        return sha + sza
 
-    # 核心池先选 (沪深各5只)
-    core_sha, core_sz = split_sz_sha(core)
-    selected = core_sha[:5] + core_sz[:5]
-
-    # 核心池不足5只/边, 用观察池补
-    if len(core_sha) < 5:
-        watch_sha, _ = split_sz_sha(watch)
-        selected += watch_sha[:5 - len(core_sha)]
-    if len(core_sz) < 5:
-        _, watch_sz = split_sz_sha(watch)
-        selected += watch_sz[:5 - len(core_sz)]
-
-    # 仍不足, 用边缘池按沪深分别补
-    selected_codes = {s["code"] for s in selected}
-    # 统计当前沪深数量
-    cur_sha_cnt = sum(1 for s in selected if s["code"].startswith("6"))
-    cur_sz_cnt = sum(1 for s in selected if s["code"].startswith("0"))
-    sha_need = max(0, 5 - cur_sha_cnt)
-    sz_need = max(0, 5 - cur_sz_cnt)
-    # 边缘池按沪深分别补
-    edge_sha, edge_sz = split_sz_sha(edge)
-    selected += edge_sha[:sha_need]
-    selected += edge_sz[:sz_need]
-    # 边缘池仍不足, 用剩余观察池补
-    if len(selected) < 10:
-        still_need = 10 - len(selected)
-        watch_remaining = [r for r in watch if r["code"] not in selected_codes]
-        wr_sha, wr_sz = split_sz_sha(watch_remaining)
-        selected += (wr_sha + wr_sz)[:still_need]
-
-    selected.sort(key=lambda x: (0 if x.get("tier") == "核心" else 1 if x.get("tier") == "观察" else 2, -x["dlp"]))
+    # 核心池+观察池全部写入, 边缘池限20只(避免候选池过大)
+    selected = sort_by_dlp(core) + sort_by_dlp(watch)
+    selected += sort_by_dlp(edge)[:20]
 
     print(f"\n[婴儿级候选池] 分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只")
-    print(f"写入: {len(selected)}只 (沪深各5只, 共10只)")
+    print(f"写入: {len(selected)}只 (核心+观察全部, 边缘限20只)")
     print(f"  核心{len([s for s in selected if s.get('tier')=='核心'])} + 观察{len([s for s in selected if s.get('tier')=='观察'])} + 边缘{len([s for s in selected if s.get('tier')=='边缘'])}")
 
-    wb = load_workbook(WB)
+    wb = safe_load_wb()
     ws = wb['候选池']
 
-    # 清空旧数据(保留表头和公式列)
-    for r in range(2, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            cell = ws.cell(row=r, column=c)
-            if not cell.value or str(cell.value).startswith('='):
-                continue
-            cell.value = None
+    # ============================================================
+    # BUG修复 (2026-07-28): 候选池写入后不更新
+    #
+    # 根因1: 清空旧数据时跳过公式列(以=开头的cell) → 公式残留在空行
+    #        → ws.max_row因残留公式虚高到192行 → 清空循环范围巨大但无效
+    #        → 旧行的公式引用错行(如Row4的L列引用Row5) → 显示旧数据
+    #
+    # 根因2: 写入新数据时只重写列11公式, 列12-47保留旧公式
+    #        → 公式引用的行号与新数据行不匹配 → 计算结果错误
+    #
+    # 修复: 1. 彻底清空所有行(包括公式), 保留表头
+    #       2. 写入新数据时为每行重新写入所有公式(用正确行号)
+    #       3. 无确认标的时也清空候选池(显示空池而非旧数据)
+    # ============================================================
+
+    # 备份公式模板(从第2行提取, 用作写入时的模板)
+    formula_templates = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=2, column=c).value
+        if v and str(v).startswith('='):
+            formula_templates[c] = str(v)
+
+    # 彻底清空所有数据行(保留表头第1行)
+    # BUG修复 (2026-07-28): cell.value=None只清值不删行, max_row不变
+    # 用 delete_rows 彻底删除多余行, 避免残留空行导致max_row虚高
+    max_row = ws.max_row
+    if max_row > 1:
+        ws.delete_rows(2, max_row - 1)
+
+    # 如果无确认标的, 清空后直接保存(显示空池)
+    if not all_confirmed:
+        print("\n候选池: 无确认标的(排除持仓后), 候选池已清空")
+        safe_save_wb(wb)
+        recalc()
+        return {
+            "scan_result": result,
+            "selected": [],
+            "errors": 0,
+        }
 
     today = date.today()
     # 分层映射: 中文简称 → 候选池显示名称
@@ -413,8 +1183,15 @@ def run_full_scan():
         ws.cell(row=row, column=8, value=stock["dlp"])
         ws.cell(row=row, column=9, value=str(stock["valid"]))
         ws.cell(row=row, column=10, value="一买")
-        # 列11: 分层Tier — 公式自动计算(ratio<20%+DL_P>0.90=核心池)
-        ws.cell(row=row, column=11, value=f'=IF($A{row}="","",IF(AND(G{row}<20%,H{row}>0.90),"核心池",IF(AND(H{row}>=0.85),"观察池",IF(AND(H{row}>=0.80),"边缘池",""))))')
+
+        # BUG修复 (2026-07-28): 为每行写入所有公式(用正确行号)
+        # 旧代码只写列11, 列12-47保留旧公式 → 引用错行 → 候选池不更新
+        # 使用openpyxl Translator正确处理相对/绝对引用
+        from openpyxl.formula.translate import Translator
+        for col, template in formula_templates.items():
+            formula = Translator(template, origin="B2").translate_formula(f"B{row}")
+            ws.cell(row=row, column=col, value=formula)
+
         ws.cell(row=row, column=11).font = XFont(bold=True, size=11)
         # 行颜色: 按分层着色 (黄/蓝/灰)
         fill = tier_fill.get(tier)
@@ -425,7 +1202,7 @@ def run_full_scan():
         if note:
             ws.cell(row=row, column=31, value=note)
 
-    wb.save(WB)
+    safe_save_wb(wb)
     recalc_result = recalc()
     errors = recalc_result.get("total_errors", -1)
 
@@ -503,7 +1280,7 @@ def detect_entry_level(code, cost):
 
 def get_candidate_pool():
     """从Excel候选池读取标的列表"""
-    wb = load_workbook(WB, data_only=True)
+    wb = safe_load_wb(data_only=True)
     ws = wb['候选池']
     candidates = []
     for r in range(2, ws.max_row + 1):
@@ -514,6 +1291,138 @@ def get_candidate_pool():
         price = ws.cell(row=r, column=4).value or 0
         candidates.append({"code": str(code), "name": name, "price": float(price)})
     return candidates
+
+# ============================================================
+# P0清仓升级机制 (2026-07-31 BUG修复)
+# 问题: 东风股份连续3天P0未执行 → 无升级告警 → 纪律执行失败
+# 修复: 跟踪P0待执行天数, 升级告警级别, 写入执行清单
+# ============================================================
+
+def _count_p0_pending_days(wb, code, name):
+    """计算某股票P0清仓待执行天数
+
+    读取执行清单中该股票的P0标记记录, 计算从首次标记到今天的天数
+    如果执行清单中已有该股票的卖出成交记录, 返回0(已执行)
+
+    Args:
+        wb: openpyxl Workbook对象
+        code: 股票代码
+        name: 股票名称
+
+    Returns:
+        int: P0待执行天数 (0=未标记或已执行)
+    """
+    try:
+        today = date.today()
+        first_p0_date = None
+
+        # 检查执行清单中的P0标记
+        if '执行清单' in wb.sheetnames:
+            ws = wb['执行清单']
+            for r in range(2, ws.max_row + 1):
+                row_code = str(ws.cell(row=r, column=3).value or '')
+                row_action = str(ws.cell(row=r, column=4).value or '')
+                row_date = ws.cell(row=r, column=1).value
+
+                if row_code == str(code):
+                    # 检查是否已执行(有卖出成交记录)
+                    if '卖出' in row_action or '清仓' in row_action:
+                        shares = ws.cell(row=r, column=7).value
+                        if shares and int(shares) > 0:
+                            return 0  # 已执行
+
+                    # 查找P0标记
+                    note = str(ws.cell(row=r, column=15).value or '') + str(ws.cell(row=r, column=21).value or '')
+                    if 'P0' in note or '破一买低' in note:
+                        if row_date:
+                            if isinstance(row_date, (datetime, date)):
+                                d = row_date.date() if isinstance(row_date, datetime) else row_date
+                            else:
+                                try:
+                                    d = datetime.strptime(str(row_date)[:10], '%Y-%m-%d').date()
+                                except:
+                                    continue
+                            if first_p0_date is None or d < first_p0_date:
+                                first_p0_date = d
+
+        # 检查交易记录中是否有卖出(已执行)
+        if '交易记录' in wb.sheetnames:
+            ws_tr = wb['交易记录']
+            for r in range(2, ws_tr.max_row + 1):
+                row_code = str(ws_tr.cell(row=r, column=3).value or '')
+                row_dir = str(ws_tr.cell(row=r, column=4).value or '')
+                if row_code == str(code) and ('卖出' in row_dir or '一卖' in row_dir):
+                    raw_date = ws_tr.cell(row=r, column=1).value
+                    if raw_date:
+                        if isinstance(raw_date, (datetime, date)):
+                            d = raw_date.date() if isinstance(raw_date, datetime) else raw_date
+                        else:
+                            try:
+                                d = datetime.strptime(str(raw_date)[:10], '%Y-%m-%d').date()
+                            except:
+                                continue
+                        # 如果在first_p0_date之后卖出 → 已执行
+                        if first_p0_date and d >= first_p0_date:
+                            return 0
+
+        if first_p0_date:
+            return (today - first_p0_date).days
+        return 0
+    except Exception as e:
+        return 0
+
+
+def _mark_p0_pending(wb, code, name, price, obl, pct):
+    """在执行清单中写入/更新P0待执行标记
+
+    如果该股票已有P0标记且未执行, 更新日期和价格
+    如果没有, 新增一行P0清仓标记
+
+    Args:
+        wb: openpyxl Workbook对象
+        code: 股票代码
+        name: 股票名称
+        price: 当前价格
+        obl: 一买低点
+        pct: 跌幅百分比
+    """
+    try:
+        if '执行清单' not in wb.sheetnames:
+            return
+
+        ws = wb['执行清单']
+        today = date.today()
+
+        # 检查是否已有该股票的未执行P0标记
+        found_row = None
+        for r in range(2, ws.max_row + 1):
+            row_code = str(ws.cell(row=r, column=3).value or '')
+            if row_code == str(code):
+                note = str(ws.cell(row=r, column=15).value or '')
+                if 'P0' in note:
+                    found_row = r
+                    break
+
+        if found_row:
+            # 更新现有行
+            ws.cell(row=found_row, column=1, value=today)
+            ws.cell(row=found_row, column=2, value=name)
+            ws.cell(row=found_row, column=3, value=code)
+            ws.cell(row=found_row, column=4, value="P0清仓")
+            ws.cell(row=found_row, column=5, value=price)
+            ws.cell(row=found_row, column=15, value=f"P0清仓-破一买低({obl:.2f}, 跌{pct:+.1f}%)")
+        else:
+            # 新增一行
+            new_row = ws.max_row + 1
+            ws.cell(row=new_row, column=1, value=today)
+            ws.cell(row=new_row, column=2, value=name)
+            ws.cell(row=new_row, column=3, value=code)
+            ws.cell(row=new_row, column=4, value="P0清仓")
+            ws.cell(row=new_row, column=5, value=price)
+            ws.cell(row=new_row, column=15, value=f"P0清仓-破一买低({obl:.2f}, 跌{pct:+.1f}%)")
+    except Exception:
+        pass
+
 
 def run_intraday_scan():
     """盘中扫描: 30min级别扫描候选池(排除持仓股) + 5min确认 + 持仓止损检查"""
@@ -653,6 +1562,65 @@ def run_intraday_scan():
         if waived != '是':
             if close_price and h['stop'] and close_price <= h['stop']:
                 alerts.append(f"⚠️ {name}({code}) 破止损: 现价{close_price:.2f}<=止损{h['stop']:.2f}")
+
+        # ============================================================
+        # BUG修复 (2026-07-31): 一买低点止损 — 不受WAIVED状态影响
+        #
+        # 问题: 东风股份被标记WAIVED → 一买低点检查在 if waived != '是': 块内
+        #       → 整个块被跳过 → 连续3天未检测到破位 → P0清仓失败
+        # 根因: WAIVED设计初衷是跳过"普通止损"(避免一买区持仓的误报),
+        #       但一买低点破位是硬性风控, 不应被WAIVED跳过
+        # 修复: 将一买低点检查移出WAIVED门控, 无条件执行
+        #       同时添加P0升级计数器, 连续N天未清仓→升级告警
+        # ============================================================
+        if close_price > 0 and cost > 0:
+            cur_pos = h.get('pos', 0) or 0
+            try:
+                from beichi_analyzer import detect_multilevel_buy_signals as _detect_ml
+                _ml = _detect_ml(code, price=close_price)
+                _obl = _ml.get("one_buy_low")
+
+                # BUG修复 (2026-07-31): 一买低点合理性校验(与check_sell_compliance一致)
+                # 防止噪音中枢产生的错误一买低点触发误报
+                if _obl and _obl > 0 and _obl > cost:
+                    # 一买低 > 成本价 → 中枢检测异常, 跳过
+                    pass
+                elif _obl and _obl > 0 and close_price < _obl:
+                    _pct = ((close_price - _obl) / _obl) * 100
+
+                    # === P0升级计数器 ===
+                    # 读取执行清单中该股票的P0待执行天数
+                    p0_days = _count_p0_pending_days(wb, code, name)
+                    waived_tag = " [WAIVED]" if waived == '是' else ""
+
+                    if cur_pos > 0.35:
+                        if p0_days >= 3:
+                            alerts.append(
+                                f"🔴🔴 P0升级({p0_days}天未执行): {name}({code}) 破一买低点: "
+                                f"现价{close_price:.2f}<=一买低{_obl:.2f} (跌{_pct:+.1f}%, "
+                                f"仓位{cur_pos:.1%}>35%) {waived_tag} → 严重纪律违规, 必须立即清仓!"
+                            )
+                        elif p0_days >= 2:
+                            alerts.append(
+                                f"🔴 P0升级({p0_days}天未执行): {name}({code}) 破一买低点: "
+                                f"现价{close_price:.2f}<=一买低{_obl:.2f} (跌{_pct:+.1f}%, "
+                                f"仓位{cur_pos:.1%}>35%) {waived_tag} → 连续未执行, 明日铁律清仓!"
+                            )
+                        else:
+                            alerts.append(
+                                f"🔴 {name}({code}) 破一买低点: 现价{close_price:.2f}<=一买低{_obl:.2f} "
+                                f"(跌{_pct:+.1f}%, 仓位{cur_pos:.1%}>35%, 二买失败→应立即减仓至35%){waived_tag}"
+                            )
+                    else:
+                        alerts.append(
+                            f"⚠️ {name}({code}) 破一买低点: 现价{close_price:.2f}<=一买低{_obl:.2f} "
+                            f"(跌{_pct:+.1f}%, 仓位{cur_pos:.1%}<=35%, 一买失败→止损){waived_tag}"
+                        )
+
+                    # 写入P0待执行标记到执行清单
+                    _mark_p0_pending(wb, code, name, close_price, _obl, _pct)
+            except:
+                pass
 
         # 3c. 背驰卖点 + 中枢破位检查(动态级别)
         for level in sell_levels:
@@ -795,6 +1763,16 @@ def run_intraday_scan():
             print(f"    ★ {h['name']}({code}) {entry_level}信号 [{tier}] → 动态上限{dynamic_cap:.0%} "
                   f"当前仓位{h.get('pos',0):.1%} 浮盈{pnl_pct:.1%} 可加仓空间{remaining:.1%}")
             print(f"      DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
+            # BUG修复 (2026-07-30): 显示一买低点距离
+            obl = dynamic_cap_info.get("one_buy_low")
+            dist_to_low = dynamic_cap_info.get("dist_to_one_buy_low")
+            if obl and dist_to_low is not None:
+                if dist_to_low < 0.03:
+                    print(f"      ⚠️ 一买低={obl:.2f} 现价离一买低仅{dist_to_low:.1%}<3% → 不宜加仓(破位风险)")
+                else:
+                    print(f"      ✓ 一买低={obl:.2f} 现价离一买低{dist_to_low:.1%}(安全)")
+            else:
+                print(f"      ℹ️ 一买低点未检测到")
         else:
             print(f"    · {h['name']}({code}) [{tier}] 上限{dynamic_cap:.0%} "
                   f"DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
@@ -1114,6 +2092,257 @@ def format_scan_summary(scan_data, ts):
     return '\n'.join(lines)
 
 
+def format_rebalance_summary(holdings, ts):
+    """格式化去弱留强Telegram消息: 减多少股 + 加多少股 + 最新核心池
+
+    权重 (2026-07-29): DL_P 0.7 + EP_L 0.3 (DL_P更具特征代表性)
+    """
+    import sys as _sys
+    _sys.path.insert(0, BEICHI_DIR)
+    from beichi_analyzer import detect_multilevel_buy_signals
+
+    lines = [f"🔄 去弱留强 {ts}", ""]
+
+    # === 1. 对每只持仓计算信号强度 ===
+    ranked = []
+    for h in holdings:
+        code = str(h['code'])
+        cost = h.get('entry') or 0
+        close = h.get('close') or 0
+        shares = h.get('shares') or 0
+        if cost <= 0 or close <= 0 or shares <= 0:
+            continue
+
+        pnl = (close - cost) / cost
+        mv = shares * close
+        try:
+            ml = detect_multilevel_buy_signals(code, price=close)
+        except:
+            ml = {}
+
+        dl_p = ml.get('daily_dl_p', 0)
+        m30_ep = ml.get('30min_ep_p', 0)
+        m5_ep = ml.get('5min_ep_p', 0)
+        # BUG修复 (2026-07-30): 获取一买低点
+        obl = ml.get('one_buy_low')
+        dist_to_obl = None
+        if obl and obl > 0 and close > 0:
+            dist_to_obl = (close - obl) / obl
+        # 新权重: DL_P 0.7 + 30min EP 0.2 + 5min EP 0.1
+        score = dl_p * 0.7 + m30_ep * 0.2 + m5_ep * 0.1
+
+        # ============================================================
+        # BUG修复 (2026-07-30): 一买低点风险惩罚 — 防止加仓后破位重仓回撤
+        #
+        # 问题: 去弱留强评分只看信号强度(DL_P+EP_L), 不看下行风险
+        #       沃华DL_P=0.94评分最高 → 永远被保留 → 即使接近一买低点也不卖
+        #       → 二买失效时重仓大幅回撤
+        #
+        # 修复: 接近一买低点时评分惩罚
+        #   dist < 3%: score *= 0.4 (严重风险, 优先卖出)
+        #   dist 3-5%: score *= 0.7 (中等风险, 降低排名)
+        #   dist < 0 (已破位): score = 0 (立即清仓)
+        #
+        # 为什么EP_L>0.6不能解决:
+        #   EP_L是当前反转概率的快照, 不预测未来
+        #   EP_L=0.62今天确认二买, 明天可能跌到EP_L=0.2
+        #   但加仓已经完成 → 重仓在手 → 只能靠止损退出
+        #   唯一有效的保护: 评分系统考虑一买低点距离
+        # ============================================================
+        risk_tag = ""
+        if dist_to_obl is not None:
+            if dist_to_obl < 0:
+                # 已破一买低点 → 二买完全失效, 评分归零
+                score = 0
+                risk_tag = " [已破一买低,二买失效]"
+            elif dist_to_obl < 0.03:
+                # 离一买低<3% → 严重风险, 评分降至40%
+                score *= 0.4
+                risk_tag = f" [离一买低{dist_to_obl:.1%},高风险]"
+            elif dist_to_obl < 0.05:
+                # 离一买低3-5% → 中等风险, 评分降至70%
+                score *= 0.7
+                risk_tag = f" [离一买低{dist_to_obl:.1%},中风险]"
+
+        # 卖点检查
+        sell_signal = ""
+        try:
+            r30 = analyze_beichi(code, level="30min")
+            for sig in r30.get("signals", []):
+                if sig["op"] in ("一卖", "二卖") and sig.get("valid"):
+                    sell_signal = sig["op"]
+        except:
+            pass
+
+        ranked.append({
+            "name": h['name'], "code": code, "shares": shares,
+            "cost": cost, "close": close, "pnl": pnl, "mv": mv,
+            "dl_p": dl_p, "m30_ep": m30_ep, "m5_ep": m5_ep,
+            "score": score, "sell_signal": sell_signal,
+            "t1_lock": h.get("t1_lock", ""),
+            "one_buy_low": obl,  # BUG修复 (2026-07-30)
+            "dist_to_obl": dist_to_obl,  # 离一买低点距离
+            "risk_tag": risk_tag,  # 风险标签
+        })
+
+    ranked.sort(key=lambda x: -x["score"])
+
+    # === 2. 分割: 前4保留, 后N清仓 ===
+    # BUG修复 (2026-07-30): 已破一买低点的股票强制进入卖出列表
+    #
+    # 问题: 旧逻辑只按评分排名取前4保留
+    #       沃华DL_P=0.94评分最高 → 即使破一买低也在前4 → 被保留 → 重仓回撤
+    #       评分惩罚(BUG1)已让破位股票score降低, 但还不够:
+    #       如果持仓只有4只, 破位的也会在前4
+    #
+    # 修复: 破一买低点的股票无条件进入sell_list, 不受前4保护
+    keep = []
+    forced_sell = []
+    for r in ranked:
+        dist = r.get("dist_to_obl")
+        if dist is not None and dist < 0:
+            # 已破一买低点 → 强制卖出
+            forced_sell.append(r)
+        else:
+            keep.append(r)
+    keep = keep[:4]
+    sell_list = keep[4:] + forced_sell
+    keep = keep[:4]
+
+    # === 3. 账户概览 ===
+    total_mv = sum(r["mv"] for r in ranked)
+    sell_mv = sum(r["mv"] for r in sell_list)
+    lines.append(f"持仓{len(ranked)}只 → 保留{len(keep)}只/清仓{len(sell_list)}只")
+    lines.append(f"清仓回收: ¥{sell_mv:,.0f}")
+    lines.append("")
+
+    # === 4. 清仓明细 (减多少股) ===
+    if sell_list:
+        lines.append("🔻 清仓(卖出):")
+        for r in sell_list:
+            pnl_str = f"{r['pnl']*100:+.1f}%"
+            score_str = f"强度{r['score']:.2f}"
+            dl_str = f"DL={r['dl_p']:.2f}"
+            sell_tag = f" +{r['sell_signal']}" if r["sell_signal"] else ""
+            lines.append(
+                f"  卖 {r['name']}({r['code']}) {r['shares']}股 ¥{r['close']:.2f} "
+                f"回收¥{r['mv']:,.0f} {pnl_str} {dl_str}{sell_tag}"
+            )
+        lines.append("")
+
+    # === 5. 保留明细 ===
+    if keep:
+        lines.append("✅ 保留(持有):")
+        for r in keep:
+            pnl_str = f"{r['pnl']*100:+.1f}%"
+            risk_str = r.get("risk_tag", "")
+            lines.append(
+                f"  留 {r['name']}({r['code']}) {r['shares']}股 ¥{r['close']:.2f} "
+                f"DL={r['dl_p']:.2f} EP={r['m30_ep']:.2f} {pnl_str}{risk_str}"
+            )
+        lines.append("")
+
+    # === 6. 加仓信号检查 (加多少股) ===
+    add_lines = []
+    for r in keep:
+        cost = r["cost"]
+        close = r["close"]
+        pnl = r["pnl"]
+        dl_p = r["dl_p"]
+        m30_ep = r["m30_ep"]
+        m5_ep = r["m5_ep"]
+        obl = r.get("one_buy_low")
+        dist_obl = r.get("dist_to_obl")
+
+        # BUG修复 (2026-07-30): 一买低点距离检查 — 加仓前置风控
+        # 离一买低点<3%时禁止加仓, 防止二买破位重仓回撤
+        obl_block = False
+        obl_warn = ""
+        if obl and dist_obl is not None and dist_obl < 0.03:
+            obl_block = True
+            obl_warn = f" ⚠️离一买低{dist_obl:.1%}<3%不宜加仓"
+
+        # 二买条件检查
+        cond_b = m30_ep >= 0.5
+        cond_c = m5_ep >= 0.3 or m5_ep > 0
+        cond_d = pnl >= 0.05
+
+        if cond_b and cond_c and cond_d and not obl_block:
+            # 二买确认 → 可加仓到50%
+            total_asset = 21311  # 近似值
+            target_mv = total_asset * 0.50
+            current_mv = r["mv"]
+            add_mv = max(0, target_mv - current_mv)
+            add_shares = int(add_mv / close / 100) * 100
+            if add_shares > 0:
+                obl_info = f" 一买低={obl:.2f}(安全{dist_obl:.1%})" if obl and dist_obl else ""
+                add_lines.append(
+                    f"  加 {r['name']}({r['code']}) +{add_shares}股 "
+                    f"仓位→50% (二买确认 DL={dl_p:.2f} EP={m30_ep:.2f}){obl_info}"
+                )
+        elif cond_b and cond_c and cond_d and obl_block:
+            # 二买确认但一买低点太近 → 不加仓
+            add_lines.append(
+                f"  ⏸ {r['name']}({r['code']}) 二买确认但离一买低{dist_obl:.1%}<3%{obl_warn}"
+            )
+        elif cond_b and not cond_c:
+            # 仅缺5min确认
+            trigger = cost * 1.05
+            add_lines.append(
+                f"  等 {r['name']}({r['code']}) 5min入场确认 "
+                f"(30m EP={m30_ep:.2f}✓ 涨至¥{trigger:.2f}触发)"
+            )
+        elif pnl < 0.05 and dl_p >= 0.8:
+            # DL_P强但浮盈不足
+            trigger = cost * 1.05
+            add_lines.append(
+                f"  等 {r['name']}({r['code']}) 浮盈至5%(¥{trigger:.2f}) "
+                f"DL={dl_p:.2f} EP={m30_ep:.2f}"
+            )
+
+    if add_lines:
+        lines.append("📈 加仓/观察:")
+        for a in add_lines:
+            lines.append(a)
+        lines.append("")
+
+    # === 7. 最新核心池 ===
+    # BUG修复 (2026-07-30): 候选池列索引错配
+    #   旧代码: tier读col8(DL_P), dl_p读col6(买点低点), ratio读col7(ratio), confirmed读col10(SignalType)
+    #   正确列: tier=col11(分层Tier), dl_p=col8(DL_P), ratio=col7(ratio), confirmed=col12(是否确认信号)
+    #   tier值应为"核心池"而非"核心"
+    try:
+        wb = safe_load_wb(data_only=True)
+        if '候选池' in wb.sheetnames:
+            ws_pool = wb['候选池']
+            core_pool = []
+            for r in range(2, ws_pool.max_row + 1):
+                tier = str(ws_pool.cell(row=r, column=11).value or "")
+                if tier == "核心池":
+                    name = ws_pool.cell(row=r, column=2).value or ""
+                    code = str(ws_pool.cell(row=r, column=3).value or "")
+                    price = ws_pool.cell(row=r, column=4).value or 0
+                    dl_p = ws_pool.cell(row=r, column=8).value or 0
+                    ratio = ws_pool.cell(row=r, column=7).value or 0
+                    confirmed = ws_pool.cell(row=r, column=12).value or ""
+                    core_pool.append({
+                        "name": name, "code": code, "price": price,
+                        "dl_p": dl_p, "ratio": ratio, "confirmed": confirmed,
+                    })
+            if core_pool:
+                lines.append(f"⭐ 核心池({len(core_pool)}只):")
+                for s in core_pool:
+                    lines.append(
+                        f"  {s['name']}({s['code']}) ¥{s['price']:.2f} "
+                        f"DL={s['dl_p']:.2f} ratio={s['ratio']*100:.1f}%"
+                    )
+                lines.append("")
+    except:
+        pass
+
+    return '\n'.join(lines)
+
+
 def format_compliance_summary(account, holdings, issues, ts):
     """Format compliance check results into clean Telegram message."""
     lines = [f"📝 合规核查 {ts}", ""]
@@ -1169,7 +2398,7 @@ def run_weekly_review():
     # ============================================================
     # 1. 读取账户数据
     # ============================================================
-    wb_d = load_workbook(WB, data_only=True)
+    wb_d = safe_load_wb(data_only=True)
     ws_acc = wb_d['账户总表']
     latest_row = 2
     for r in range(2, ws_acc.max_row + 1):
@@ -1491,7 +2720,7 @@ def run_weekly_review():
     # ============================================================
     # 5. 写入Excel
     # ============================================================
-    wb = load_workbook(WB)
+    wb = safe_load_wb()
     ws_rev = wb['周复盘']
 
     # 新列表头 (如果不存在则添加)
@@ -1576,7 +2805,7 @@ def run_weekly_review():
     ws_tr_fix.cell(row=216, column=2, value=round(win_loss_ratio, 6) if win_loss_ratio != float('inf') else 999)
     ws_tr_fix.cell(row=217, column=2, value=system_status)
 
-    wb.save(WB)
+    safe_save_wb(wb)
     recalc_result = recalc()
 
     print(f"\n周复盘完成 (双复利模型):")
@@ -1681,7 +2910,10 @@ def main():
     try:
         if cmd == "compliance":
             account, holdings, issues = check_compliance()
-            msg = format_compliance_summary(account, holdings, issues, ts)
+            # Telegram推送改为去弱留强格式 (2026-07-29)
+            # 旧: format_compliance_summary → 只推送合规告警
+            # 新: format_rebalance_summary → 减多少股+加多少股+核心池
+            msg = format_rebalance_summary(holdings, ts)
             send_telegram(msg)
         elif cmd == "scan":
             scan_data = run_full_scan()

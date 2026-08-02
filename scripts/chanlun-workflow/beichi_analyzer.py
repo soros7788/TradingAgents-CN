@@ -7,6 +7,11 @@ BUG修复记录:
    - 根因: 前段仅15根K线，日内微小回调被当成有效下跌段
    - 修复: 前段最小30根 + 幅度>=0.1% + 大级别方向过滤
    - 日期: 2026-07-14
+
+2. sklearn沙箱常驻BUG (2026-07-28)
+   - 根因: TRAE沙箱每次新session是干净环境, pip install不持久
+   - 症状: 模型加载失败→回退硬编码→全市场无DL_P>0.8→触发用户规则
+   - 修复: import时自动检测并安装scikit-learn==1.7.2
 """
 
 import urllib.request
@@ -16,6 +21,22 @@ import re
 import os
 import pickle
 import numpy as np
+
+# ============================================================
+#  sklearn自动安装 (沙箱环境兼容)
+#  TRAE沙箱每次新session不保留pip安装, 需自动补装
+# ============================================================
+try:
+    import sklearn
+except ImportError:
+    import subprocess, sys
+    print("[依赖] sklearn未安装, 正在自动安装 scikit-learn==1.7.2 ...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "scikit-learn==1.7.2", "--break-system-packages", "-q"
+    ])
+    print("[依赖] scikit-learn==1.7.2 安装完成")
+    import sklearn
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -41,6 +62,312 @@ _DL_FEATURE_NAMES = [
     "macd_bar_peak", "level_code", "bar_converge",
 ]
 
+# ============================================================
+#  反转概率模型 EP_L (V2)
+#  MLP(128→64→32→16) 训练于1724样本, AUC=0.68
+#  20维精选特征 (36维→SelectKBest)
+#  预测背驰信号后是否发生有效反转
+# ============================================================
+_ep_model = None
+_ep_scaler = None
+_ep_meta = None
+_ep_loaded = False
+_EP_MODEL_PATH = os.path.join(_DL_DIR, "ep_model.pkl")
+_EP_SCALER_PATH = os.path.join(_DL_DIR, "ep_scaler.pkl")
+_EP_META_PATH = os.path.join(_DL_DIR, "ep_train_meta.pkl")
+_EP_TREND_P = 0.6   # P>=0.6 → 高反转概率
+_EP_WATCH_P = 0.4    # P>=0.4 → 观察区间
+
+
+def _load_ep_model():
+    """加载EP_L反转概率模型(懒加载)
+
+    BUG修复 (2026-07-28): 同_load_dl_model, _loaded=True在try前设置导致永不重试
+    修复: 仅在成功或永久性错误时设_loaded=True
+    """
+    global _ep_model, _ep_scaler, _ep_meta, _ep_loaded
+    if _ep_loaded:
+        return _ep_model is not None
+    try:
+        if not os.path.exists(_EP_MODEL_PATH):
+            print(f"[EP模型] 模型文件不存在: {_EP_MODEL_PATH}")
+            _ep_loaded = True  # 永久性错误, 不重试
+            return False
+        if not os.path.exists(_EP_SCALER_PATH):
+            print(f"[EP模型] Scaler文件不存在: {_EP_SCALER_PATH}")
+            _ep_loaded = True  # 永久性错误, 不重试
+            return False
+        with open(_EP_MODEL_PATH, 'rb') as f:
+            _ep_model = pickle.load(f)
+        with open(_EP_SCALER_PATH, 'rb') as f:
+            _ep_scaler = pickle.load(f)
+        if os.path.exists(_EP_META_PATH):
+            with open(_EP_META_PATH, 'rb') as f:
+                _ep_meta = pickle.load(f)
+        _ep_loaded = True  # 成功加载
+        print(f"[EP模型] 加载成功: model={type(_ep_model).__name__}, "
+              f"meta_version={_ep_meta.get('version', 'N/A') if _ep_meta else 'N/A'}")
+        return True
+    except ImportError as e:
+        print(f"[EP模型] 依赖缺失(保留重试): {e}")
+        return False  # _loaded保持False, 下次调用可重试
+    except Exception as e:
+        print(f"[EP模型] 加载失败(保留重试): {type(e).__name__}: {e}")
+        return False  # _loaded保持False, 下次调用可重试
+
+
+def _compute_ep_features(ratio, pre_pct, post_pct, pre_bars, post_bars,
+                          closes, highs, lows, opens, volumes,
+                          pre_s, pre_e, post_s, post_e, dif, bar,
+                          zs, atr, level_name, V):
+    """计算EP_L 36维完整特征向量 (信号点为post_e)"""
+    n = len(closes)
+    sig_idx = post_e
+    sig_price = closes[sig_idx]
+
+    # ====== DL_P 16维 (复用) ======
+    f1 = ratio
+    f2 = pre_pct
+    f3 = post_pct
+    f4 = pre_bars / 50.0
+    f5 = post_bars / 50.0
+    f6 = _compute_consistency(closes, pre_s, pre_e)
+    f7 = _compute_consistency(closes, post_s, post_e)
+    zs_price = closes[zs['s']]
+    f8 = (zs['zg'] - zs['zd']) / zs_price * 100 if zs_price > 0 else 0
+    f9 = atr / zs_price if zs_price > 0 else 0
+    pre_vol = sum(V[pre_s:pre_e + 1]) / max(1, pre_e - pre_s + 1) if V and pre_e >= pre_s else 1
+    post_vol = sum(V[post_s:post_e + 1]) / max(1, post_e - post_s + 1) if V and post_e >= post_s else 1
+    f10 = post_vol / pre_vol if pre_vol > 0 else 1.0
+    f11 = _compute_dif_slope(dif, sig_idx)
+    lookback = min(60, n)
+    f12 = abs(closes[-1] - closes[n - lookback]) / closes[n - lookback] * 100 if n > lookback else 0
+    zs_mid = (zs['zg'] + zs['zd']) / 2
+    zs_half = (zs['zg'] - zs['zd']) / 2 if (zs['zg'] - zs['zd']) > 0 else 1
+    f13 = max(-1.0, min(1.0, (closes[sig_idx] - zs_mid) / zs_half))
+    post_bars_list = bar[post_s:post_e + 1] if post_e >= post_s else [0]
+    f14 = max(abs(b) for b in post_bars_list) / (atr + 1e-10)
+    level_code_map = {"日线": 0, "30min": 1, "5min": 2, "1min": 2}
+    f15 = float(level_code_map.get(level_name, 0))
+    f16 = _compute_bar_converge(bar, post_s, post_e)
+
+    # ====== EP专属 20维 ======
+    # F17: RSI14
+    f17 = _calc_rsi(closes[:sig_idx + 1], 14)
+    # F18-F20: KDJ
+    f18, f19, f20 = _calc_kdj(highs[:sig_idx + 1], lows[:sig_idx + 1], closes[:sig_idx + 1])
+    # F21: price_vs_ma5
+    ma5 = _calc_ma(closes[:sig_idx + 1], 5)
+    f21 = (sig_price - ma5) / ma5 * 100 if ma5 > 0 else 0
+    # F22: price_vs_ma20
+    ma20 = _calc_ma(closes[:sig_idx + 1], 20)
+    f22 = (sig_price - ma20) / ma20 * 100 if ma20 > 0 else 0
+    # F23: macd_bar_shrink
+    if sig_idx >= 3:
+        br = [abs(bar[sig_idx]), abs(bar[sig_idx - 1]), abs(bar[sig_idx - 2])]
+        f23 = 1.0 if br[0] < br[1] < br[2] else 0.0
+    else:
+        f23 = 0.0
+    # F24: max_drawdown_10
+    dd_s = max(0, sig_idx - 10)
+    dd_h = max(closes[dd_s:sig_idx + 1])
+    f24 = (dd_h - min(closes[dd_s:sig_idx + 1])) / dd_h * 100 if dd_h > 0 else 0
+    # F25: volume_trend_slope
+    vw = min(10, sig_idx)
+    if vw >= 3 and volumes:
+        vy = np.array(volumes[sig_idx - vw + 1:sig_idx + 1], dtype=float)
+        vx = np.arange(len(vy), dtype=float)
+        vxm, vym = vx.mean(), vy.mean()
+        f25 = np.sum((vx - vxm) * (vy - vym)) / (np.sum((vx - vxm) ** 2) + 1e-10) / (vym + 1e-10)
+    else:
+        f25 = 0.0
+    # F26: lower_shadow_ratio
+    sig_total = highs[sig_idx] - lows[sig_idx]
+    f26 = (min(opens[sig_idx], closes[sig_idx]) - lows[sig_idx]) / sig_total if sig_total > 0 else 0.0
+    # F27: consecutive_down_days
+    cdd = 0
+    for i in range(sig_idx, max(sig_idx - 20, 0), -1):
+        if i > 0 and closes[i] < closes[i - 1]:
+            cdd += 1
+        else:
+            break
+    f27 = cdd / 20.0
+    # F28: bollinger_position
+    bb_window = min(20, sig_idx)
+    if bb_window >= 5:
+        bb_closes = closes[sig_idx - bb_window + 1:sig_idx + 1]
+        bb_mean = np.mean(bb_closes)
+        bb_std = np.std(bb_closes)
+        if bb_std > 0:
+            f28 = (sig_price - (bb_mean - 2 * bb_std)) / (4 * bb_std)
+            f28 = max(0.0, min(1.0, f28))
+        else:
+            f28 = 0.5
+    else:
+        f28 = 0.5
+    # F29: bottom_volume_ratio
+    avg_vol_20 = np.mean(volumes[max(0, sig_idx - 19):sig_idx + 1]) if volumes and sig_idx >= 19 else (np.mean(volumes[:sig_idx + 1]) if volumes else 1)
+    f29 = volumes[sig_idx] / avg_vol_20 if avg_vol_20 > 0 and volumes else 1.0
+    # F30: dif_cross_dea
+    if sig_idx < len(dif):
+        dea = _calc_dea(dif)
+        if sig_idx < len(dea):
+            f30 = (dif[sig_idx] - dea[sig_idx]) / (atr + 1e-10) if atr > 0 else 0
+        else:
+            f30 = 0.0
+    else:
+        f30 = 0.0
+    # F31: retracement_from_high
+    rh_start = max(0, sig_idx - 60)
+    recent_high = max(highs[rh_start:sig_idx + 1])
+    f31 = (recent_high - sig_price) / recent_high * 100 if recent_high > 0 else 0
+    # F32: candle_pattern
+    body = abs(opens[sig_idx] - closes[sig_idx])
+    upper_shadow = highs[sig_idx] - max(opens[sig_idx], closes[sig_idx])
+    lower_shadow = min(opens[sig_idx], closes[sig_idx]) - lows[sig_idx]
+    if sig_total > 0:
+        if lower_shadow > body * 2 and upper_shadow < body * 0.5:
+            f32 = 1.0
+        elif body < sig_total * 0.1:
+            f32 = 0.8
+        elif lower_shadow > body and upper_shadow < lower_shadow:
+            f32 = 0.6
+        else:
+            f32 = 0.0
+    else:
+        f32 = 0.0
+    # F33: volume_price_diverge
+    if sig_idx >= 10 and volumes:
+        recent_5_lows = min(lows[sig_idx - 4:sig_idx + 1])
+        prev_5_lows = min(lows[max(0, sig_idx - 9):sig_idx - 4])
+        recent_5_vol = np.mean(volumes[sig_idx - 4:sig_idx + 1])
+        prev_5_vol = np.mean(volumes[max(0, sig_idx - 9):sig_idx - 4])
+        if recent_5_lows < prev_5_lows and prev_5_vol > 0:
+            f33 = prev_5_vol / recent_5_vol
+        else:
+            f33 = 1.0
+    else:
+        f33 = 1.0
+    # F34: momentum_5d
+    f34 = (closes[sig_idx] - closes[sig_idx - 5]) / closes[sig_idx - 5] * 100 if sig_idx >= 5 else 0.0
+    # F35: volatility_squeeze
+    if sig_idx >= 20:
+        vol_short = np.std([closes[i] / closes[i - 1] - 1 for i in range(sig_idx - 4, sig_idx + 1)])
+        vol_long = np.std([closes[i] / closes[i - 1] - 1 for i in range(sig_idx - 19, sig_idx + 1)])
+        f35 = vol_short / vol_long if vol_long > 0 else 1.0
+    else:
+        f35 = 1.0
+    # F36: support_distance
+    support_start = max(0, sig_idx - 40)
+    recent_low = min(lows[support_start:sig_idx + 1])
+    f36 = (sig_price - recent_low) / recent_low * 100 if recent_low > 0 else 0
+
+    return [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16,
+            f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30,
+            f31, f32, f33, f34, f35, f36]
+
+
+def _calc_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(c, 0) for c in changes[-period:]]
+    losses = [max(-c, 0) for c in changes[-period:]]
+    ag, al = sum(gains) / period, sum(losses) / period
+    if al < 1e-10:
+        return 100.0
+    return 100.0 - 100.0 / (1 + ag / al)
+
+
+def _calc_kdj(highs, lows, closes, period=9):
+    if len(closes) < period:
+        return 50.0, 50.0, 50.0
+    hh, ll = max(highs[-period:]), min(lows[-period:])
+    if hh == ll:
+        return 50.0, 50.0, 50.0
+    rsv = (closes[-1] - ll) / (hh - ll) * 100
+    k = 2 / 3 * 50 + 1 / 3 * rsv
+    d = 2 / 3 * 50 + 1 / 3 * k
+    return k, d, 3 * k - 2 * d
+
+
+def _calc_ma(closes, period):
+    if len(closes) < period:
+        return closes[-1] if closes else 0
+    return sum(closes[-period:]) / period
+
+
+def _calc_dea(dif, period=9):
+    dea, k = [], 2 / (period + 1)
+    for i, v in enumerate(dif):
+        dea.append(v if i == 0 else v * k + dea[-1] * (1 - k))
+    return dea
+
+
+def predict_reversal(ratio, pre_pct, post_pct, pre_bars, post_bars,
+                     closes, highs, lows, opens, volumes,
+                     pre_s, pre_e, post_s, post_e, dif, bar,
+                     zs, atr, level_name, V):
+    """
+    用EP_L模型预测反转概率
+
+    返回: (rev_type, ep_prob)
+      rev_type: "高反转"/"观察"/"低反转"
+      ep_prob: 0-1
+    """
+    if not _load_ep_model():
+        # 回退: 基于ratio和RSI的简单规则
+        rsi = _calc_rsi(closes[:post_e + 1], 14)
+        if ratio < 30 and rsi < 30:
+            return "高反转", 0.65
+        elif ratio < 60 and rsi < 40:
+            return "观察", 0.45
+        else:
+            return "低反转", 0.25
+
+    feat_all = _compute_ep_features(
+        ratio, pre_pct, post_pct, pre_bars, post_bars,
+        closes, highs, lows, opens, volumes,
+        pre_s, pre_e, post_s, post_e, dif, bar,
+        zs, atr, level_name, V
+    )
+    X_all = np.array([feat_all], dtype=float)
+    X_all = np.nan_to_num(X_all, nan=0.0, posinf=200.0, neginf=0.0)
+
+    # 特征选择 (用训练时的掩码)
+    if _ep_meta and 'selected_mask' in _ep_meta:
+        mask = np.array(_ep_meta['selected_mask'])
+        X_selected = X_all[:, mask]
+    else:
+        X_selected = X_all
+
+    X_scaled = _ep_scaler.transform(X_selected)
+    raw_prob = _ep_model.predict_proba(X_scaled)[0, 1]
+
+    # 【BUG修复 2026-07-28】EP_L校准公式过于激进
+    #
+    # 旧公式: (raw - 0.5) * 2.0
+    #   → raw<0.5 → EP=0 (71%信号归零!)
+    #   → raw=0.6 → EP=0.2 (本应是有一定反转概率的)
+    #   → 0%信号达到0.5阈值, 二买永远无法确认
+    #
+    # 新公式: 以0.3为锚点的线性拉伸
+    #   raw=0.3 → EP=0.1 (极低反转)
+    #   raw=0.5 → EP=0.3 (低反转)
+    #   raw=0.65 → EP=0.5 (观察阈值)
+    #   raw=0.8 → EP=0.75 (高反转)
+    #   raw=1.0 → EP=1.0
+    prob = max(0.0, min(1.0, (raw_prob - 0.3) / 0.7))
+
+    if prob >= _EP_TREND_P:
+        rev_type = "高反转"
+    elif prob >= _EP_WATCH_P:
+        rev_type = "观察"
+    else:
+        rev_type = "低反转"
+
+    return rev_type, prob
+
 
 def _load_dl_model():
     """加载深度学习模型(懒加载)
@@ -48,30 +375,36 @@ def _load_dl_model():
     BUG修复 (2026-07-26): 原代码 except Exception: pass 静默吞掉所有错误
     症状: sklearn未安装时模型加载失败, 回退到硬编码0.70, 全市场无DL_P>0.8
     修复: 添加错误日志, 不再静默失败
+
+    BUG修复 (2026-07-28): _loaded=True 在try前设置, 导致首次失败后永不重试
+    症状: 首次调用时sklearn未装好 → _loaded永久True → 后续即使装好也不重试
+    修复: 仅在成功或永久性错误(文件不存在)时设_loaded=True, 瞬时错误保留重试机会
     """
     global _dl_model, _dl_scaler, _dl_loaded
     if _dl_loaded:
         return _dl_model is not None
-    _dl_loaded = True
     try:
         if not os.path.exists(_DL_MODEL_PATH):
             print(f"[DL模型] 模型文件不存在: {_DL_MODEL_PATH}")
+            _dl_loaded = True  # 永久性错误, 不重试
             return False
         if not os.path.exists(_DL_SCALER_PATH):
             print(f"[DL模型] Scaler文件不存在: {_DL_SCALER_PATH}")
+            _dl_loaded = True  # 永久性错误, 不重试
             return False
         with open(_DL_MODEL_PATH, 'rb') as f:
             _dl_model = pickle.load(f)
         with open(_DL_SCALER_PATH, 'rb') as f:
             _dl_scaler = pickle.load(f)
+        _dl_loaded = True  # 成功加载
         print(f"[DL模型] 加载成功: model={type(_dl_model).__name__}, scaler={type(_dl_scaler).__name__}")
         return True
     except ImportError as e:
-        print(f"[DL模型] 依赖缺失, 回退到硬编码: {e}")
-        return False
+        print(f"[DL模型] 依赖缺失, 回退到硬编码(保留重试): {e}")
+        return False  # _loaded保持False, 下次调用可重试
     except Exception as e:
-        print(f"[DL模型] 加载失败, 回退到硬编码: {type(e).__name__}: {e}")
-        return False
+        print(f"[DL模型] 加载失败, 回退到硬编码(保留重试): {type(e).__name__}: {e}")
+        return False  # _loaded保持False, 下次调用可重试
 
 
 def _compute_dl_features(ratio, pre_pct, post_pct, pre_bars, post_bars,
@@ -428,11 +761,30 @@ def find_zhongshu(highs, lows, min_width=5, min_amp_pct=0.08):
     return filtered
 
 
-def calc_area(vals, s, e):
-    """计算MACD DIF面积(绝对值之和)"""
+def calc_area(vals, s, e, direction=None):
+    """
+    计算MACD DIF面积(方向性面积)
+
+    【BUG修复 2026-07-28】
+    旧实现: sum(abs(v)) 对所有DIF取绝对值求和
+    问题: DIF穿越零轴时, 正负值都被累加, 面积虚高导致ratio异常(如2140%)
+    修复: 按趋势方向只计算对应方向的DIF面积
+      - direction="down": 只累加DIF<0的绝对值 (底背驰绿柱面积)
+      - direction="up":   只累加DIF>0的绝对值 (顶背驰红柱面积)
+      - direction=None:   兼容旧逻辑(abs全部), 仅供fallback
+    """
     if s >= e or s < 0 or e >= len(vals):
         return 0
-    return sum(abs(v) for v in vals[s:e + 1])
+    seg = vals[s:e + 1]
+    if direction == "down":
+        area = sum(abs(v) for v in seg if v < 0)
+        # fallback: 如果整段没有负值(极少见), 退回abs全部避免除零
+        return area if area > 0 else sum(abs(v) for v in seg)
+    elif direction == "up":
+        area = sum(abs(v) for v in seg if v > 0)
+        return area if area > 0 else sum(abs(v) for v in seg)
+    else:
+        return sum(abs(v) for v in seg)
 
 
 def seg_direction(closes, s, e):
@@ -489,7 +841,12 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
 
     scale_map = {"日线": "240", "30min": "30", "5min": "5", "1min": "1"}
     min_w_map = {"日线": 5, "30min": 4, "5min": 3, "1min": 3}
-    min_amp_map = {"日线": 0.3, "30min": 0.1, "5min": 0.05, "1min": 0.02}
+    # BUG修复 (2026-07-29): 30min min_amp_pct=0.1%过低 → 4.8元股价下0.01元(1tick)就能形成中枢
+    # 问题: 23个中枢中22个宽度仅0.01元, 全是噪音 → 现价偏离1tick就"破位"
+    # 修复: 30min从0.1%提高到0.5%, 5min从0.05%提高到0.3%
+    #   4.8元 × 0.5% = 0.024元 → 过滤tick噪音, 保留真实中枢
+    #   3.4元 × 0.5% = 0.017元 → 三力士同理
+    min_amp_map = {"日线": 0.3, "30min": 0.5, "5min": 0.3, "1min": 0.02}
     pre_bars_map = {"日线": 25, "30min": 20, "5min": 20, "1min": 30}  # 修复: 1min从15增至30
     pre_min_pct = {"日线": 1.0, "30min": 0.5, "5min": 0.2, "1min": 0.1}  # 修复: 新增幅度门槛
     post_min_bars = {"日线": 5, "30min": 5, "5min": 3, "1min": 5}  # 修复: 1min从3增至5
@@ -501,6 +858,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         C = [b['close'] for b in bars]
         H = [b['high'] for b in bars]
         L = [b['low'] for b in bars]
+        O = [b['open'] for b in bars]
         times = [b['time'] for b in bars]
         V = [b['volume'] for b in bars]
         n = len(C)
@@ -511,6 +869,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         C = [float(d['close']) for d in data]
         H = [float(d['high']) for d in data]
         L = [float(d['low']) for d in data]
+        O = [float(d['open']) for d in data]
         times = [d['day'] for d in data]
         V = [float(d.get('volume', 0)) for d in data]
         n = len(C)
@@ -588,9 +947,15 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         post_d = seg_direction(C, post_s, post_e)
 
         if pre_d != "flat" and post_d != "flat" and pre_d == post_d:
-            pre_a = calc_area(dif, pre_s, pre_e)
-            post_a = calc_area(dif, post_s, post_e)
-            ratio = (post_a / pre_a * 100) if pre_a > 0 else 999
+            pre_a = calc_area(dif, pre_s, pre_e, direction=pre_d)
+            post_a = calc_area(dif, post_s, post_e, direction=post_d)
+            # 【BUG修复续 2026-07-28】pre段方向性面积过小时ratio无意义
+            # 当pre段MACD动能极弱(DIF几乎不穿越零轴), 分母趋零导致ratio虚高至数千%
+            MIN_AREA = 0.5  # 最小有效方向性DIF面积
+            if pre_a < MIN_AREA:
+                ratio = 999  # pre段MACD动能不足, 无背驰意义
+            else:
+                ratio = (post_a / pre_a * 100)
 
             # 【DL修复】ratio裁剪到训练数据分布范围[10,150]
             ratio_clamped = max(10.0, min(150.0, ratio))
@@ -660,12 +1025,28 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
             # 【BUG修复】大级别方向过滤
             aligned = (pre_d == overall_dir)
 
+            # 【EP_L】计算反转概率
+            try:
+                ep_rev_type, ep_prob = predict_reversal(
+                    ratio_clamped, pre_pct, post_pct,
+                    pre_e - pre_s + 1, post_e - post_s + 1,
+                    C, H, L, O, V,
+                    pre_s, pre_e, post_s, post_e, dif, bar,
+                    zs, atr, level, V
+                )
+            except Exception as e:
+                print(f"[EP预测异常] {type(e).__name__}: {e}")
+                import traceback; traceback.print_exc()
+                ep_rev_type, ep_prob = "低反转", 0.25
+
             signals.append({
                 "type": sig_type,
                 "dir": direction,
                 "op": op,
                 "ratio": ratio,
-                "dl_prob": dl_prob,  # 新增: 深度学习概率
+                "dl_prob": dl_prob,  # 深度学习背驰概率
+                "ep_prob": ep_prob,  # 反转概率 EP_L
+                "ep_type": ep_rev_type,  # 反转类型: 高反转/观察/低反转
                 "zs": zs,
                 "pre_dir": pre_d,
                 "post_dir": post_d,
@@ -728,10 +1109,17 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
 
                 pre_pct_ermai = abs(C[pre_e_ermai] - C[pre_s_ermai]) / C[pre_s_ermai] * 100 if C[pre_s_ermai] > 0 else 0
                 post_pct_ermai = abs(C[post_e_ermai] - C[post_s_ermai]) / C[post_s_ermai] * 100 if C[post_s_ermai] > 0 else 0
-                # TRAE修复: 真实计算MACD面积比(替代硬编码50)
-                pre_a_ermai = calc_area(dif, pre_s_ermai, pre_e_ermai)
-                post_a_ermai = calc_area(dif, post_s_ermai, post_e_ermai)
-                ratio_ermai = (post_a_ermai / pre_a_ermai * 100) if pre_a_ermai > 0 else 999
+                # 计算二买段方向(用于方向性面积计算)
+                pre_d_ermai = seg_direction(C, pre_s_ermai, pre_e_ermai)
+                post_d_ermai = seg_direction(C, post_s_ermai, post_e_ermai)
+                # TRAE修复: 真实计算MACD面积比(替代硬编码50) + 方向性面积
+                pre_a_ermai = calc_area(dif, pre_s_ermai, pre_e_ermai, direction=pre_d_ermai)
+                post_a_ermai = calc_area(dif, post_s_ermai, post_e_ermai, direction=post_d_ermai)
+                # 【BUG修复续 2026-07-28】同样增加最小面积阈值防止ratio虚高
+                if pre_a_ermai < 0.5:
+                    ratio_ermai = 999
+                else:
+                    ratio_ermai = (post_a_ermai / pre_a_ermai * 100) if pre_a_ermai > 0 else 999
 
                 # 用DL模型计算真实概率
                 try:
@@ -771,12 +1159,31 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                     one_buy_before = one_buy_sig is not None
                     # 条件3: DL_P >= 0.4 (盘整背驰门槛, 二买要求较低)
                     if one_buy_before and dl_prob_ermai >= 0.4:
+                        # EP_L: 二买反转概率
+                        # 【BUG修复 2026-07-28】旧代码硬编码pre_bars=30, post_bars=10
+                        #   且窗口用curr_zs相对位置, 与实际走势段不匹配
+                        #   修复: 用实际中枢间距作为窗口
+                        ermai_pre_bars = max(5, pre_e_ermai - pre_s_ermai + 1)
+                        ermai_post_bars = max(3, post_e_ermai - post_s_ermai + 1)
+                        try:
+                            ep_rev_type_2m, ep_prob_2m = predict_reversal(
+                                ratio_ermai, pre_pct_ermai, post_pct_ermai,
+                                ermai_pre_bars, ermai_post_bars,
+                                C, H, L, O, V,
+                                pre_s_ermai, pre_e_ermai,
+                                post_s_ermai, post_e_ermai,
+                                dif, bar, curr_zs, atr, level, V
+                            )
+                        except:
+                            ep_rev_type_2m, ep_prob_2m = "观察", 0.40
                         signals.append({
                             "type": "盘整背驰" if dl_prob_ermai >= _DL_PAN_P else "无背驰",
                             "dir": "看多",
                             "op": "二买",
                             "ratio": ratio_ermai,
                             "dl_prob": dl_prob_ermai,
+                            "ep_prob": ep_prob_2m,
+                            "ep_type": ep_rev_type_2m,
                             "zs": curr_zs,
                             "pre_dir": "down",
                             "post_dir": "up",
@@ -822,12 +1229,28 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
 
                                 # 三买要求更高: DL_P >= 0.45
                                 if dl_prob_sanmai >= 0.45:
+                                    # EP_L: 三买反转概率
+                                    try:
+                                        ep_rev_type_3m, ep_prob_3m = predict_reversal(
+                                            max(10, min(150, ratio_sanmai)),
+                                            pre_pct_ermai, post_pct_ermai,
+                                            pre_e_ermai - pre_s_ermai + 1,
+                                            post_e_ermai - post_s_ermai + 1,
+                                            C, H, L, O, V,
+                                            pre_s_ermai, pre_e_ermai,
+                                            post_s_ermai, post_e_ermai,
+                                            dif, bar, curr_zs, atr, level, V
+                                        )
+                                    except:
+                                        ep_rev_type_3m, ep_prob_3m = "观察", 0.40
                                     signals.append({
                                         "type": "盘整背驰" if dl_prob_sanmai >= _DL_PAN_P else "无背驰",
                                         "dir": "看多",
                                         "op": "三买",
                                         "ratio": ratio_sanmai,
                                         "dl_prob": dl_prob_sanmai,
+                                        "ep_prob": ep_prob_3m,
+                                        "ep_type": ep_rev_type_3m,
                                         "zs": curr_zs,
                                         "pre_dir": "down",
                                         "post_dir": "up",
@@ -844,12 +1267,17 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
 
     signals.sort(key=lambda x: -x['zs']['e'])
 
+    # BUG修复 (2026-07-29): result未返回H/L → 外部调用者r.get("H",[])返回空
+    # 影响: daily_workflow的中枢破位检查用r.get("zss")拿到的是正确的(内部计算),
+    #       但任何需要外部重新检查H/L的逻辑都会失败
     result = {
         "code": code,
         "level": level,
         "n": n,
         "times": times,
         "C": C,
+        "H": H,  # BUG修复: 补充H/L返回
+        "L": L,  # BUG修复: 补充H/L返回
         "zss": zss,
         "signals": signals,
         "price": price,
@@ -936,14 +1364,53 @@ def detect_multilevel_buy_signals(code, price=None):
     # 日线最佳一买
     daily_best = max(daily_one_buys, key=lambda s: s.get("dl_prob", 0), default=None)
     daily_dl_p = daily_best.get("dl_prob", 0) if daily_best else 0
+    daily_ep_p = daily_best.get("ep_prob", 0) if daily_best else 0
     daily_ratio = daily_best.get("ratio", 999) if daily_best else 999
     daily_valid = daily_best is not None and daily_best.get("valid", False)
+
+    # ============================================================
+    # BUG修复 (2026-07-30): 提取一买低点用于加仓风控
+    #
+    # 问题: 二买加仓后, 若二买无法确认且价格破一买低点 → 重仓大幅回撤
+    #       get_dynamic_position_cap需要one_buy_low来检查加仓安全性
+    #       run_intraday_scan需要one_buy_low来做破位止损
+    #
+    # 来源优先级:
+    #   1. 日线二买信号中已存储的one_buy_low (analyze_beichi计算)
+    #   2. 从日线最佳一买信号的中枢计算最低收盘价
+    # ============================================================
+    daily_one_buy_low = None
+    # 方式1: 从日线二买信号中获取(analyze_beichi已在line 1195存储)
+    for s in daily_signals:
+        if s.get("op") == "二买" and s.get("valid") and s.get("one_buy_low"):
+            obl = s["one_buy_low"]
+            if daily_one_buy_low is None or obl < daily_one_buy_low:
+                daily_one_buy_low = obl
+    # 方式2: 从日线最佳一买信号的中枢计算
+    if daily_one_buy_low is None and daily_best:
+        sig_zs = daily_best.get("zs", {})
+        C_daily = daily.get("C", [])
+        if sig_zs and C_daily:
+            s_idx = sig_zs.get("s", 0)
+            e_idx = sig_zs.get("e", 0)
+            if 0 <= s_idx <= e_idx < len(C_daily):
+                daily_one_buy_low = min(C_daily[s_idx:e_idx + 1])
 
     # 30min信号(看多+看空)
     min30_signals = min30.get("signals", [])
     min30_buys = [s for s in min30_signals if s.get("dir") == "看多"]
-    min30_best = max(min30_buys, key=lambda s: s.get("dl_prob", 0), default=None)
-    min30_dl_p = min30_best.get("dl_prob", 0) if min30_best else 0
+    # 【Trae复核修复 2026-07-28】一鱼两吃缺陷
+    # Codex方案: 加权评分 DL_P*0.4 + EP_L*0.6 选一个信号 → 一买和二买共用
+    # 问题: 002454 DL=0.035/EP=0.089 和 DL=0.008/EP=0.591 是两个不同信号
+    #   加权选中后者 → 30min DL_P=0.008 → 分层门槛0.6永远过不了
+    #   一买分层被杀死, 二买也用的是低DL信号
+    # 修复: 一买/二买各选各的最优信号
+    #   一买分层用: max(DL_P) → 背驰结构最强的信号
+    #   二买确认用: max(EP_L) → 反转概率最高的信号
+    min30_best_dl = max(min30_buys, key=lambda s: s.get("dl_prob", 0), default=None)   # 一买侧重
+    min30_best_ep = max(min30_buys, key=lambda s: s.get("ep_prob", 0), default=None)   # 二买侧重
+    min30_dl_p = min30_best_dl.get("dl_prob", 0) if min30_best_dl else 0
+    min30_ep_p = min30_best_ep.get("ep_prob", 0) if min30_best_ep else 0
     min30_sells = [s for s in min30_signals if s.get("dir") == "看空"]
     min30_sell_count = len(min30_sells)
     min30_best_sell = max(min30_sells, key=lambda s: s.get("dl_prob", 0), default=None)
@@ -952,8 +1419,11 @@ def detect_multilevel_buy_signals(code, price=None):
     # 5min信号(看多+看空)
     min5_signals = min5.get("signals", [])
     min5_buys = [s for s in min5_signals if s.get("dir") == "看多"]
-    min5_best = max(min5_buys, key=lambda s: s.get("dl_prob", 0), default=None)
-    min5_dl_p = min5_best.get("dl_prob", 0) if min5_best else 0
+    # 【Trae复核修复 2026-07-28】同30min, 一买/二买各选各的
+    min5_best_dl = max(min5_buys, key=lambda s: s.get("dl_prob", 0), default=None)   # 一买侧重
+    min5_best_ep = max(min5_buys, key=lambda s: s.get("ep_prob", 0), default=None)   # 二买侧重
+    min5_dl_p = min5_best_dl.get("dl_prob", 0) if min5_best_dl else 0
+    min5_ep_p = min5_best_ep.get("ep_prob", 0) if min5_best_ep else 0
     min5_sells = [s for s in min5_signals if s.get("dir") == "看空"]
     min5_sell_count = len(min5_sells)
 
@@ -975,36 +1445,78 @@ def detect_multilevel_buy_signals(code, price=None):
         elif daily_dl_p >= 0.80:
             tier = "边缘池"
 
-    # 二买: 日线一买valid + 30min DL_P>=0.6 + 5min DL_P>=0.4
+    # ============================================================
+    # 二买: V4 (2026-07-27) EP_L反转确认
+    #
+    # 设计思想 (用户确认):
+    #   一买区间 = DL_P背驰概率 → "有没有背驰结构"
+    #   二买区间 = EP_L反转概率 → "背驰后是否真在反转"
+    #   二买 = 一买确认(日线DL_P) + 30min反转确认(EP_L>=0.5)
+    #         + 5min入场确认(EP_L>=0.3 或 DL_P>=0.4)
+    #
+    # EP_L核心价值:
+    #   DL_P高+EP_L低 = 背驰存在但反转没发生 → 不做二买
+    #   DL_P高+EP_L高 = 背驰存在且反转在推进 → 确认二买
+    # ============================================================
     ermai = None
-    if daily_valid and min30_dl_p >= 0.6 and min5_dl_p >= 0.4:
-        avg_dl_p = (daily_dl_p + min30_dl_p + min5_dl_p) / 3
-        ermai = {
-            "valid": True,
-            "dl_prob": avg_dl_p,
-            "op": "二买",
-            "daily_dl_p": daily_dl_p,
-            "30min_dl_p": min30_dl_p,
-            "5min_dl_p": min5_dl_p,
-            "ratio": daily_ratio,
-            "levels_confirmed": 3,
-            "reason": "日线一买valid + 30min趋势确认(>=0.6) + 5min入场确认(>=0.4)",
-        }
+    if daily_valid and min30_ep_p >= 0.5:
+        # 30min EP_L确认反转在发生
+        # 5min: EP_L>=0.3(反转继续) 或 DL_P>=0.4(仍有背驰结构)
+        if min5_ep_p >= 0.3 or min5_dl_p >= 0.4:
+            # 综合评分: 日线DL_P + 30min EP_L + 5min EP_L
+            avg_ep_p = (daily_ep_p + min30_ep_p + min5_ep_p) / 3
+            # 权重调整 (2026-07-29): DL_P更具特征代表性, 权重从0.5提升到0.7
+            # 依据: EP_L单独使用会误判(东风-35%但EP_L=0.42排第3, 松芝DL_P=0.68但EP_L=0.65排第1)
+            #       DL_P准确识别背驰结构, 是"有没有"的判断; EP_L是"在不在反转"的验证
+            #       去弱留强以DL_P为主, EP_L仅作加仓时的反转确认
+            #       二买确认强度 = 日线DL_P权重0.7 + 30min EP_L权重0.2 + 5min EP_L权重0.1
+            ermai_dl_prob = daily_dl_p * 0.7 + min30_ep_p * 0.2 + min5_ep_p * 0.1
+            ermai = {
+                "valid": True,
+                "dl_prob": daily_dl_p,  # 兼容: 日线一买DL_P
+                "ermai_dl_prob": ermai_dl_prob,  # 新增: 二买本身确认强度
+                "ep_prob": avg_ep_p,
+                "confirm_method": "EP_L",
+                "op": "二买",
+                "daily_dl_p": daily_dl_p,
+                "daily_ep_p": daily_ep_p,
+                "30min_dl_p": min30_dl_p,
+                "30min_ep_p": min30_ep_p,  # 关键: 30min EP_L>=0.5
+                "5min_dl_p": min5_dl_p,
+                "5min_ep_p": min5_ep_p,
+                "ratio": daily_ratio,
+                "levels_confirmed": 3,
+                "reason": (f"日线一买valid(DL={daily_dl_p:.2f}) "
+                          f"+ 30min EP_L反转确认(EP={min30_ep_p:.2f}>=0.5) "
+                          f"+ 5min入场(EP={min5_ep_p:.2f}>=0.3) "
+                          f"→ 二买确认强度={ermai_dl_prob:.2f}"),
+            }
 
-    # 三买: 日线趋势up + 30min DL_P>=0.6 + 5min DL_P>=0.6
+    # ============================================================
+    # 三买: V4 EP_L反转共振确认
+    #
+    # 三买 = 日线趋势已确认up + 30min EP_L>=0.5 + 5min EP_L>=0.4
+    # 用EP_L共振确认反转在多个级别持续推进
+    # ============================================================
     sanmai = None
-    if daily_dir == "up" and min30_dl_p >= 0.6 and min5_dl_p >= 0.6:
-        avg_dl_p = (daily_dl_p + min30_dl_p + min5_dl_p) / 3
+    if daily_dir == "up" and min30_ep_p >= 0.5 and min5_ep_p >= 0.4:
+        avg_ep_p = (daily_ep_p + min30_ep_p + min5_ep_p) / 3
         sanmai = {
             "valid": True,
-            "dl_prob": avg_dl_p,
+            "dl_prob": daily_dl_p,
+            "ep_prob": avg_ep_p,
+            "confirm_method": "EP_L",
             "op": "三买",
             "daily_dl_p": daily_dl_p,
+            "daily_ep_p": daily_ep_p,
             "30min_dl_p": min30_dl_p,
+            "30min_ep_p": min30_ep_p,  # 关键: 30min EP_L>=0.5
             "5min_dl_p": min5_dl_p,
+            "5min_ep_p": min5_ep_p,  # 关键: 5min EP_L>=0.4
             "ratio": daily_ratio,
             "levels_confirmed": 3,
-            "reason": "日线趋势up + 30min趋势背驰(>=0.6) + 5min共振(>=0.6)",
+            "reason": (f"日线趋势up + 30min EP_L共振(EP={min30_ep_p:.2f}>=0.5) "
+                      f"+ 5min EP_L共振(EP={min5_ep_p:.2f}>=0.4)"),
         }
 
     return {
@@ -1013,13 +1525,16 @@ def detect_multilevel_buy_signals(code, price=None):
         "ermai": ermai,
         "sanmai": sanmai,
         "daily_dl_p": daily_dl_p,
+        "daily_ep_p": daily_ep_p,
         "daily_valid": daily_valid,
         "30min_dl_p": min30_dl_p,
+        "30min_ep_p": min30_ep_p,
         "5min_dl_p": min5_dl_p,
+        "5min_ep_p": min5_ep_p,
         "daily_dir": daily_dir,
         "daily_ratio": daily_ratio,
         "levels_available": list(level_results.keys()),
-        # 新增: 看空信号信息 (BUG-2修复)
+        # 看空信号信息
         "min30_sell_count": min30_sell_count,
         "min30_sell_dl_p": min30_sell_dl_p,
         "min5_sell_count": min5_sell_count,
@@ -1027,6 +1542,8 @@ def detect_multilevel_buy_signals(code, price=None):
         "min5_has_data": len(min5_signals) > 0,
         "trend_conflict": trend_conflict,
         "min30_dir": min30_dir,
+        # BUG修复 (2026-07-30): 一买低点, 用于加仓风控和破位止损
+        "one_buy_low": daily_one_buy_low,
     }
 
 
@@ -1103,6 +1620,17 @@ def detect_sell_signals(code, cost, close):
         reasons.append(f"已亏损{pnl_pct*100:.1f}%+日线趋势down")
         risk_level = "高"
 
+    # 规则6 (BUG修复 2026-07-30): 破一买低点 → 二买失败, 清仓
+    # 核心: 二买加仓后若价格破一买低点, 说明二买确认失败, 趋势仍在下跌
+    #       重仓持仓必须立即止损, 防止大幅回撤
+    one_buy_low = ml.get("one_buy_low")
+    if one_buy_low and one_buy_low > 0 and close < one_buy_low:
+        should_clear = True
+        should_reduce = True
+        pct_below = ((close - one_buy_low) / one_buy_low) * 100
+        reasons.append(f"破一买低点(一买低={one_buy_low:.2f}, 现价{close:.2f}, 跌{pct_below:+.1f}%)→二买失败")
+        risk_level = "高"
+
     reason = "; ".join(reasons) if reasons else "无卖出信号"
 
     return {
@@ -1167,7 +1695,10 @@ def get_signal_summary(result):
             pnl = f" | 浮盈{p:+.2f}%"
 
         sig_type = sig.get('type', '')
-        one = (f"{sig['op']} | {sig_type} | DL{dl_prob:.0%} 面积比{sig['ratio']:.1f}%"
+        ep_prob = sig.get('ep_prob', 0)
+        ep_type = sig.get('ep_type', '')
+        ep_str = f" | EP{ep_prob:.0%}" if ep_prob > 0 else ""
+        one = (f"{sig['op']} | {sig_type} | DL{dl_prob:.0%}{ep_str} 面积比{sig['ratio']:.1f}%"
                f" | 大级别{overall}{pnl}")
         return {
             "signal": sig['op'], "bias": sig_type,

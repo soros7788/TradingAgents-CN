@@ -100,6 +100,17 @@ def recalc(filename, timeout=30):
     if not Path(filename).exists():
         return {"error": f"File {filename} does not exist"}
 
+    # BUG修复 (2026-07-28): 清理LibreOffice残留锁文件
+    # 问题: 上次recalc超时/崩溃 → 残留 .~lock.* 文件 → 下次打开失败
+    import glob
+    file_dir = os.path.dirname(os.path.abspath(filename))
+    for pattern in ['.~lock.*#', '.~lock.*', '~lock.*']:
+        for f in glob.glob(os.path.join(file_dir, pattern)):
+            try:
+                os.remove(f)
+            except:
+                pass
+
     abs_path = str(Path(filename).absolute())
 
     if not setup_libreoffice_macro():
@@ -120,6 +131,14 @@ def recalc(filename, timeout=30):
         cmd = ["gtimeout", str(timeout)] + cmd
 
     result = subprocess.run(cmd, capture_output=True, text=True, env=get_soffice_env())
+
+    # BUG修复 (2026-07-28): recalc后清理锁文件(无论成功/超时/失败)
+    for pattern in ['.~lock.*#', '.~lock.*', '~lock.*']:
+        for f in glob.glob(os.path.join(file_dir, pattern)):
+            try:
+                os.remove(f)
+            except:
+                pass
 
     if result.returncode != 0 and result.returncode != 124:  # 124 is timeout exit code
         error_msg = result.stderr or "Unknown error during recalculation"

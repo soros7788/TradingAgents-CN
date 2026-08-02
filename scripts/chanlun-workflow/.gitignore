@@ -1,0 +1,17 @@
+# LibreOffice锁文件
+.~lock.*
+~lock.*
+
+# Python缓存
+__pycache__/
+*.pyc
+
+# 备份文件
+*.bak.*
+*backup*
+trade-workbook-backup-*.xlsx
+
+# 临时文件
+*.tmp
+/data/user/work/
+

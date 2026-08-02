@@ -77,7 +77,7 @@ python daily_workflow.py holdings       # 持仓明细
 - 工作流目录: /workspace/.trae/skills/daily-trading-workflow/
 - 主脚本: daily_workflow.py (scan命令 = 扫描 + 写入候选池 + 重算)
 - 全市场扫描: full_scan.py (无bug版: 002代码生成修复 + 深市价格兜底 + 沪深均衡排序)
-- Excel: /workspace/动态仓位资金管理法则_执行版.xlsx
+- Excel: /workspace/TradingAgents-CN/scripts/chanlun-workflow/trade-workbook.xlsx
 - 背驰分析器: /workspace/chanlun-kline/beichi_analyzer.py
 - DL模型: /workspace/chanlun-kline/dl_model.pkl
 - 重算脚本: /data/user/builtin/work/eurydice/skills/xlsx/scripts/recalc.py

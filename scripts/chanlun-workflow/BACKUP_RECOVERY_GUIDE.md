@@ -19,7 +19,8 @@ TradingAgents-CN/
 │   ├── recalc.py                                   # Excel公式重算
 │   ├── dl_model.pkl                                # 深度学习模型 (MLP 128→64→32→16)
 │   ├── dl_scaler.pkl                               # DL模型StandardScaler
-│   ├── 动态仓位资金管理法则_执行版.xlsx              # 交易执行Excel (候选池+持仓+账户)
+│   ├── trade-workbook.xlsx                           # 交易执行Excel (候选池+持仓+账户)
+│   ├── 动态仓位资金管理法则_执行版.xlsx              # [已废弃] 中文名备份, 改用英文名
 │   ├── 周一计划_2026-07-27.md                       # 周一交易计划
 │   ├── WORKFLOW.md                                 # 工作流文档
 │   ├── beichi_analyzer.py.bak.20260726             # BUG修复前备份(5个版本)
