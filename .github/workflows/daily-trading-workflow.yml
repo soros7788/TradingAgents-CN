@@ -6,13 +6,10 @@ on:
     - cron: '0 2,3,5,6 * * 1-5'
     # 尾盘扫描: 交易日 14:30 → intraday (收盘前最后检查, 防止尾盘急跌漏检)
     - cron: '30 6 * * 1-5'
-    # 日线全市场扫描: 交易日 15:05 → scan (更新候选池日线信号)
+    # 日线全市场扫描 + 合规核查: 交易日 15:05 → scan_then_compliance
+    # scan成功后在同一job继续执行compliance
     - cron: '5 7 * * 1-5'
-    # 合规核查+心态日志: 交易日 15:30 → compliance (scan完成后自动触发)
-    # 【BUG修复 (2026-07-29)】scan→compliance联动: 改为workflow_run触发
-    # 旧方案: scan和compliance分别用两个cron, 但scan可能超时15分钟
-    #         → compliance在scan未完成时就启动 → 读到旧候选池数据
-    # 新方案: scan作为主任务, 完成后通过workflow_run自动触发compliance
+    # 合规核查兜底: 交易日 15:30 → compliance (独立fallback, 防scan_then_compliance超时)
     - cron: '30 7 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -25,13 +22,7 @@ on:
           - intraday
           - scan
           - compliance
-          - scan_then_compliance  # BUG修复(2026-07-29): 一键scan+compliance联动
-
-  # BUG修复 (2026-07-29): scan完成后自动触发compliance
-  workflow_run:
-    workflows: ["Daily Trading Workflow"]
-    types: [completed]
-    branches: [main, master]
+          - scan_then_compliance  # scan成功后自动执行compliance
 
 env:
   PYTHONPATH: ${{ github.workspace }}/scripts/chanlun-workflow
@@ -78,16 +69,12 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             SCHEDULE="${{ github.event.schedule }}"
             if [ "$SCHEDULE" = "5 7 * * 1-5" ]; then
-              CMD="scan"          # 15:05 收盘后日线全市场扫描 + 更新候选池
+              CMD="scan_then_compliance"  # 15:05 收盘后日线扫描 → 成功后继续compliance
             elif [ "$SCHEDULE" = "30 7 * * 1-5" ]; then
-              CMD="compliance"    # 15:30 合规核查
+              CMD="compliance"    # 15:30 合规核查兜底
             else
               CMD="intraday"      # 盘中30min扫描 + 持仓止损检查
             fi
-          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
-            # BUG修复 (2026-07-29): scan完成后自动触发compliance
-            # 只有scan任务完成后才触发compliance, 确保候选池已更新
-            CMD="compliance"
           else
             CMD="${{ github.event.inputs.command || 'intraday' }}"
           fi
