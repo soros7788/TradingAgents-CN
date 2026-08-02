@@ -2205,8 +2205,10 @@ def format_rebalance_summary(holdings, ts):
             forced_sell.append(r)
         else:
             keep.append(r)
-    keep = keep[:4]
-    sell_list = keep[4:] + forced_sell
+    # BUG修复 (2026-08-02): 旧代码先 keep=keep[:4] 再取 keep[4:]
+    #   导致 keep[4:] 恒为空, 排名第5+的非破位股票被静默丢弃 (既不在keep也不在sell_list)
+    #   修复: 先取 sell_list 再截断 keep
+    sell_list = keep[4:] + forced_sell  # 排名第5+ + 强制清仓
     keep = keep[:4]
 
     # === 3. 账户概览 ===
