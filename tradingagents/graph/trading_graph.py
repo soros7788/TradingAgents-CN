@@ -14,7 +14,10 @@ from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import Toolkit
 from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.agents.utils.memory import FinancialSituationMemory
+from tradingagents.agents.utils.memory import FinancialSituationMemory, ChromaDBManager
+
+# RAG 升级: 导入知识库检索器
+from tradingagents.knowledge import KnowledgeRetriever
 
 # 导入统一日志系统
 from tradingagents.utils.logging_init import get_logger
@@ -548,6 +551,24 @@ class TradingAgentsGraph:
             self.invest_judge_memory = None
             self.risk_manager_memory = None
 
+        # RAG 升级: 初始化外部知识库检索器
+        kb_enabled = os.getenv("EXTERNAL_KB_ENABLED", "true").lower() == "true"
+        if kb_enabled and memory_enabled:
+            try:
+                chroma_manager = ChromaDBManager()
+                self.knowledge_retriever = KnowledgeRetriever(
+                    chroma_manager=chroma_manager,
+                    config=self.config,
+                )
+                logger.info(f"📚 [RAG] 外部知识库检索器初始化完成")
+            except Exception as e:
+                logger.warning(f"⚠️ [RAG] 知识库检索器初始化失败, 使用空检索: {e}")
+                self.knowledge_retriever = None
+        else:
+            self.knowledge_retriever = None
+            if kb_enabled:
+                logger.info(f"📚 [RAG] 知识库已启用但memory未启用, 跳过检索器初始化")
+
         # Create tool nodes
         self.tool_nodes = self._create_tool_nodes()
 
@@ -574,6 +595,7 @@ class TradingAgentsGraph:
             self.conditional_logic,
             self.config,
             getattr(self, 'react_llm', None),
+            self.knowledge_retriever,
         )
 
         self.propagator = Propagator()

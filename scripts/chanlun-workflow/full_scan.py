@@ -10,7 +10,11 @@ sys.path.insert(0, _SCRIPT_DIR)
 from beichi_analyzer import analyze_beichi
 
 def _gen_sz_codes():
-    """生成深市全量代码: 000主板 + 002中小板 (不含3开头创业板)"""
+    """生成深市代码: 000主板 + 002中小板 (不含3开头创业板)
+
+    婴幼儿账户规模未达到买入300开头股票资格, 保持原有扫描范围
+    (2026-08-06): 回退创业板扫描范围
+    """
     main = [f"{i:06d}" for i in range(1, 1000)]       # 000001-000999
     smb  = [f"002{i:03d}" for i in range(1, 1000)]    # 002001-002999
     return main + smb
@@ -18,7 +22,7 @@ def _gen_sz_codes():
 def fetch_sha_list():
     stocks = []
     for page in range(1, 40):
-        url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={page}&num=50&sort=code&asc=0&node=hs_a&_s_r_a=page"
+        url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={page}&num=50&sort=code&asc=1&node=sh_a&_s_r_a=page"
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -113,6 +117,29 @@ def scan_one(code, name, price):
                 "ratio": ratio, "dlp": dlp, "valid": valid,
                 "confirmed": confirmed, "near": near, "score": score,
             }
+    # 【Fix B: 多级别tier覆盖】2026-08-08
+    # 使用detect_multilevel_buy_signals获取V5分层(30min一买准入)
+    # 覆盖daily-only的简单tier分配
+    try:
+        from beichi_analyzer import detect_multilevel_buy_signals
+        ml = detect_multilevel_buy_signals(code, price=close)
+        if ml.get("tier") and ml["tier"] != "无信号":
+            if best is None:
+                best = {
+                    "code": code, "name": name, "price": close or price,
+                    "ratio": 999, "dlp": 0, "valid": False,
+                    "confirmed": False, "near": True, "score": 10,
+                }
+            best["tier"] = ml["tier"]
+            best["30min_dl_p"] = ml.get("30min_dl_p", 0)  # 近零,仅供参考
+            best["30min_ep_p"] = ml.get("30min_ep_p", 0)  # 有效信号
+            best["30min_first_buy_valid"] = ml.get("min30_first_buy_valid", False)
+            best["ermai"] = ml.get("ermai") is not None
+            best["sanmai"] = ml.get("sanmai") is not None
+            # 【5.5复核修复: 提取single_stock_cap用于仓位联动】
+            best["single_stock_cap"] = ml.get("single_stock_cap", 0.35)
+    except:
+        pass
     return best
 
 def calc_funding(price, total_asset, cash):
@@ -174,14 +201,16 @@ def full_scan(total_asset=20326.12, cash=7847.12, silent=False):
         print(f"完成: {len(all_stocks)}只, 耗时{elapsed:.0f}秒")
 
     # ============================================================
-    # 分层候选池 (2026-07-26)
-    # 问题: DL_P跨0.8阈值的标的每天进出候选池, 无法用于调仓
-    # 方案: 按DL_P+ratio分3层, 不同层不同稳定性
-    #   核心池: DL_P>0.90 + ratio<20% → 1-2周稳定, 调仓首选
-    #   观察池: DL_P 0.85-0.90       → 3-5天稳定, 核心池不足时补充
-    #   边缘池: DL_P 0.80-0.85       → 每天变动, 仅观察不买入
+    # 分层候选池 (V5, 2026-08-08)
+    # 使用detect_multilevel_buy_signals的tier分层(30min一买准入)
+    # 回退: 无多级别tier时使用daily DL_P
     # ============================================================
     def assign_tier(stock):
+        # 优先使用多级别tier
+        if stock.get("tier"):
+            tier_map = {"核心池": "核心", "观察池": "观察", "边缘池": "边缘"}
+            return tier_map.get(stock["tier"], "边缘")
+        # 回退到daily DL_P
         dlp = stock["dlp"]
         ratio = stock["ratio"]
         if dlp > 0.90 and ratio < 20:
@@ -201,6 +230,60 @@ def full_scan(total_asset=20326.12, cash=7847.12, silent=False):
     if not silent:
         print(f"分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只")
 
+    # ============================================================
+    # BUG诊断 (2026-08-06): 全市场无DL_P>0.8时自动核查
+    # 规则: 全市场~2860只股票如果一只DL_P>0.8都没有, 极大概率是bug
+    # 诊断流程:
+    #   1. 检查数据源是否正常(沪A/深市列表是否为空)
+    #   2. 检查beichi_analyzer是否全部报错(failed == total_scanned)
+    #   3. 抽样验证: 取5只股票重新analyze, 确认分析器工作正常
+    #   4. 输出诊断报告, 不阻断扫描流程
+    # ============================================================
+    scan_diagnostics = {}
+    if confirmed == 0 and len(all_stocks) > 100:
+        diagnostics = []
+        # 诊断1: 数据源检查
+        if not sha:
+            diagnostics.append("🔴 沪A数据源为空(fetch_sha_list返回0只), 新浪API可能挂了")
+        if not sza:
+            diagnostics.append("🔴 深市数据源为空(fetch_sza_prices返回0只), 新浪API可能挂了")
+        # 诊断2: 全部失败检查
+        if failed == len(all_stocks):
+            diagnostics.append(f"🔴 全部{len(all_stocks)}只分析失败(failed={failed}), beichi_analyzer可能全局报错")
+        elif scanned > 0:
+            diagnostics.append(f"🟡 分析成功{scanned}只但确认0只, 市场极弱或阈值过严")
+        # 诊断3: 抽样验证
+        sample_checks = []
+        test_codes = [("600519", "贵州茅台"), ("000001", "平安银行"), ("600036", "招商银行")]
+        for test_code, test_name in test_codes:
+            try:
+                r = analyze_beichi(test_code, level="日线")
+                if "error" in r:
+                    sample_checks.append(f"  ❌ {test_name}({test_code}): analyze_beichi返回error={r['error']}")
+                else:
+                    sigs = r.get("signals", [])
+                    dlp_max = max([s.get("dl_prob", 0) for s in sigs], default=0)
+                    close = r["C"][-1] if r.get("C") else "N/A"
+                    sample_checks.append(f"  ✓ {test_name}({test_code}): 收盘价{close}, 最高DL_P={dlp_max:.2f}, 信号{len(sigs)}条")
+            except Exception as e:
+                sample_checks.append(f"  ❌ {test_name}({test_code}): 异常={e}")
+        diagnostics.append("抽样验证(3只权重股):\n" + "\n".join(sample_checks))
+        # 输出诊断报告
+        diag_report = "\n".join(diagnostics)
+        if not silent:
+            print(f"\n{'='*50}")
+            print(f"⚠️ BUG诊断: 全市场无DL_P>0.8信号 ({len(all_stocks)}只扫描, 0确认)")
+            print(f"{'='*50}")
+            print(diag_report)
+            print(f"{'='*50}")
+        scan_diagnostics = {
+            "triggered": True,
+            "report": diag_report,
+            "checks": diagnostics,
+        }
+    else:
+        scan_diagnostics = {"triggered": False, "report": "", "checks": []}
+
     return {
         "total_scanned": len(all_stocks),
         "success": scanned,
@@ -214,6 +297,7 @@ def full_scan(total_asset=20326.12, cash=7847.12, silent=False):
         "core": core,
         "watch": watch,
         "edge": edge,
+        "scan_diagnostics": scan_diagnostics,
     }
 
 

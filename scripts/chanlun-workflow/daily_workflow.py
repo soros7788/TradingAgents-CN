@@ -297,15 +297,25 @@ def _verify_cached_values():
         return False
 
 def get_today_holdings():
-    """读取持仓表, 按代码去重(取最后一次出现的行)
+    """读取持仓表, 按代码去重(取最后一次出现的行), 与交易记录交叉验证
 
     BUG修复 (2026-07-26): 万华已清仓仍显示持有
     根因: 持仓表存在多日重复录入, 旧行(100股)和新行(0股)共存
     修复: 以代码为key, 后出现的行覆盖先出现的行
+
+    BUG修复 (2026-08-03): 同一股票不同代码导致重复持仓
+    根因: 东风股份同时存在600006(旧)和601515(新)两条记录
+    修复: 按名称二次去重, 保留最新(最后出现)的代码和行数据
+
+    BUG修复 (2026-08-05): Telegram推送虚假持仓(松芝/贵绳/日上)
+    根因: 持仓表存有过期数据(卖出后未删除), 无交易记录交叉验证
+    修复: 读取交易记录"卖出"操作, 已全卖出的股票自动过滤
     """
     wb = safe_load_wb(data_only=True)
     ws = wb['持仓表']
     code_map = {}  # 按代码去重, 取最后一行
+    row_order = {}  # 记录每个代码首次出现的行号顺序
+    row_idx = 0
     for r in range(2, ws.max_row + 1):
         name = ws.cell(row=r, column=2).value
         if not name:
@@ -327,8 +337,149 @@ def get_today_holdings():
             "stop": stop, "action": action, "profit": profit, "pos": pos,
             "t1_lock": t1_lock
         }
+        if code not in row_order:
+            row_order[code] = row_idx
+            row_idx += 1
+    # 按代码去重后, 再按名称二次去重 (防止同一股票不同代码)
+    name_map = {}
+    for c, h in code_map.items():
+        n = h['name']
+        if n in name_map:
+            # 同名股票: 保留后出现的行 (row_order更大 = 更新)
+            if row_order.get(c, 0) > row_order.get(name_map[n]['code'], 0):
+                name_map[n] = h
+        else:
+            name_map[n] = h
     # 过滤掉0股的(已清仓)
-    holdings = [h for h in code_map.values() if h.get('shares') and h['shares'] > 0]
+    holdings = [h for h in name_map.values() if h.get('shares') and h['shares'] > 0]
+
+    # ============================================================
+    # BUG修复 (2026-08-05): 交易记录交叉验证
+    # 问题: 持仓表松芝/贵绳/日上等已卖出, 但表内未更新(仍有股数 > 0)
+    #       → get_today_holdings返回虚假持仓 → Telegram推送错误
+    # 修复: 读取交易记录中的"卖出"操作, 已全卖出的股票自动过滤
+    # ============================================================
+    try:
+        ws_trade = wb['交易记录']
+        sold_stocks = {}  # name -> {"total_sold": 股数, "last_sold_date": str}
+        for r in range(2, ws_trade.max_row + 1):
+            t_name = ws_trade.cell(row=r, column=2).value
+            t_action = ws_trade.cell(row=r, column=4).value
+            t_shares = ws_trade.cell(row=r, column=7).value  # BUG修复(2026-08-07): column=5是信号类型, column=7才是成交股数
+            t_date = ws_trade.cell(row=r, column=1).value
+            if t_name and t_action and '卖出' in str(t_action):
+                shares_val = 0
+                try:
+                    shares_val = int(t_shares) if t_shares else 0
+                except (ValueError, TypeError):
+                    try:
+                        shares_val = float(t_shares) if t_shares else 0
+                    except:
+                        shares_val = 0
+                if t_name not in sold_stocks:
+                    sold_stocks[t_name] = {"total_sold": 0, "last_date": ""}
+                sold_stocks[t_name]["total_sold"] += shares_val
+                if t_date:
+                    sold_stocks[t_name]["last_date"] = str(t_date)
+
+        # 对每只持仓, 检查是否在交易记录中有明确卖出操作
+        filtered = []
+        for h in holdings:
+            name = h['name']
+            shares = h.get('shares', 0) or 0
+            entry = h.get('entry', 0) or 0
+            close = h.get('close', 0) or 0
+
+            # 合理性检查1: 交易记录中该股票卖出总量 >= 持仓量 → 已清仓
+            if name in sold_stocks:
+                total_sold = sold_stocks[name]["total_sold"]
+                if total_sold >= shares and shares > 0:
+                    print(f"  [验证] {name} 交易记录已卖出{total_sold}股 >= 持仓{shares}股, 自动过滤")
+                    continue
+
+            # 合理性检查2: 价格/成本不合理的过滤
+            if entry > 0 and close > 0:
+                # 成本价异常(>100元)但现价<10元 → 可能数据错误
+                if entry > 100 and close < 10:
+                    print(f"  [验证] {name} 成本{entry:.2f}异常 > 现价{close:.2f}*10, 自动过滤")
+                    continue
+                # 现价和成本差价>50倍 → 可能数据错误
+                if close / entry > 50 or entry / close > 50:
+                    print(f"  [验证] {name} 成本{entry:.2f}与现价{close:.2f}差价>50倍, 自动过滤")
+                    continue
+
+            filtered.append(h)
+
+        holdings = filtered
+
+        # ============================================================
+        # BUG修复 (2026-08-07): 交易记录买入未录入持仓表检测
+        # 问题: 证通电子8/3买入300股在交易记录中, 但持仓表无此记录
+        #       → get_today_holdings返回的持仓遗漏实际持仓
+        #       → 合规检查无法检查未录入的持仓
+        # 修复: 扫描交易记录中所有"买入"操作, 检查是否在持仓表中
+        # ============================================================
+        held_names = {h['name'] for h in holdings}
+        buy_stocks = {}  # name -> {"shares": 股数, "code": 代码, "price": 价格}
+        for r in range(2, ws_trade.max_row + 1):
+            t_name = ws_trade.cell(row=r, column=2).value
+            t_action = ws_trade.cell(row=r, column=4).value
+            t_shares = ws_trade.cell(row=r, column=7).value  # Col7=成交股数
+            t_code = ws_trade.cell(row=r, column=3).value
+            t_price = ws_trade.cell(row=r, column=6).value     # Col6=成交价格
+            if t_name and t_action and '买入' in str(t_action) and '违规' not in str(t_action):
+                shares_val = 0
+                try:
+                    shares_val = int(t_shares) if t_shares else 0
+                except (ValueError, TypeError):
+                    try:
+                        shares_val = float(t_shares) if t_shares else 0
+                    except:
+                        shares_val = 0
+                if t_name not in buy_stocks:
+                    buy_stocks[t_name] = {"shares": 0, "code": str(t_code or ""), "price": t_price or 0}
+                buy_stocks[t_name]["shares"] += shares_val
+
+        # 检查: 交易记录有买入但持仓表无此股票
+        for name, info in buy_stocks.items():
+            if name not in held_names:
+                # 排除已卖出的
+                sold_total = sold_stocks.get(name, {}).get("total_sold", 0)
+                if sold_total < info["shares"]:
+                    remaining = info["shares"] - sold_total
+                    print(f"  ⚠️ [数据校验] {name}({info['code']}) 交易记录买入{info['shares']}股"
+                          f"但持仓表无记录(可能剩余{remaining}股未录入), 请手动更新持仓表")
+
+        # 检查: 持仓表有记录但交易记录无买入(旧数据残留)
+        buy_names = set(buy_stocks.keys())
+        for h in holdings:
+            if h['name'] not in buy_names:
+                print(f"  ⚠️ [数据校验] {h['name']}({h['code']}) 持仓表有记录"
+                      f"但交易记录无买入操作(可能为旧数据残留)")
+
+    except Exception as e:
+        print(f"  [验证] 交易记录交叉验证失败: {e}")
+
+    # ============================================================
+    # BUG修复 (2026-08-07): 持仓表数据完整性校验
+    # 问题: 持仓表Row3-5(皇氏/沃华/东风)缺失市值/盈亏/占比等计算列
+    #       → 合规检查使用None值 → 仓位/盈亏计算静默失败
+    # 修复: 对每条持仓校验关键字段, 缺失时打印告警
+    # ============================================================
+    for h in holdings:
+        missing_fields = []
+        if not h.get('close') or h['close'] == 0:
+            missing_fields.append("当前价")
+        if not h.get('entry') or h['entry'] == 0:
+            missing_fields.append("成本价")
+        if not h.get('stop'):
+            missing_fields.append("止损价")
+        if not h.get('pos'):
+            missing_fields.append("持仓占比")
+        if missing_fields:
+            print(f"  ⚠️ [数据校验] {h['name']}({h['code']}) 缺失字段: {', '.join(missing_fields)}"
+                  f" → 合规检查可能失效, 请更新持仓表")
+
     return holdings
 
 def get_account_summary():
@@ -338,11 +489,22 @@ def get_account_summary():
     for r in range(2, ws.max_row + 1):
         if ws.cell(row=r, column=1).value:
             latest_row = r
+
+    total_asset = ws.cell(row=latest_row, column=2).value or 0
+    cash = ws.cell(row=latest_row, column=3).value or 0
+    position_ratio = ws.cell(row=latest_row, column=5).value
+    # BUG修复 (2026-08-07): 公式列在data_only=True时返回None
+    # 当position_ratio为None时, 用total_asset和cash手动计算
+    if position_ratio is None and total_asset > 0:
+        market_value = total_asset - cash
+        position_ratio = market_value / total_asset
+        print(f"  [数据补全] position_ratio公式列为None, 手动计算: {market_value}/{total_asset} = {position_ratio:.1%}")
+
     return {
         "date": ws.cell(row=latest_row, column=1).value,
-        "total_asset": ws.cell(row=latest_row, column=2).value,
-        "cash": ws.cell(row=latest_row, column=3).value,
-        "position_ratio": ws.cell(row=latest_row, column=5).value,
+        "total_asset": total_asset,
+        "cash": cash,
+        "position_ratio": position_ratio,
         "stage": ws.cell(row=latest_row, column=33).value,
         "monthly_target": ws.cell(row=latest_row, column=28).value,
         "deviation": ws.cell(row=latest_row, column=31).value,
@@ -352,23 +514,24 @@ def get_account_summary():
 
 def get_dynamic_position_cap(code, cost, close):
     """
-    动态仓位上限计算 V3 (2026-07-26): 多级别DL_P共振
+    动态仓位上限计算 V4 (2026-08-08): 多级别EP_L+几何确认
 
-    替代单级别二买/三买检测, 用DL_P+Ratio+valid+多级别共振
+    替代单级别二买/三买检测, 用EP_L+几何判定+多级别共振
     解决: 一买DL_P变动导致核心池不稳定 + ratio/级别本身有bug
+    【重要: DL模型30min/5min失效, 改用EP_L和几何判定】
 
     多级别共振机制:
       一买建仓: 35% (基础上限)
-      二买加仓: 50% (日线一买valid + 30min+5min DL_P确认)
-      三买加仓: 60% (日线趋势up + 30min+5min 双趋势背驰)
+      二买加仓: 50% (日线一买valid + 30minEP_L/几何确认)
+      三买加仓: 60% (日线趋势up + 30minEP_L/几何确认)
 
-    候选池分层(核心池不再因一买DL_P每天变动而改变):
-      核心池: 日线DL_P>=0.6 + 30min DL_P>=0.6 (双趋势背驰, 1-2周稳定)
-      观察池: 日线DL_P>=0.6 + 30min DL_P>=0.4 (3-5天稳定)
-      边缘池: 日线DL_P>=0.4 (每天变动, 仅观察)
+    候选池分层(V5.2, 2026-08-08):
+      核心池: 30min综合评分(EP_L为主)>=0.50 + 日线不在主跌段
+      观察池: 30min综合评分(EP_L为主)>=0.35 + 日线不在主跌段
+      边缘池: 30min综合评分(EP_L为主)>=0.20
 
     条件闭环:
-      1. 买点升级: 多级别DL_P共振确认
+      1. 买点升级: 多级别EP_L+几何确认
       2. 浮盈护垫: 浮盈>=5%才允许加仓
     """
     global dynamic_cap_info
@@ -1045,6 +1208,115 @@ def check_compliance():
                     f"⚠️ {h['name']}仓位{pos_fmt}>35%静态上限 (无法计算动态上限, 缺少成本/现价)"
                 )
 
+    # ============================================================
+    # BUG修复 (2026-08-06): 合规检查模块缺失三项关键检查
+    # 问题: check_compliance() 输出"持仓合规, 无告警"但东风股份不在候选池内
+    #       且DL_P=0.08, 属于严重违规未被检测到
+    # 根因: compliance模块缺少:
+    #   1. 有效持仓数量检查(婴儿账户≤3只)
+    #   2. 候选池+DL_P阈值检查(持仓股是否在候选池内, DL_P≥0.8)
+    #   3. P0状态检查(执行清单中P0标记是否已执行)
+    # 修复: 增加以上三项检查
+    # ============================================================
+
+    # === 缺失检查1: 有效持仓数量检查 (婴儿账户) ===
+    INFANT_MAX_HOLD = 3
+    non_waived = [h for h in holdings if h.get('waived') != '是']
+    if len(non_waived) > INFANT_MAX_HOLD:
+        issues.append(
+            f"🔴 有效持仓{len(non_waived)}只超限(婴儿账户上限{INFANT_MAX_HOLD}只, "
+            f"资产<5万阶段): " + ", ".join([f"{h['name']}({h['code']})" for h in non_waived])
+        )
+    else:
+        print(f"  ✓ 有效持仓{len(non_waived)}只 <= 婴儿账户上限{INFANT_MAX_HOLD}只")
+
+    # === 缺失检查2: 候选池+DL_P阈值检查 ===
+    try:
+        wb_pool = safe_load_wb(data_only=True)
+        pool_codes = set()
+        pool_dlp = {}  # code -> dl_p
+        pool_tier = {}  # code -> tier
+        if '候选池' in wb_pool.sheetnames:
+            ws_pool = wb_pool['候选池']
+            for r in range(2, ws_pool.max_row + 1):
+                code = ws_pool.cell(row=r, column=3).value
+                tier = ws_pool.cell(row=r, column=11).value  # K列=分层Tier
+                dlp = ws_pool.cell(row=r, column=8).value  # H列=DL_P
+                if code:
+                    code_s = str(code)
+                    pool_codes.add(code_s)
+                    if dlp:
+                        try:
+                            pool_dlp[code_s] = float(dlp)
+                        except:
+                            pass
+                    if tier:
+                        pool_tier[code_s] = str(tier)
+
+        for h in holdings:
+            code = str(h['code'])
+            name = h['name']
+            close = h.get('close', 0) or 0
+            entry = h.get('entry', 0) or 0
+            waived = h.get('waived') == '是'
+
+            # 检查1: 是否在候选池内
+            if code in pool_codes:
+                tier_info = pool_tier.get(code, "未知")
+                dlp_info = pool_dlp.get(code, 0)
+                print(f"  ✓ {name}({code}) 在候选池内 [Tier={tier_info} DL_P={dlp_info:.2f}]")
+            elif not waived:
+                # 非WAIVED且不在候选池 → 违规
+                dlp_val = pool_dlp.get(code, 0)
+                issues.append(
+                    f"🔴 {name}({code}) 不在候选池内(DL_P={dlp_val:.2f}<0.8), "
+                    f"持仓逻辑失效, 应清仓或减仓至观察仓位"
+                )
+
+            # 检查2: DL_P阈值(持仓端)
+            dlp = pool_dlp.get(code, 0)
+            if dlp > 0 and dlp < 0.8 and not waived:
+                if close > 0 and entry > 0 and close < entry:
+                    # DL_P<0.8且亏损态 → RiskWatch
+                    issues.append(
+                        f"🟠 {name}({code}) DL_P={dlp:.2f}<0.8且亏损(成本{entry:.2f}>现价{close:.2f}), "
+                        f"触发RiskWatch, 建议减仓"
+                    )
+                elif dlp < 0.5:
+                    # DL_P<0.5极弱信号 → 强制清仓建议
+                    issues.append(
+                        f"🔴 {name}({code}) DL_P={dlp:.2f}<0.5信号极弱, "
+                        f"建议强制清仓(去弱留强)"
+                    )
+
+        wb_pool.close()
+    except Exception as e:
+        print(f"  候选池检查异常: {e}")
+
+    # === 缺失检查3: P0状态检查 ===
+    try:
+        wb_p0 = safe_load_wb(data_only=True)
+        if '执行清单' in wb_p0.sheetnames:
+            ws_exec = wb_p0['执行清单']
+            p0_pending = []
+            for r in range(2, ws_exec.max_row + 1):
+                note = str(ws_exec.cell(row=r, column=15).value or "")
+                action = str(ws_exec.cell(row=r, column=4).value or "")
+                stock_name = ws_exec.cell(row=r, column=2).value or ""
+                stock_code = ws_exec.cell(row=r, column=3).value or ""
+                if 'P0' in note or 'P0' in action:
+                    p0_pending.append(f"{stock_name}({stock_code}): {note}")
+
+            if p0_pending:
+                for p0_item in p0_pending:
+                    issues.append(f"🔴 P0待执行: {p0_item}")
+                print(f"  ⚠️ P0待执行项: {len(p0_pending)}条")
+            else:
+                print(f"  ✓ 无P0待执行项")
+        wb_p0.close()
+    except Exception as e:
+        print(f"  P0状态检查异常: {e}")
+
     # 输出合规摘要
     print(f"\n账户总资产: ¥{account.get('total_asset', 0):.2f}" if account.get('total_asset') else "账户总资产: N/A")
     print(f"现金: ¥{account.get('cash', 0):.2f}" if account.get('cash') else "现金: N/A")
@@ -1098,6 +1370,21 @@ def run_full_scan():
         cash=account["cash"] or 7847.12,
         silent=False,
     )
+
+    # ============================================================
+    # BUG诊断 (2026-08-06): 全市场无DL_P>0.8时自动核查
+    # 规则: 全市场无DL_P>0.8信号 → 极大概率是bug → 自动诊断
+    # 诊断已由full_scan()内部完成, 此处检查结果并触发告警
+    # ============================================================
+    scan_diag = result.get("scan_diagnostics", {})
+    if scan_diag.get("triggered"):
+        print(f"\n{'='*50}")
+        print("⚠️ ⚠️ ⚠️  全市场扫描异常  ⚠️ ⚠️ ⚠️")
+        print(f"{'='*50}")
+        print(scan_diag.get("report", "未知诊断结果"))
+        print(f"{'='*50}")
+        print("→ 候选池将保留昨日数据, 等待修复后重新扫描")
+        print(f"{'='*50}\n")
 
     # 排除持仓股(已持有的不再推荐为新候选)
     # BUG修复 (2026-07-30): 旧代码排除持仓股后, 沃华/贵绳不在候选池
@@ -1788,7 +2075,9 @@ def run_intraday_scan():
         tier = dynamic_cap_info.get("tier", "边缘池")
         d_dp = dynamic_cap_info.get("daily_dl_p", 0)
         m30_dp = dynamic_cap_info.get("30min_dl_p", 0)
+        m30_ep = dynamic_cap_info.get("30min_ep_p", 0)
         m5_dp = dynamic_cap_info.get("5min_dl_p", 0)
+        m5_ep = dynamic_cap_info.get("5min_ep_p", 0)
 
         if entry_level in ("二买", "三买") and pnl_pct >= 0.05:
             # P1 (2026-08-02): 中阴状态拦截 — NotChasing不加仓
@@ -1805,7 +2094,7 @@ def run_intraday_scan():
                 remaining = dynamic_cap - (h.get('pos', 0) or 0)
                 print(f"    ★ {h['name']}({code}) {entry_level}信号 [{tier}] → 动态上限{dynamic_cap:.0%} "
                       f"当前仓位{h.get('pos',0):.1%} 浮盈{pnl_pct:.1%} 可加仓空间{remaining:.1%}")
-                print(f"      DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
+                print(f"      DL_P: 日线={d_dp:.2f} | EP_L: 30min={m30_ep:.2f} 5min={m5_ep:.2f} (30minDL_P={m30_dp:.2f}模型失效,以EP_L为准)")
                 # P3 (2026-08-02): 显示综合置信度
                 conf = dynamic_cap_info.get("daily_confidence", 0)
                 if conf > 0:
@@ -1822,7 +2111,7 @@ def run_intraday_scan():
                     print(f"      ℹ️ 一买低点未检测到")
         else:
             print(f"    · {h['name']}({code}) [{tier}] 上限{dynamic_cap:.0%} "
-                  f"DL_P: 日线={d_dp:.2f} 30min={m30_dp:.2f} 5min={m5_dp:.2f}")
+                  f"DL_P: 日线={d_dp:.2f} | EP_L: 30min={m30_ep:.2f} 5min={m5_ep:.2f}")
 
     if not add_signals:
         print(f"    无多级别共振信号, 所有持仓维持35%静态上限")
@@ -1946,7 +2235,8 @@ def send_telegram(text, title=""):
             print(title)
         print(text)
         print("=" * 40)
-        raise RuntimeError(msg)
+        print("[TG] 继续执行, 不中断工作流")
+        return
 
     # 转义<>为全角字符 (不使用parse_mode, 纯文本模式)
     # 注意: 不替换& — 不用parse_mode时&不需要HTML转义, 替换会导致显示&amp;
@@ -2175,6 +2465,14 @@ def format_rebalance_summary(holdings, ts):
         dist_to_obl = None
         if obl and obl > 0 and close > 0:
             dist_to_obl = (close - obl) / obl
+        # BUG修复 (2026-08-03): one_buy_low=None时保守兜底
+        # 问题: detect_multilevel_buy_signal可能无法计算一买低点(中枢数据缺失等)
+        #       → dist_to_obl保持None → 风险惩罚完全跳过
+        #       → 东风股份DL=0.08也能保留
+        # 修复: 无法获取一买低点时, 保守假设为高风险(dit_to_obl=0)
+        elif close > 0:
+            # 无中枢数据可计算一买低点, 保守标记为高风险
+            dist_to_obl = 0.0
         # 新权重: DL_P 0.7 + 30min EP 0.2 + 5min EP 0.1
         score = dl_p * 0.7 + m30_ep * 0.2 + m5_ep * 0.1
 
@@ -2243,12 +2541,17 @@ def format_rebalance_summary(holdings, ts):
     #       如果持仓只有4只, 破位的也会在前4
     #
     # 修复: 破一买低点的股票无条件进入sell_list, 不受前4保护
+    # BUG修复 (2026-08-03): DL_P<0.5强制清仓, 不受前4保护
+    # 问题: 东风股份DL_P=0.08评分0.056, 但无one_buy_low数据
+    #       → 不触发破位强制卖出 → 排名进前4→被保留→继续亏损
+    # 修复: DL_P<0.5视为信号强度极弱, 直接强制卖出
     keep = []
     forced_sell = []
     for r in ranked:
         dist = r.get("dist_to_obl")
-        if dist is not None and dist < 0:
-            # 已破一买低点 → 强制卖出
+        dl_p = r.get("dl_p", 0)
+        if (dist is not None and dist < 0) or dl_p < 0.5:
+            # 已破一买低点 或 DL_P<0.5(信号极弱) → 强制卖出
             forced_sell.append(r)
         else:
             keep.append(r)
@@ -2949,15 +3252,102 @@ def format_weekly_review_summary(data, ts):
     return '\n'.join(lines)
 
 
+def clean_excel():
+    """清理Excel中的空行、重复行和已卖出持仓
+
+    BUG修复 (2026-08-05): 持仓表存有过期数据(松芝/贵绳/日上已卖出但未删除)
+    修复: 读取交易记录中的"卖出"操作, 已全卖出的股票从持仓表删除
+    """
+    try:
+        from openpyxl import load_workbook
+        wb = safe_load_wb()
+        total_empty = 0
+        total_dup = 0
+        total_sold = 0
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            # 删除空行(前5列全空)
+            empty = 0
+            for r in range(ws.max_row, 1, -1):
+                vals = [ws.cell(row=r, column=c).value for c in range(1, 6)]
+                if all(v is None for v in vals):
+                    ws.delete_rows(r, 1)
+                    empty += 1
+            total_empty += empty
+            # 删除重复行(按关键列去重, 保留最后一条)
+            seen = {}
+            dup_rows = []
+            dup = 0
+            key_cols = [2, 3]  # 名称+代码
+            for r in range(2, ws.max_row + 1):
+                key = tuple(ws.cell(row=r, column=c).value for c in key_cols)
+                if key and key != (None, None):
+                    if key in seen:
+                        dup_rows.append(r)
+                        dup += 1
+                    else:
+                        seen[key] = r
+            # BUG修复: 实际删除重复行, 旧代码只计数不删除
+            for r in sorted(dup_rows, reverse=True):
+                ws.delete_rows(r, 1)
+            total_dup += dup
+
+        # ============================================================
+        # BUG修复 (2026-08-05): 持仓表已卖出股票清理
+        # 问题: 松芝/贵绳/日上已卖出, 但持仓表仍有股数>0的行
+        #       导致get_today_holdings返回虚假持仓
+        # 修复: 读取交易记录, 已全卖出的股票从持仓表删除
+        # ============================================================
+        if '交易记录' in wb.sheetnames and '持仓表' in wb.sheetnames:
+            ws_trade = wb['交易记录']
+            ws_hold = wb['持仓表']
+
+            # 计算每只股票在交易记录中的总卖出量
+            sold_stocks = {}
+            for r in range(2, ws_trade.max_row + 1):
+                t_name = ws_trade.cell(row=r, column=2).value
+                t_action = ws_trade.cell(row=r, column=4).value
+                t_shares = ws_trade.cell(row=r, column=5).value
+                if t_name and t_action and '卖出' in str(t_action):
+                    try:
+                        sv = int(t_shares) if t_shares else 0
+                    except:
+                        sv = 0
+                    if t_name not in sold_stocks:
+                        sold_stocks[t_name] = 0
+                    sold_stocks[t_name] += sv
+
+            # 删除已全卖出的股票行
+            for r in range(ws_hold.max_row, 1, -1):
+                h_name = ws_hold.cell(row=r, column=2).value
+                h_shares = ws_hold.cell(row=r, column=7).value
+                if h_name and h_name in sold_stocks:
+                    try:
+                        hs = int(h_shares) if h_shares else 0
+                    except:
+                        hs = 0
+                    if hs > 0 and sold_stocks[h_name] >= hs:
+                        ws_hold.delete_rows(r, 1)
+                        total_sold += 1
+                        print(f"  [清理] 删除已卖出持仓: {h_name}")
+
+        safe_save_wb(wb)
+        print(f"  [清理] 空行={total_empty}, 重复={total_dup}, 已卖出={total_sold}")
+        return total_empty > 0 or total_dup > 0 or total_sold > 0
+    except Exception as e:
+        print(f"  [清理] 失败: {e}")
+        return False
+
 def main():
     if len(sys.argv) < 2:
-        print("用法: daily_workflow.py [compliance|scan|intraday|account|holdings|weekly]")
+        print("用法: daily_workflow.py [compliance|scan|intraday|account|holdings|weekly|clean]")
         return
     cmd = sys.argv[1]
     ts = datetime.now().strftime('%m-%d %H:%M')
 
     try:
         if cmd == "compliance":
+            clean_excel()
             account, holdings, issues = check_compliance()
             # Telegram推送改为去弱留强格式 (2026-07-29)
             # 旧: format_compliance_summary → 只推送合规告警
@@ -2965,6 +3355,7 @@ def main():
             msg = format_rebalance_summary(holdings, ts)
             send_telegram(msg)
         elif cmd == "scan":
+            clean_excel()
             scan_data = run_full_scan()
             msg = format_scan_summary(scan_data, ts)
             send_telegram(msg)
@@ -2986,6 +3377,9 @@ def main():
             review_data = run_weekly_review()
             msg = format_weekly_review_summary(review_data, ts)
             send_telegram(msg)
+        elif cmd == "clean":
+            clean_excel()
+            print("✅ Excel修复完成")
         else:
             print(f"未知命令: {cmd}")
     except Exception as e:

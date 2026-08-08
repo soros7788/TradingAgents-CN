@@ -7,7 +7,7 @@ from tradingagents.agents.utils.instrument_utils import build_instrument_context
 logger = get_logger("default")
 
 
-def create_research_manager(llm, memory):
+def create_research_manager(llm, memory, knowledge_retriever=None):
     def research_manager_node(state) -> dict:
         ticker = state["company_of_interest"]
         instrument_context = build_instrument_context(ticker)
@@ -32,6 +32,17 @@ def create_research_manager(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
+        # RAG 升级: 检索外部知识库
+        kb_context_str = ""
+        if knowledge_retriever is not None:
+            try:
+                kb_results = knowledge_retriever.retrieve_for_agent(
+                    query=curr_situation, agent_role="research_manager"
+                )
+                kb_context_str = knowledge_retriever.format_context(kb_results)
+            except Exception as e:
+                logger.warning(f"⚠️ [RAG] research_manager 知识检索失败: {e}")
+
         prompt = f"""作为投资组合经理和辩论主持人，您的职责是批判性地评估这轮辩论并做出明确决策：支持看跌分析师、看涨分析师，或者仅在基于所提出论点有强有力理由时选择持有。
 
 简洁地总结双方的关键观点，重点关注最有说服力的证据或推理。您的建议——买入、卖出或持有——必须明确且可操作。避免仅仅因为双方都有有效观点就默认选择持有；要基于辩论中最强有力的论点做出承诺。
@@ -54,6 +65,7 @@ def create_research_manager(llm, memory):
 
 以下是您对错误的过去反思：
 \"{past_memory_str}\"
+{kb_context_str}
 
 标的约束：
 {instrument_context}

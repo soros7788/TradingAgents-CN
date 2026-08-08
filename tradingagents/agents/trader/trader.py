@@ -8,7 +8,7 @@ from tradingagents.agents.utils.instrument_utils import build_instrument_context
 logger = get_logger("default")
 
 
-def create_trader(llm, memory):
+def create_trader(llm, memory, knowledge_retriever=None):
     def trader_node(state, name):
         company_name = state["company_of_interest"]
         instrument_context = build_instrument_context(company_name)
@@ -49,6 +49,17 @@ def create_trader(llm, memory):
             logger.warning(f"⚠️ [DEBUG] memory为None，跳过历史记忆检索")
             past_memories = []
             past_memory_str = "暂无历史记忆数据可参考。"
+
+        # RAG 升级: 检索外部知识库
+        kb_context_str = ""
+        if knowledge_retriever is not None:
+            try:
+                kb_results = knowledge_retriever.retrieve_for_agent(
+                    query=curr_situation, agent_role="trader"
+                )
+                kb_context_str = knowledge_retriever.format_context(kb_results)
+            except Exception as e:
+                logger.warning(f"⚠️ [RAG] trader 知识检索失败: {e}")
 
         context = {
             "role": "user",
@@ -95,7 +106,8 @@ def create_trader(llm, memory):
 
 请用中文撰写分析内容，并始终以'最终交易建议: **买入/持有/卖出**'结束您的回应以确认您的建议。
 
-请不要忘记利用过去决策的经验教训来避免重复错误。以下是类似情况下的交易反思和经验教训: {past_memory_str}""",
+请不要忘记利用过去决策的经验教训来避免重复错误。以下是类似情况下的交易反思和经验教训: {past_memory_str}
+{kb_context_str}""",
             },
             context,
         ]

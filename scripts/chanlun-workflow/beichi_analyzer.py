@@ -38,6 +38,9 @@ except ImportError:
     print("[依赖] scikit-learn==1.7.2 安装完成")
     import sklearn
 
+import pandas as pd
+from third_buy_sell_judge import evaluate_third_buy_sell
+
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
@@ -611,15 +614,112 @@ def _market_prefix(code):
         return "sz"
 
 
+def fetch_kline_eastmoney(code, scale="240", datalen=120):
+    """东方财富K线API回退 (2026-08-07)
+    当新浪API返回空数据时, 使用东方财富作为备用数据源
+    scale映射: 240=日线(101), 30=30min(4), 5=5min(2), 1=1min(1)
+    """
+    code = str(code)
+    secid_prefix = "1" if code.startswith("6") else "0"
+    secid = f"{secid_prefix}.{code}"
+
+    # scale → klt映射
+    klt_map = {"240": "101", "30": "4", "5": "2", "1": "1"}
+    klt = klt_map.get(str(scale), "101")
+
+    url = (f"http://push2his.eastmoney.com/api/qt/stock/kline/get?"
+           f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6"
+           f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+           f"&klt={klt}&fqt=1&beg=0&end=20500101&lmt={datalen}")
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "http://quote.eastmoney.com/"
+    })
+    try:
+        raw = urllib.request.urlopen(req, timeout=15).read()
+    except Exception:
+        return []
+    resp = json.loads(raw.decode('utf-8', errors='replace'))
+
+    klines = resp.get("data", {}).get("klines", [])
+    if not klines:
+        return []
+
+    # 东方财富格式: "datetime,open,close,high,low,volume,amount"
+    # 新浪格式: {"day": "...", "open": "...", "high": "...", "low": "...", "close": "...", "volume": ...}
+    result = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        dt_str = parts[0]
+        # 日线格式: "2026-08-06", 分钟线格式: "2026-08-06 11:00"
+        if ' ' not in dt_str and klt != "101":
+            dt_str = dt_str + " 00:00"
+        elif ' ' in dt_str and len(dt_str) == 16:
+            dt_str = dt_str + ":00"
+
+        result.append({
+            "day": dt_str,
+            "open": parts[1],
+            "high": parts[3],
+            "low": parts[4],
+            "close": parts[2],
+            "volume": float(parts[5]) if parts[5] else 0,
+        })
+
+    return result
+
+
+def fetch_kline_tdx_cache(code, scale="240", datalen=120):
+    """TDX MCP缓存读取 (2026-08-07)
+    第三层数据源: 当新浪和东方财富均无数据时, 读取TDX预取缓存
+    缓存路径: /data/user/work/tdx_cache/{code}_{scale}.json
+    数据由MCP工具 tdx_kline 预取并写入, 格式与新浪兼容
+    """
+    cache_dir = "/data/user/work/tdx_cache"
+    cache_file = os.path.join(cache_dir, f"{code}_{scale}.json")
+    try:
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r') as f:
+                cached = json.load(f)
+            # 检查缓存时间: 超过6小时的日线缓存视为过期, 分钟线2小时过期
+            import time as _time
+            cache_age = _time.time() - cached.get("_ts", 0)
+            max_age = 3600 * 6 if scale == "240" else 3600 * 2
+            if cache_age > max_age:
+                return []
+            data = cached.get("data", [])
+            if data:
+                return data[-datalen:]  # 只返回需要的数量
+    except Exception:
+        pass
+    return []
+
+
 def fetch_kline_sina(code, scale="240", datalen=120):
-    """从新浪获取K线数据"""
+    """从新浪获取K线数据, 无数据时自动回退东方财富→TDX缓存 (2026-08-07)"""
     prefix = _market_prefix(code)
     url = (f"https://money.finance.sina.com.cn/quotes_service/api/"
            f"json_v2.php/CN_MarketData.getKLineData?symbol={prefix}{code}"
            f"&scale={scale}&ma=no&datalen={datalen}")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    raw = urllib.request.urlopen(req, context=ctx, timeout=15).read()
-    return json.loads(raw.decode('utf-8', errors='replace'))
+    try:
+        raw = urllib.request.urlopen(req, context=ctx, timeout=15).read()
+        data = json.loads(raw.decode('utf-8', errors='replace'))
+    except Exception:
+        data = []
+
+    # 回退1: 新浪返回空数据时, 使用东方财富API
+    if not data:
+        data = fetch_kline_eastmoney(code, scale, datalen)
+
+    # 回退2: 东方财富也无数据时, 使用TDX缓存
+    if not data:
+        data = fetch_kline_tdx_cache(code, scale, datalen)
+
+    return data
 
 
 def fetch_realtime_tencent(code):
@@ -652,7 +752,17 @@ def build_1min_from_5min(code):
     if not k5 or not timeline:
         return None
 
-    today_k5 = [k for k in k5 if k['day'].startswith('2026-07-14')]
+    # 从5min K线数据中提取最新交易日日期 (修复硬编码2026-07-14)
+    today_str = ""
+    for k in reversed(k5):
+        d = k.get('day', '')
+        if d and ' ' not in d:
+            today_str = d
+            break
+    if not today_str:
+        today_str = k5[-1]['day'] if k5 else ""
+
+    today_k5 = [k for k in k5 if k['day'].startswith(today_str[:10])]
     if not today_k5:
         today_k5 = k5[-48:]
 
@@ -665,7 +775,7 @@ def build_1min_from_5min(code):
     result = []
     for k in today_k5:
         time_str = k['day']
-        dp = time_str[:10] if ' ' in time_str else '2026-07-14'
+        dp = time_str[:10] if ' ' in time_str else today_str[:10]
         tp = time_str[11:16] if ' ' in time_str else time_str
         if not tp:
             continue
@@ -996,8 +1106,14 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                 post_high = max(C[post_s:post_e + 1])
                 price_new_extreme = post_high > pre_high
 
+            # 【BUG修复 (2026-08-04)】price_new_extreme硬过滤导致DL_P=0
+            # 问题: 价格未创新低(二买/类二买) → 直接降级为"无背驰"
+            #       日线信号dl_prob=0.93被硬杀死, 下游get_signal_summary过滤后DL_P=0
+            # 修复: 改为软惩罚 — 趋势背驰降级为盘整背驰, 不直接杀死
+            # 保留盘整背驰级别的信号, 让DL模型做主
             if not price_new_extreme and sig_type != "无背驰":
-                sig_type = "无背驰"
+                if sig_type == "趋势背驰":
+                    sig_type = "盘整背驰"  # 降一级, 保留信号
 
             # 【BUG-1修复 (2026-07-26)】趋势背驰 vs 盘整背驰校正
             #
@@ -1052,7 +1168,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                 "post_dir": post_d,
                 "pre_ok": pre_ok,
                 "post_ok": post_ok,
-                "valid": pre_ok and post_ok and aligned,  # 修复: 必须aligned
+                "valid": (pre_ok and post_ok and aligned) or dl_prob >= 0.6,  # 【BUG修复】DL模型高置信度(>=0.6)软豁免硬编码条件
                 "aligned": aligned,
                 "overall_dir": overall_dir,
                 "has_downtrend": has_downtrend,  # BUG-1: 下跌趋势标记
@@ -1463,42 +1579,206 @@ def compute_confidence_score(signal):
 
 
 # ============================================================
-# 多级别二买/三买信号检测 V3 (2026-07-26)
-#
-# 替代缠论"次级别同构性", 用DL_P+Ratio+valid+多级别共振
-#
-# 缠论原文BUG:
-#   1. ratio本身有bug(曾硬编码50/40, 现已修复为真实MACD面积比)
-#   2. 次级别同构性定义模糊, 难以精确编码
-#   3. 级别递归关系(1min→5min→30min→日线)在实际数据中不稳定
-#
-# V3.1方案 (用户确认的分层标准):
-#   二买 = 日线一买valid + 30min DL_P>=0.6 + 5min DL_P>=0.4
-#   三买 = 日线趋势up + 30min DL_P>=0.6 + 5min DL_P>=0.6
-#
-# 候选池分层 (30min DL_P>=0.6作为统一的"次级别确认"):
-#   核心池: 日线DL_P>0.90 + ratio<20% + valid + 30min DL_P>=0.6
-#           (1-2周稳定, 调仓首选)
-#   观察池: 日线DL_P 0.85-0.90 + valid + 30min DL_P>=0.6
-#           (3-5天稳定, 核心池不足时补充)
-#   边缘池: 日线DL_P 0.80-0.85 + valid + 30min DL_P>=0.6
-#           (每天变动, 仅观察不买入)
-#
-# 稳定性原理:
-#   旧方案: DL_P>0.8硬阈值 → 0.79和0.81本质相同但一个入池一个出池
-#   新方案: 30min DL_P>=0.6作为锚 → 30min中枢变化慢(每周1-2次)
-#           日线DL_P在0.80-0.90区间波动不会跨分层边界(0.85/0.90)
+# Second/Third buy/sell 几何判定函数 (2026-08-08)
+# 集成自 Gemini 笔记本，用于替代 EP_L 概率判定
+# 独立于 pandas，仅需基础数值判断
 # ============================================================
 
-def detect_multilevel_buy_signals(code, price=None):
+def evaluate_second_buy_sell(
+    first_point_price: float,
+    rebound_high: float,
+    pullback_low: float,
+    center: dict = None,
+    signal_type: str = "second_buy",
+    tick_size: float = 0.01,
+    # 【Fix边界2: 次级别假突破过滤】2026-08-08
+    # 集成 min_width>=5 和 min_amp>=0.08 硬性校验
+    # 确保次级别回撤段构成结构完备的次级别中枢
+    pullback_klines: int = 0,          # 回撤段K线数量
+    pullback_amp_pct: float = 0.0,    # 回撤段振幅百分比
+    min_width: int = 5,                # 最小K线数量要求
+    min_amp: float = 0.08,             # 最小振幅百分比要求
+) -> dict:
     """
-    多级别二买/三买信号检测 V3.1
+    第二类买卖点严格几何判定（简化版，无需DataFrame）。
 
-    替代缠论"次级别同构性", 用DL_P+Ratio+valid+多级别共振
+    参数
+    ----
+    first_point_price : float
+        一买低点(L1buy) 或 一卖高点(H1sell)
+    rebound_high : float
+        一买后反弹段最高价(H1rebound)
+    pullback_low : float
+        回踩段最低价(L2buy)
+    center : dict, optional
+        中枢区间 {zg, zd}，用于检测二三买重叠
+    signal_type : str
+        'second_buy' 或 'second_sell'
+    tick_size : float
+        最小价格变动单位，默认0.01
+    pullback_klines : int
+        回撤段K线数量，用于min_width校验
+    pullback_amp_pct : float
+        回撤段振幅百分比，用于min_amp校验
+    min_width : int
+        最小K线数量要求（默认5），防止杂波误识别
+    min_amp : float
+        最小振幅百分比要求（默认0.08），防止平盘假突破
+
+    返回
+    ----
+    dict : {
+        'is_confirmed': bool,
+        'status': str,
+        'invalid_boundary': float | None,
+        'optimal_buy_min': float | None,
+        'optimal_buy_max': float | None,
+        'cushion': float,
+        'cushion_ratio': float,
+        'reason': str
+    }
+    """
+    result = {
+        'is_confirmed': False,
+        'status': 'UNKNOWN',
+        'invalid_boundary': None,
+        'optimal_buy_min': None,
+        'optimal_buy_max': None,
+        'cushion': 0.0,
+        'cushion_ratio': 0.0,
+        'reason': '',
+    }
+
+    if signal_type == 'second_buy':
+        l1 = first_point_price
+        h1 = rebound_high
+        l2 = pullback_low
+        cushion = round(l2 - l1, 4)
+
+        # 【Fix边界2: 次级别假突破过滤】2026-08-08
+        # min_width>=5: 回撤段至少5根K线，排除杂波
+        # min_amp>=0.08: 回撤段振幅至少0.08%，排除平盘
+        sub_level_ok = True
+        if pullback_klines > 0 and pullback_klines < min_width:
+            sub_level_ok = False
+            result['status'] = 'REJECTED_SUB_LEVEL_WIDTH'
+            result['reason'] = (
+                f"二买拒绝(次级别宽度不足): 回撤段{pullback_klines}根K线 < "
+                f"min_width={min_width}, 次级别结构未完备"
+            )
+        if pullback_amp_pct > 0 and pullback_amp_pct < min_amp:
+            sub_level_ok = False
+            result['status'] = 'REJECTED_SUB_LEVEL_AMP'
+            result['reason'] = (
+                f"二买拒绝(次级别振幅不足): 振幅{pullback_amp_pct:.4f}% < "
+                f"min_amp={min_amp}%, 平盘假突破风险"
+            )
+
+        if not sub_level_ok:
+            return result
+
+        if l2 > l1:
+            result['is_confirmed'] = True
+            result['invalid_boundary'] = l1
+            result['optimal_buy_min'] = round(l1 * 1.005, 4)
+            if h1 > l1:
+                result['optimal_buy_max'] = round(l1 + (h1 - l1) * 0.382, 4)
+            else:
+                result['optimal_buy_max'] = round(l1 + tick_size, 4)
+            result['cushion'] = cushion
+            result['cushion_ratio'] = round(cushion / l1, 4) if l1 != 0 else 0.0
+
+            # 二三买重叠检测
+            if center and l2 > center.get('zg', 9e9):
+                result['status'] = 'CONFIRMED_SECOND_THIRD_BUY_OVERLAP'
+                result['reason'] = (
+                    f"二买确认(二三买重叠): L2buy({l2:.2f})>L1buy({l1:.2f}) "
+                    f"且突破ZG({center['zg']:.2f}), 缓冲垫={cushion:.2f}"
+                )
+            else:
+                result['status'] = 'CONFIRMED_SECOND_BUY'
+                result['reason'] = (
+                    f"二买几何确认: L2buy({l2:.2f})>L1buy({l1:.2f}) "
+                    f"缓冲垫={cushion:.2f} 黄金区间"
+                    f"[{result['optimal_buy_min']:.2f},{result['optimal_buy_max']:.2f}]"
+                )
+        else:
+            result['status'] = 'REJECTED_NEW_LOW_FAILED'
+            result['invalid_boundary'] = l1
+            result['reason'] = (
+                f"二买失败: L2buy({l2:.2f})<=L1buy({l1:.2f}), "
+                f"跌破一买低点, 下行趋势延续"
+            )
+
+    elif signal_type == 'second_sell':
+        h1 = first_point_price
+        l1_pullback = rebound_high  # 一卖后回踩段最低价
+        h2 = pullback_low           # 反弹段最高价
+        cushion = round(h1 - h2, 4)
+
+        if h2 < h1:
+            result['is_confirmed'] = True
+            result['invalid_boundary'] = h1
+            result['optimal_sell_min'] = round(h1 - (h1 - l1_pullback) * 0.382, 4)
+            result['optimal_sell_max'] = round(h1 - tick_size, 4)
+            result['cushion'] = cushion
+            result['cushion_ratio'] = round(cushion / h1, 4) if h1 != 0 else 0.0
+            result['status'] = 'CONFIRMED_SECOND_SELL'
+            result['reason'] = (
+                f"二卖确认: H2sell({h2:.2f})<H1sell({h1:.2f}), "
+                f"缓冲垫={cushion:.2f}"
+            )
+        else:
+            result['status'] = 'REJECTED_NEW_HIGH_FAILED'
+            result['invalid_boundary'] = h1
+            result['reason'] = (
+                f"二卖失败: H2sell({h2:.2f})>=H1sell({h1:.2f}), "
+                f"突破一卖高点, 上行趋势延续"
+            )
+
+    return result
+
+
+# ============================================================
+# 多级别二买/三买信号检测 V5.2 (2026-08-08)
+#
+# 替代缠论"次级别同构性", 用几何判定+多级别共振
+#
+# 【重要: DL模型局限】DL_P模型基于日线特征训练, 对30min/5min数据
+#   预测值始终趋近于0(0.00-0.05), 无法用于次级别信号判定.
+#   30min/5min级别的信号判定, 实际依赖:
+#   - EP_L(反转概率): 有效检测趋势反转
+#   - 几何判定: 二买/三买的严格几何确认
+#   - 趋势方向回退: 无背驰信号时, 趋势方向up视为反转确认
+#   - 长期方案: 需重训DL模型时加入30min级别训练数据
+#
+# BUG修复 (2026-08-08):
+#   Fix A: 中阴状态机 — 一买确认后锁定L1buy, 切换状态, 屏蔽价格新低检查
+#   Fix B: 级别错配 — 核心池准入从日线一买切换为30min一买确认
+#   Fix C: EP_L缺陷 — 二买确认从EP_L概率改为几何判定(L2buy>L1buy)
+#   Fix D: DL模型30min失效 — 次级别评分改用EP_L为主, DL_P*10为辅
+#
+# 候选池分层 (V5.2, 2026-08-08):
+#   核心池: 30min一买确认 + 30min综合评分(EP_L为主)>=0.50 + 日线不在主跌段
+#   观察池: 30min一买确认 + 30min综合评分(EP_L为主)>=0.35 + 日线不在主跌段
+#   边缘池: 30min一买确认 + 30min综合评分(EP_L为主)>=0.20
+# ============================================================
+
+def detect_multilevel_buy_signals(code, price=None, zhongyin_day_count=0):
+    """
+    多级别二买/三买信号检测 V5.2 (2026-08-08)
+
+    替代缠论"次级别同构性", 用几何判定+EP_L+多级别共振
+
+    【重要: DL模型局限】
+    DL_P模型基于日线特征训练, 对30min/5min数据预测值趋近于0.
+    30min/5min信号判定实际依赖EP_L(反转概率)和几何判定.
+    返回的30min_dl_p/5min_dl_p仅供参考, 不应作为决策依据.
 
     参数:
         code: 股票代码
         price: 当前价格(可选, None则用最新收盘价)
+        zhongyin_day_count: 中阴状态持续天数(外部传入, 用于僵尸态超时检测)
 
     返回: {
         "code": code,
@@ -1506,9 +1786,12 @@ def detect_multilevel_buy_signals(code, price=None):
         "ermai": 二买信号 dict or None,
         "sanmai": 三买信号 dict or None,
         "daily_dl_p": 日线最佳一买DL_P,
+        "daily_ep_p": 日线最佳一买EP_L,
         "daily_valid": 日线一买是否valid,
-        "30min_dl_p": 30min最佳看多DL_P,
-        "5min_dl_p": 5min最佳看多DL_P,
+        "30min_dl_p": 30min最佳看多DL_P(近零,仅供参考),
+        "30min_ep_p": 30min最佳看多EP_L(有效信号),
+        "5min_dl_p": 5min最佳看多DL_P(近零,仅供参考),
+        "5min_ep_p": 5min最佳看多EP_L(有效信号),
         "daily_dir": 日线趋势方向,
         "daily_ratio": 日线一买ratio,
         "levels_available": 可用级别列表,
@@ -1542,6 +1825,38 @@ def detect_multilevel_buy_signals(code, price=None):
     daily_valid = daily_best is not None and daily_best.get("valid", False)
 
     # ============================================================
+    # 【Fix A: 中阴状态机】2026-08-08
+    #
+    # 问题: 一买需要价格新低+底背驰, 二买需要回调>一买低点
+    #       当一买确认后, daily_valid因新低条件失效 → 二买前提崩塌
+    #
+    # 修复: 一买确认后进入中阴状态, 锁定L1buy价格和方向快照
+    #       在中阴状态下, 二买检测不再依赖daily_valid
+    #       退出条件: 价格跌破L1buy → 一买失效, 回到DOWN状态
+    #
+    # 状态迁移:
+    #   DOWN: 寻找一买, 允许价格新低
+    #   ZHONGYIN: 锁定L1buy, 屏蔽价格新低检查, 等待二买确认或破位
+    #   SECOND_BUY_CONFIRMED: 二买几何确认, 进入上升段
+    #   DOWN (回退): 价格跌破L1buy, 一买失效
+    # ============================================================
+    daily_dir_snapshot = daily_dir  # 一买确认时的方向快照
+    daily_price = daily.get("price", 0)
+    daily_C = daily.get("C", [])
+    last_close = daily_C[-1] if daily_C else daily_price
+
+    # 中阴状态初始化
+    zhongyin_active = False       # 中阴状态是否激活
+    one_buy_broken = False        # 是否已跌破一买低点
+    zhongyin_state = "DOWN"       # 状态机: DOWN / ZHONGYIN / SECOND_BUY_CONFIRMED
+
+    # 激活条件: 日线一买valid + 30min趋势已反转(进入中阴)
+    min30_dir_raw = min30.get("overall_dir", "flat")
+    if daily_valid and min30_dir_raw in ("up", "flat"):
+        zhongyin_active = True
+        zhongyin_state = "ZHONGYIN"
+
+    # ============================================================
     # BUG修复 (2026-07-30): 提取一买低点用于加仓风控
     #
     # 问题: 二买加仓后, 若二买无法确认且价格破一买低点 → 重仓大幅回撤
@@ -1569,6 +1884,43 @@ def detect_multilevel_buy_signals(code, price=None):
             if 0 <= s_idx <= e_idx < len(C_daily):
                 daily_one_buy_low = min(C_daily[s_idx:e_idx + 1])
 
+    # 中阴状态: 检查是否破位 (价格跌破一买低点 → 一买失效)
+    if daily_one_buy_low and daily_one_buy_low > 0 and last_close < daily_one_buy_low:
+        one_buy_broken = True
+        zhongyin_state = "DOWN"
+
+    # 【5.5复核修复: 内部计算zhongyin_day_count】
+    # 当调用方未传递zhongyin_day_count时(默认0), 从daily_C推算
+    # 方法: 找到一买低点在daily_C中的位置, 计算至今的K线数
+    if zhongyin_day_count == 0 and daily_one_buy_low and daily_one_buy_low > 0:
+        if len(daily_C) >= 5:
+            # 从后往前找, 找到第一个 <= L1buy 的收盘价位置
+            for i in range(len(daily_C) - 1, -1, -1):
+                if daily_C[i] <= daily_one_buy_low:
+                    zhongyin_day_count = len(daily_C) - i - 1
+                    break
+
+    # ============================================================
+    # 【Fix边界1: 中阴僵尸态】2026-08-08
+    #
+    # 问题: 价格在锁定L1buy后进入超长期窄幅横盘, 不破L1buy也不产生二买
+    #       系统陷入"中阴僵尸态", 资金被无效占用 → 机会成本极高
+    #
+    # 修复:
+    #   1. zhongyin_timeout: 中阴持续>=20交易日 → 强制降低priority
+    #   2. 僵尸态标记: zhongyin_stale=True, 不影响其他股票扫描
+    #   3. 恢复机制: 三买出现时自动恢复priority (外部调用方检查)
+    # ============================================================
+    zhongyin_timeout = False
+    zhongyin_stale = False
+    ZHONGYIN_DAYS_MAX = 20  # 最大中阴持续天数
+    if zhongyin_state == "ZHONGYIN" and zhongyin_day_count >= ZHONGYIN_DAYS_MAX:
+        zhongyin_timeout = True
+        zhongyin_stale = True
+        # 僵尸态: 降级eligible, 但不阻断破位检测
+        if not one_buy_broken:
+            zhongyin_active = False  # 临时冻结, 等待三买恢复
+
     # 30min信号(看多+看空)
     min30_signals = min30.get("signals", [])
     min30_buys = [s for s in min30_signals if s.get("dir") == "看多"]
@@ -1584,6 +1936,22 @@ def detect_multilevel_buy_signals(code, price=None):
     min30_best_ep = max(min30_buys, key=lambda s: s.get("ep_prob", 0), default=None)   # 二买侧重
     min30_dl_p = min30_best_dl.get("dl_prob", 0) if min30_best_dl else 0
     min30_ep_p = min30_best_ep.get("ep_prob", 0) if min30_best_ep else 0
+
+    # 【BUG修复 2026-08-07】趋势反转回退: 30min无背驰信号但趋势已反转
+    #
+    # 问题: 背驰信号要求pre段和post段同方向(down→down或up→up)
+    #       当趋势已反转(down→up)时, pre_d≠post_d, 不会产生新的背驰信号
+    #       → min30_ep_p=0 → 二买条件2永远无法满足
+    #
+    # 修复: 当30min无看多信号但整体趋势已向上(overall_dir=up)时,
+    #       认为反转已通过趋势方向确认, 赋予EP_L=0.6
+    min30_reversal_by_trend = False
+    if min30_ep_p == 0 and min30_dl_p == 0:
+        min30_dir_raw = min30.get("overall_dir", "flat")
+        if min30_dir_raw == "up":
+            min30_ep_p = 0.6
+            min30_reversal_by_trend = True
+
     min30_sells = [s for s in min30_signals if s.get("dir") == "看空"]
     min30_sell_count = len(min30_sells)
     min30_best_sell = max(min30_sells, key=lambda s: s.get("dl_prob", 0), default=None)
@@ -1597,6 +1965,15 @@ def detect_multilevel_buy_signals(code, price=None):
     min5_best_ep = max(min5_buys, key=lambda s: s.get("ep_prob", 0), default=None)   # 二买侧重
     min5_dl_p = min5_best_dl.get("dl_prob", 0) if min5_best_dl else 0
     min5_ep_p = min5_best_ep.get("ep_prob", 0) if min5_best_ep else 0
+
+    # 【BUG修复 2026-08-07】同30min, 5min趋势反转回退
+    min5_reversal_by_trend = False
+    if min5_ep_p == 0 and min5_dl_p == 0:
+        min5_dir_raw = min5.get("overall_dir", "flat")
+        if min5_dir_raw == "up":
+            min5_ep_p = 0.4  # 5min入场确认: 趋势反转
+            min5_reversal_by_trend = True
+
     min5_sells = [s for s in min5_signals if s.get("dir") == "看空"]
     min5_sell_count = len(min5_sells)
 
@@ -1605,92 +1982,358 @@ def detect_multilevel_buy_signals(code, price=None):
     trend_conflict = (daily_dir != "flat" and min30_dir != "flat" and daily_dir != min30_dir)
 
     # ============================================================
-    # 候选池分层 (V3.1 用户确认标准)
-    # 前提: 日线一买valid + 30min DL_P>=0.6 (次级别确认)
-    # 分层: 日线DL_P区间 + 核心池额外要求ratio<20%
+    # 【Fix B + Fix D: 候选池分层 V5.2】2026-08-08
+    # 准入: 30min一买确认 + EP_L/几何确认
+    # 注意: DL模型对30min数据失效, 分层评分改用EP_L为主
+    # 日线降级为过滤因子: 不在主跌段
     # ============================================================
-    tier = "无信号"
-    if daily_valid and min30_dl_p >= 0.6:
-        if daily_dl_p > 0.90 and daily_ratio < 20:
-            tier = "核心池"
-        elif daily_dl_p >= 0.85:
-            tier = "观察池"
-        elif daily_dl_p >= 0.80:
-            tier = "边缘池"
+    # 30min一买确认: 存在valid的一买信号
+    min30_first_buy_valid = any(
+        s.get("op") == "一买" and s.get("valid")
+        for s in min30_signals
+    )
+    # ============================================================
+    # 【Fix边界3修复: 日线过滤从硬拦截改为软过滤】2026-08-08
+    #
+    # 原问题: daily_dir != "down" 硬拦截当前市场73%的股票
+    #   + MACD+MA20硬拦截剩余27% → 候选池几乎为空
+    #
+    # 修复策略:
+    #   1. daily_dir=="down"时: 30min信号足够强(EP_L>=0.3)可豁免
+    #   2. MACD+MA20降级为风险标记, 不作硬拦截
+    #   3. 保留daily_filter_warning供分层降级参考
+    # ============================================================
+    daily_filter_ok = True
+    daily_filter_warning = False
+
+    if daily_dir == "down":
+        # 日线向下: 需要30min信号足够强才能豁免
+        # 【Mini复核修复: 增加min30_reversal_by_trend豁免】
+        #   沃华医药: daily_dir=down, 30min dir=up(趋势反转), EP_L=0.600
+        #   之前因为min30_first_buy_valid=False被拦截
+        m30_exempt = min30_first_buy_valid or min30_reversal_by_trend or min30_ep_p >= 0.3
+        if m30_exempt and (min30_ep_p >= 0.3 or min30_dl_p >= 0.10):
+            daily_filter_ok = True
+            daily_filter_warning = True  # 标记高风险, 不拦截
+        else:
+            daily_filter_ok = False
+            # 日线向下且30min信号弱 → 硬拦截(主跌段中继风险高)
+
+    # MACD+MA20降级为辅助标记, 不硬拦截
+    if daily_filter_ok and len(daily_C) >= 20:
+        daily_ma20 = _calc_ma(daily_C, 20)
+        daily_last_close = daily_C[-1]
+        try:
+            _, _, macd_bar = calc_macd(daily_C)
+            if len(macd_bar) >= 2:
+                macd_slope_down = macd_bar[-1] < macd_bar[-2] and macd_bar[-1] < 0
+            else:
+                macd_slope_down = False
+        except Exception:
+            macd_slope_down = False
+        if daily_last_close < daily_ma20 and macd_slope_down:
+            daily_filter_warning = True  # 仅标记风险, 不拦截
 
     # ============================================================
-    # 二买: V4 (2026-07-27) EP_L反转确认
+    # 【Fix B修复 + Fix D: 30min分层阈值调整】2026-08-08
     #
-    # 设计思想 (用户确认):
-    #   一买区间 = DL_P背驰概率 → "有没有背驰结构"
-    #   二买区间 = EP_L反转概率 → "背驰后是否真在反转"
-    #   二买 = 一买确认(日线DL_P) + 30min反转确认(EP_L>=0.5)
-    #         + 5min入场确认(EP_L>=0.3 或 DL_P>=0.4)
+    # 原问题: DL模型基于日线特征训练, 对30min数据预测值极低(0.00-0.05)
+    #   DL_P阈值0.6/0.8对30min信号永远无法达到
     #
-    # EP_L核心价值:
-    #   DL_P高+EP_L低 = 背驰存在但反转没发生 → 不做二买
-    #   DL_P高+EP_L高 = 背驰存在且反转在推进 → 确认二买
+    # 修复: 使用EP_L(反转概率)作为30min主要指标
+    #   EP_L模型对30min数据更有效(万科A EP_L=0.618)
+    #   DL_P降级为辅助参考, 阈值降低10倍
+    #
+    # 【Fix D: DL模型30min失效 — 根本原因】
+    #   DL_P模型训练时仅使用日线级别特征(MA5/MA10/MA20/MACD日线),
+    #   对30min K线数据提取的特征分布完全不同, 模型无法泛化.
+    #   30min趋势背驰确实存在, 但DL模型检测不到.
+    #   真正有效的30min信号来源:
+    #     1. EP_L(反转概率): 正确检测趋势反转
+    #     2. 几何判定: 二买/三买严格几何确认(L2buy>L1buy等)
+    #     3. 趋势方向回退: overall_dir=up视为反转确认
+    #   长期方案: 重训DL模型时加入30min/5min级别训练数据,
+    #     或独立训练次级别背驰模型, 彻底解决此问题.
+    # ============================================================
+    # 30min准入条件: 一买valid 或 趋势反转已确认(整体方向up) 或 EP_L足够强
+    #   min30_reversal_by_trend: 30min无看多信号但整体趋势已向上
+    #   沃华医药: 30min dir=up, EP_L=0.600(趋势反转), 但无valid一买
+    #   万科A: 30min一买valid, EP_L=0.618
+    # 【Mini复核修复: 增加min30_ep_p>=0.3准入, 覆盖EP_L>0但无信号标记的情况】
+    min30_eligible_for_tier = min30_first_buy_valid or min30_reversal_by_trend or min30_ep_p >= 0.3
+
+    # 30min综合评分: EP_L为主(模型适配30min), DL_P*10为辅(补偿日线模型偏差)
+    #   注意: DL_P*10是临时补偿, 长期需重训模型
+    min30_score = max(min30_ep_p, min30_dl_p * 10.0)
+
+    tier = "无信号"
+    if min30_eligible_for_tier and min30_score >= 0.20 and daily_filter_ok:
+        if min30_score >= 0.50 and not daily_filter_warning:
+            tier = "核心池"
+        elif min30_score >= 0.35:
+            tier = "观察池"
+        elif min30_score >= 0.20:
+            tier = "边缘池"
+    # 备选: 日线DL_P极高(>=0.90)但30min无信号 → 边缘池
+    # 台华新材: 日线DL_P=0.969, 30min无信号但整体趋势有结构
+    if tier == "无信号" and daily_dl_p >= 0.90 and daily_valid:
+        tier = "边缘池"
+
+    # ============================================================
+    # 【Fix C + Fix A: 二买 V5】2026-08-08
+    #
+    # 几何判定(L2buy>L1buy)为必要条件, EP_L降级为辅助排序
+    # 中阴状态机: 一买确认后不依赖daily_valid, 直接使用几何判定
     # ============================================================
     ermai = None
-    if daily_valid and min30_ep_p >= 0.5:
-        # 30min EP_L确认反转在发生
-        # 5min: EP_L>=0.3(反转继续) 或 DL_P>=0.4(仍有背驰结构)
-        if min5_ep_p >= 0.3 or min5_dl_p >= 0.4:
-            # 综合评分: 日线DL_P + 30min EP_L + 5min EP_L
-            avg_ep_p = (daily_ep_p + min30_ep_p + min5_ep_p) / 3
-            # 权重调整 (2026-07-29): DL_P更具特征代表性, 权重从0.5提升到0.7
-            # 依据: EP_L单独使用会误判(东风-35%但EP_L=0.42排第3, 松芝DL_P=0.68但EP_L=0.65排第1)
-            #       DL_P准确识别背驰结构, 是"有没有"的判断; EP_L是"在不在反转"的验证
-            #       去弱留强以DL_P为主, EP_L仅作加仓时的反转确认
-            #       二买确认强度 = 日线DL_P权重0.7 + 30min EP_L权重0.2 + 5min EP_L权重0.1
-            ermai_dl_prob = daily_dl_p * 0.7 + min30_ep_p * 0.2 + min5_ep_p * 0.1
+
+    # 二买候选人: 中阴状态(一买确认+趋势反转) 或 日线一买valid
+    ermai_eligible = zhongyin_active and not one_buy_broken
+    if not ermai_eligible and daily_valid:
+        ermai_eligible = True
+
+    if ermai_eligible and daily_one_buy_low and daily_one_buy_low > 0:
+        # 提取几何数据
+        L1 = daily_one_buy_low
+
+        # L2buy: 30min近期最低价(回调段低点)
+        min30_C = min30.get("C", [])
+        min30_price = min30.get("price", 0)
+        L2 = min(min30_C[-20:]) if len(min30_C) >= 20 else min30_price
+
+        # H1rebound: 30min近40根K线最高价(反弹段高点)
+        H1 = max(min30_C[-40:]) if len(min30_C) >= 40 else 0
+
+        # 【Fix边界2: 次级别假突破过滤】计算回撤段K线数量和振幅
+        # 5.5复核修复: 使用实际回撤段长度(从H1位置到当前), 而非固定20窗口
+        pullback_klines = 0
+        pullback_amp_pct = 0.0
+        if len(min30_C) >= 5:
+            # 计算实际回撤段: 从H1(反弹高点)位置到当前
+            lookback = min(40, len(min30_C))
+            recent_40 = min30_C[-lookback:]
+            h1_val = max(recent_40)
+            try:
+                h1_offset = recent_40.index(h1_val)
+                h1_idx = len(min30_C) - lookback + h1_offset
+                pullback_segment = min30_C[h1_idx:]
+                pullback_klines = len(pullback_segment)
+                pullback_high = max(pullback_segment)
+                pullback_low_val = min(pullback_segment)
+            except (ValueError, IndexError):
+                # 回退: 使用最后20根K线
+                pullback_segment = min30_C[-20:]
+                pullback_klines = len(pullback_segment)
+                pullback_high = max(pullback_segment)
+                pullback_low_val = min(pullback_segment)
+            if pullback_low_val > 0:
+                pullback_amp_pct = (pullback_high - pullback_low_val) / pullback_low_val * 100
+
+        # 几何判定(含次级别完备性校验)
+        geo_result = evaluate_second_buy_sell(
+            first_point_price=L1,
+            rebound_high=H1,
+            pullback_low=L2,
+            signal_type="second_buy",
+            pullback_klines=pullback_klines,
+            pullback_amp_pct=pullback_amp_pct,
+            min_width=5,
+            min_amp=0.08,
+        )
+        geometric_pass = geo_result["is_confirmed"]
+
+        # 5min入场确认
+        entry_ok = min5_ep_p >= 0.3 or min5_dl_p >= 0.4 or min5_reversal_by_trend
+
+        if geometric_pass and entry_ok:
+            # 综合评分: 几何强度 + EP_L辅助
+            cushion = geo_result["cushion"]
+            geometric_score = min(1.0, cushion / (L1 * 0.02 + 0.01))
+            score = geometric_score * 0.6 + min30_ep_p * 0.25 + min5_ep_p * 0.15
+
+            gold_min = geo_result.get("optimal_buy_min", 0)
+            gold_max = geo_result.get("optimal_buy_max", 0)
+
+            # 中阴状态推进
+            zhongyin_state = "SECOND_BUY_CONFIRMED"
+
             ermai = {
                 "valid": True,
-                "dl_prob": daily_dl_p,  # 兼容: 日线一买DL_P
-                "ermai_dl_prob": ermai_dl_prob,  # 新增: 二买本身确认强度
-                "ep_prob": avg_ep_p,
-                "confirm_method": "EP_L",
+                "dl_prob": daily_dl_p,
+                "ermai_dl_prob": round(score, 4),
+                "ep_prob": (min30_ep_p + min5_ep_p) / 2,
+                "confirm_method": "几何判定",
                 "op": "二买",
+                "geometric": {
+                    "L1buy": L1,
+                    "L2buy": L2,
+                    "H1rebound": H1,
+                    "cushion": cushion,
+                    "cushion_ratio": round(cushion / L1, 4) if L1 else 0,
+                    "geometric_pass": True,
+                    "status": geo_result["status"],
+                    "gold_min": gold_min,
+                    "gold_max": gold_max,
+                    "invalid_boundary": L1,
+                },
                 "daily_dl_p": daily_dl_p,
                 "daily_ep_p": daily_ep_p,
                 "30min_dl_p": min30_dl_p,
-                "30min_ep_p": min30_ep_p,  # 关键: 30min EP_L>=0.5
+                "30min_ep_p": min30_ep_p,
                 "5min_dl_p": min5_dl_p,
                 "5min_ep_p": min5_ep_p,
                 "ratio": daily_ratio,
                 "levels_confirmed": 3,
-                "reason": (f"日线一买valid(DL={daily_dl_p:.2f}) "
-                          f"+ 30min EP_L反转确认(EP={min30_ep_p:.2f}>=0.5) "
-                          f"+ 5min入场(EP={min5_ep_p:.2f}>=0.3) "
-                          f"→ 二买确认强度={ermai_dl_prob:.2f}"),
+                "reason": (f"二买几何确认: L2buy({L2:.2f})>L1buy({L1:.2f}) "
+                          f"缓冲垫={cushion:.2f} 黄金区间[{gold_min:.2f},{gold_max:.2f}] "
+                          f"失效边界={L1:.2f} | "
+                          f"{'中阴状态' if zhongyin_active else '日线一买valid'}"),
             }
 
     # ============================================================
-    # 三买: V4 EP_L反转共振确认
+    # 三买: V6 (2026-08-08) 严格几何判定
     #
-    # 三买 = 日线趋势已确认up + 30min EP_L>=0.5 + 5min EP_L>=0.4
-    # 用EP_L共振确认反转在多个级别持续推进
+    # 缠论三买定义: 次级别(30min)走势向上突破中枢后,
+    #   次级别回踩段最低点 > 中枢高点ZG
+    #
+    # 几何判定(third_buy_sell_judge.evaluate_third_buy_sell):
+    #   1. 找到30min级别最后一个中枢(center={zg, zd})
+    #   2. 离开段: 中枢结束后的上涨段(到最高价)
+    #   3. 回踩段: 从最高价回落的K线
+    #   4. 确认条件: l_pullback > zg (回踩不进入中枢)
+    #
+    # 修复: 替代旧版"级别共振"逻辑(仅检查方向, 无几何确认)
+    #   旧版: daily_dir==up + 30min EP_L >= 0.3 → 三买
+    #   新版: 30min中枢+回踩几何确认
+    #   影响: 高争民爆(002827)旧版判三买, 新版正确拒绝
     # ============================================================
     sanmai = None
-    if daily_dir == "up" and min30_ep_p >= 0.5 and min5_ep_p >= 0.4:
-        avg_ep_p = (daily_ep_p + min30_ep_p + min5_ep_p) / 3
-        sanmai = {
-            "valid": True,
-            "dl_prob": daily_dl_p,
-            "ep_prob": avg_ep_p,
-            "confirm_method": "EP_L",
-            "op": "三买",
-            "daily_dl_p": daily_dl_p,
-            "daily_ep_p": daily_ep_p,
-            "30min_dl_p": min30_dl_p,
-            "30min_ep_p": min30_ep_p,  # 关键: 30min EP_L>=0.5
-            "5min_dl_p": min5_dl_p,
-            "5min_ep_p": min5_ep_p,  # 关键: 5min EP_L>=0.4
-            "ratio": daily_ratio,
-            "levels_confirmed": 3,
-            "reason": (f"日线趋势up + 30min EP_L共振(EP={min30_ep_p:.2f}>=0.5) "
-                      f"+ 5min EP_L共振(EP={min5_ep_p:.2f}>=0.4)"),
-        }
+    if daily_dir == "up":
+        # 获取30min级别K线数据和中枢
+        min30_zss = min30.get("zss", [])
+        min30_H_data = min30.get("H", [])
+        min30_L_data = min30.get("L", [])
+        min30_n = min30.get("n", 0)
+
+        # 必须有至少1个中枢, 且K线数据完整
+        if len(min30_zss) >= 1 and len(min30_H_data) >= 10 and len(min30_L_data) >= 10:
+            last_center = min30_zss[-1]
+            zg = last_center["zg"]
+            zd = last_center["zd"]
+            center_end = last_center["e"]
+
+            # 离开段: 从中枢结束位置开始, 寻找最高点
+            if center_end + 1 < min30_n:
+                leave_highs = min30_H_data[center_end + 1:]
+                leave_lows = min30_L_data[center_end + 1:]
+
+                if leave_highs:
+                    h_leave = max(leave_highs)
+                    h_leave_rel_idx = leave_highs.index(h_leave)
+                    h_leave_abs = center_end + 1 + h_leave_rel_idx
+
+                    # 必须有离开段(最高点 > ZG)
+                    if h_leave > zg:
+                        leave_df = pd.DataFrame({
+                            "high": min30_H_data[center_end + 1:h_leave_abs + 1],
+                            "low": min30_L_data[center_end + 1:h_leave_abs + 1]
+                        })
+
+                        # 回踩段: 从最高点之后到最新
+                        if h_leave_abs + 1 < min30_n:
+                            pullback_df = pd.DataFrame({
+                                "high": min30_H_data[h_leave_abs + 1:],
+                                "low": min30_L_data[h_leave_abs + 1:]
+                            })
+
+                            # 次级别共振: 5min是否有入场信号
+                            sub_resonance = (min5_ep_p >= 0.3 or min5_dl_p >= 0.4 or min5_reversal_by_trend)
+
+                            try:
+                                geo_result = evaluate_third_buy_sell(
+                                    center={"zg": zg, "zd": zd},
+                                    leave_segment=leave_df,
+                                    pullback_segment=pullback_df,
+                                    signal_type="third_buy",
+                                    sub_level_resonance=sub_resonance
+                                )
+
+                                if geo_result["is_confirmed"]:
+                                    # 额外安全过滤: 防止假三买
+                                    #
+                                    # 1. 回踩段必须至少有3根K线(结构完整性)
+                                    #    高争民爆: 回踩仅2根K线, 同为54.16, 无真实回踩
+                                    # 2. 缓冲垫比率必须>=0.5%
+                                    #    防止ZG极高时微小的价格抖动被误判
+                                    # 3. 30min有强卖点时(DL_P>0.5)拒绝三买
+                                    #    卖点=主力出货, 三买=接盘
+                                    pullback_bars = len(pullback_df)
+                                    cushion_ratio = geo_result.get("cushion", 0) / max(zg, 0.01)
+                                    sell_conflict = min30_sell_dl_p > 0.5
+
+                                    if pullback_bars < 3:
+                                        # 回踩段结构不完整, 拒绝三买
+                                        pass
+                                    elif cushion_ratio < 0.005:
+                                        # 缓冲垫太薄, 价格抖动即可破位
+                                        pass
+                                    elif sell_conflict:
+                                        # 30min有强卖点, 三买=接盘
+                                        pass
+                                    else:
+                                        score = daily_dl_p * 0.5 + min30_score * 0.3 + min5_ep_p * 0.2
+                                        sanmai = {
+                                            "valid": True,
+                                            "dl_prob": daily_dl_p,
+                                            "ep_prob": (min30_ep_p + min5_ep_p) / 2,
+                                            "confirm_method": "几何判定",
+                                            "op": "三买",
+                                            "daily_dl_p": daily_dl_p,
+                                            "daily_ep_p": daily_ep_p,
+                                            "30min_dl_p": min30_dl_p,
+                                            "30min_ep_p": min30_ep_p,
+                                            "5min_dl_p": min5_dl_p,
+                                            "5min_ep_p": min5_ep_p,
+                                            "ratio": daily_ratio,
+                                            "levels_confirmed": 3,
+                                            "geometric": geo_result,
+                                            "reason": geo_result["reason"],
+                                        }
+                            except Exception:
+                                # 几何判定异常, 不产生三买信号
+                                pass
+
+    # ============================================================
+    # 【Fix 3: 二买/三买覆盖tier】2026-08-08
+    #
+    # 问题: 即使二买/三买几何确认, 因30min DL_P过低导致tier="无信号"
+    #   丽珠集团: 二买已确认但tier=无信号(30min DL_P=0.000)
+    #   万科A: 30min一买valid但tier=无信号(30min DL_P=0.028)
+    #
+    # 修复: 二买确认→至少观察池, 三买确认→核心池
+    #   tier优先级: 核心池 > 观察池 > 边缘池 > 无信号
+    # ============================================================
+    _tier_rank = {"核心池": 3, "观察池": 2, "边缘池": 1, "无信号": 0}
+    _current_rank = _tier_rank.get(tier, 0)
+
+    if ermai and ermai.get("valid"):
+        # 二买确认 → 至少观察池
+        # 【Mini复核修复: 若daily_filter_ok=False, 二买最多观察池】
+        #   丽珠集团: daily_dir=down, 30min无信号(EP=0, DL=0), 二买确认
+        #   但日线过滤已拦截 → 二买只进观察池, 不进核心
+        if daily_filter_ok:
+            ermai_tier = "核心池" if not daily_filter_warning else "观察池"
+        else:
+            ermai_tier = "观察池"
+        if _tier_rank.get(ermai_tier, 0) > _current_rank:
+            tier = ermai_tier
+            _current_rank = _tier_rank.get(tier, 0)
+
+    if sanmai and sanmai.get("valid"):
+        # 三买确认 → 核心池
+        if _tier_rank.get("核心池", 3) > _current_rank:
+            tier = "核心池"
+            _current_rank = 3
 
     return {
         "code": code,
@@ -1711,17 +2354,32 @@ def detect_multilevel_buy_signals(code, price=None):
         "min30_sell_count": min30_sell_count,
         "min30_sell_dl_p": min30_sell_dl_p,
         "min5_sell_count": min5_sell_count,
-        "min30_has_data": len(min30_signals) > 0,
-        "min5_has_data": len(min5_signals) > 0,
+        "min30_has_data": len(min30_signals) > 0 or "30min" in level_results,
+        "min5_has_data": len(min5_signals) > 0 or "5min" in level_results,
+        "min30_reversal_by_trend": min30_reversal_by_trend,
+        "min5_reversal_by_trend": min5_reversal_by_trend,
         "trend_conflict": trend_conflict,
         "min30_dir": min30_dir,
         # BUG修复 (2026-07-30): 一买低点, 用于加仓风控和破位止损
         "one_buy_low": daily_one_buy_low,
-        # P1 (2026-08-02): 中阴状态检测
+        # 【Fix A: 中阴状态机】2026-08-08
+        "zhongyin_state": zhongyin_state,
+        "zhongyin_active": zhongyin_active,
+        "one_buy_broken": one_buy_broken,
+        # 【Fix边界1: 中阴僵尸态】2026-08-08
+        "zhongyin_timeout": zhongyin_timeout,
+        "zhongyin_stale": zhongyin_stale,
+        "zhongyin_day_count": zhongyin_day_count,
+        # 【Fix边界4: 仓位联动】中阴状态时SingleStockCap强制20%
+        "single_stock_cap": 0.20 if zhongyin_active else 0.35,
         "zhongyin": detect_zhongyin(daily) if daily else {
             "is_zhongyin": False, "reason": "无日线数据",
             "action": "正常", "price_vs_zs": "未知",
         },
+        # 【Fix B: 30min一买确认】
+        "min30_first_buy_valid": min30_first_buy_valid,
+        "daily_filter_ok": daily_filter_ok,
+        "daily_filter_warning": daily_filter_warning,
         # P3 (2026-08-02): 最佳一买信号的综合置信度
         "daily_confidence": daily_best.get("confidence", 0) if daily_best else 0,
     }
@@ -2019,7 +2677,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     holdings = {
-        "601515": {"name": "东风股份", "cost": 5.715},
+        "600006": {"name": "东风股份", "cost": 8.711},
         "600900": {"name": "长江电力", "cost": 27.530},
     }
 

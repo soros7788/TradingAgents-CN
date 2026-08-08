@@ -7,7 +7,7 @@ from tradingagents.utils.logging_init import get_logger
 logger = get_logger("default")
 
 
-def create_bear_researcher(llm, memory):
+def create_bear_researcher(llm, memory, knowledge_retriever=None):
     def bear_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
@@ -86,6 +86,17 @@ def create_bear_researcher(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
+        # RAG 升级: 检索外部知识库
+        kb_context_str = ""
+        if knowledge_retriever is not None:
+            try:
+                kb_results = knowledge_retriever.retrieve_for_agent(
+                    query=curr_situation, agent_role="bear_researcher"
+                )
+                kb_context_str = knowledge_retriever.format_context(kb_results)
+            except Exception as e:
+                logger.warning(f"⚠️ [RAG] bear_researcher 知识检索失败: {e}")
+
         prompt = f"""你是一位看跌分析师，负责论证不投资股票 {company_name}（股票代码：{ticker}）的理由。
 
 ⚠️ 重要提醒：当前分析的是 {market_info['market_name']}，所有价格和估值请使用 {currency}（{currency_symbol}）作为单位。
@@ -110,6 +121,7 @@ def create_bear_researcher(llm, memory):
 辩论对话历史：{history}
 最后的看涨论点：{current_response}
 类似情况的反思和经验教训：{past_memory_str}
+{kb_context_str}
 
 请使用这些信息提供令人信服的看跌论点，反驳看涨声明，并参与动态辩论，展示投资该股票的风险和弱点。你还必须处理反思并从过去的经验教训和错误中学习。
 

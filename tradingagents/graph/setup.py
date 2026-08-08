@@ -47,6 +47,7 @@ class GraphSetup:
         conditional_logic: ConditionalLogic,
         config: Dict[str, Any] = None,
         react_llm = None,
+        knowledge_retriever = None,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -61,6 +62,7 @@ class GraphSetup:
         self.conditional_logic = conditional_logic
         self.config = config or {}
         self.react_llm = react_llm
+        self.knowledge_retriever = knowledge_retriever  # RAG 升级: 外部知识检索器
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
@@ -152,22 +154,24 @@ class GraphSetup:
 
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(
-            self.quick_thinking_llm, self.bull_memory
+            self.quick_thinking_llm, self.bull_memory, self.knowledge_retriever
         )
         bear_researcher_node = create_bear_researcher(
-            self.quick_thinking_llm, self.bear_memory
+            self.quick_thinking_llm, self.bear_memory, self.knowledge_retriever
         )
         research_manager_node = create_research_manager(
-            self.deep_thinking_llm, self.invest_judge_memory
+            self.deep_thinking_llm, self.invest_judge_memory, self.knowledge_retriever
         )
-        trader_node = create_trader(self.quick_thinking_llm, self.trader_memory)
+        trader_node = create_trader(
+            self.quick_thinking_llm, self.trader_memory, self.knowledge_retriever
+        )
 
         # Create risk analysis nodes
         risky_analyst = create_risky_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         safe_analyst = create_safe_debator(self.quick_thinking_llm)
         risk_manager_node = create_risk_manager(
-            self.deep_thinking_llm, self.risk_manager_memory
+            self.deep_thinking_llm, self.risk_manager_memory, self.knowledge_retriever
         )
 
         # Create workflow
