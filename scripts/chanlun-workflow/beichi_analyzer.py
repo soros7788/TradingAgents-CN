@@ -841,6 +841,11 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         return analyze_beichi._cache[cache_key]
 
     scale_map = {"日线": "240", "30min": "30", "5min": "5", "1min": "1"}
+    # 【2026-08-09优化】根据测试结果, 新浪支持任意datalen
+    # 30min: 500根 ≈ 31天, 足以构建3-5个完整中枢
+    # 5min: 240根 ≈ 5天, 足以构建1-2个中枢
+    # 日线: 240根 ≈ 1年, 足够
+    datalen_map = {"日线": 240, "30min": 500, "5min": 240, "1min": 48}
     min_w_map = {"日线": 5, "30min": 4, "5min": 3, "1min": 3}
     # BUG修复 (2026-07-29): 30min min_amp_pct=0.1%过低 → 4.8元股价下0.01元(1tick)就能形成中枢
     # 问题: 23个中枢中22个宽度仅0.01元, 全是噪音 → 现价偏离1tick就"破位"
@@ -864,7 +869,9 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         V = [b['volume'] for b in bars]
         n = len(C)
     else:
-        data = fetch_kline_sina(code, scale_map[level], 120)
+        # 【2026-08-09优化】使用datalen_map根据级别获取适量数据
+        # 30min获取500根(约31天), 5min获取240根(约5天), 日线获取240根(约1年)
+        data = fetch_kline_sina(code, scale_map[level], datalen_map.get(level, 120))
         if not data:
             return {"error": "no data"}  # 不缓存: 允许后续重试
         C = [float(d['close']) for d in data]
