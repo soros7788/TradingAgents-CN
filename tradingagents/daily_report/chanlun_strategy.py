@@ -1,8 +1,12 @@
 """
 区间套交易策略引擎
 
-同时监控多级别（30min/5min/1min）缠论信号，根据"大级别定方向、小级别找买卖点"
-原则输出操作建议。
+使用自包含的缠论引擎 (scripts/chanlun_engine.py)，不再依赖 stock-chanlun 外部包。
+
+核心逻辑: "大级别定方向，小级别找买卖点"
+- 30分钟级别定大方向
+- 5分钟级别找中级别买卖点
+- 1分钟级别找精确入场点
 
 用法:
     from tradingagents.daily_report.chanlun_strategy import ChanlunStrategy
@@ -14,17 +18,23 @@
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import akshare as ak
 import pandas as pd
-
-from .chanlun_adapter import _get_kline_akshare  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# 缠论引擎延迟导入，避免初始化时拉重依赖
+# 将 scripts 目录加入 path
+_ROOT = Path(__file__).resolve().parent.parent.parent
+_SCRIPTS = _ROOT / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from chanlun_engine import analyze as _chanlun_analyze  # noqa: E402
+from chanlun_engine import IntervalStrategy, ChanlunResult  # noqa: E402
 
 
 @dataclass
@@ -44,12 +54,12 @@ class LevelSignal:
 @dataclass
 class TradeAdvice:
     """交易建议"""
-    action: str           # "等待" / "轻仓试多" / "重仓做多" / "减仓观望" / "做空"
-    confidence: float     # 0~1
-    target_zone: Optional[Tuple[float, float]]  # 目标价格区间
+    action: str
+    confidence: float
+    target_zone: Optional[Tuple[float, float]]
     stop_loss: Optional[float]
     reasoning: str
-    risk_level: str       # "低" / "中" / "高"
+    risk_level: str
 
 
 class ChanlunStrategy:
@@ -66,51 +76,27 @@ class ChanlunStrategy:
 
     def __init__(self, code: str):
         self.code = code.zfill(6)
-        self._engine = None  # 延迟初始化
-
-    def _engine_instance(self):
-        if self._engine is None:
-            import sys
-            from pathlib import Path
-            _root = Path(__file__).resolve().parent.parent.parent.parent / "stock-chanlun" / "backend"
-            if not _root.exists():
-                _root = Path("/workspace/stock-chanlun/backend").resolve()
-            _path = str(_root)
-            if _path not in sys.path:
-                sys.path.insert(0, _path)
-            from chanlun.engine import ChanlunEngine
-            self._engine_class = ChanlunEngine
-        return self._engine_class
 
     def _fetch_and_analyze(self, level: str, period: str, klines: int) -> Optional[Dict]:
         """拉取K线并跑缠论分析，返回简化结果。"""
         try:
-            if level == 'daily':
-                df = _get_kline_akshare(self.code, days=klines)
-            else:
-                prefix = 'sh' if self.code.startswith(('6', '9', '688')) else 'sz'
-                df = ak.stock_zh_a_minute(symbol=f'{prefix}{self.code}', period=period)
-                df.rename(columns={'day': 'date'}, inplace=True)
-                df['date'] = pd.to_datetime(df['date'])
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                df = df.tail(klines).copy()
-
-            if df is None or df.empty or len(df) < 30:
+            result = _chanlun_analyze(self.code, level=level)
+            if result is None:
                 return None
 
-            engine = self._engine_instance()(df)
-            result = engine.analyze(level=level)
-
-            # 提取最近一个信号
-            latest_sig = None
-            if result.signals:
-                latest_sig = max(result.signals, key=lambda s: s.datetime)
-
+            latest_sig = result.signals[-1] if result.signals else None
             zs_low = zs_high = None
             if result.zhongshus:
                 zs = result.zhongshus[-1]
                 zs_low, zs_high = zs.range_low, zs.range_high
+
+            sig_price = 0.0
+            sig_type = "无"
+            sig_dt = ""
+            if latest_sig:
+                sig_price = latest_sig.price
+                sig_type = latest_sig.type
+                sig_dt = latest_sig.datetime.strftime("%m-%d %H:%M") if latest_sig.datetime else ""
 
             return {
                 'level': level,
@@ -118,8 +104,11 @@ class ChanlunStrategy:
                 'latest_signal': latest_sig,
                 'zhongshu_low': zs_low,
                 'zhongshu_high': zs_high,
-                'current_price': float(df['close'].iloc[-1]),
+                'current_price': result.current_price,
                 'summary': result.summary,
+                'sig_type': sig_type,
+                'sig_price': sig_price,
+                'sig_dt': sig_dt,
             }
         except Exception as e:
             logger.warning("%s 级别分析失败: %s", level, e)
@@ -136,15 +125,12 @@ class ChanlunStrategy:
         for level, period, klines in configs:
             r = self._fetch_and_analyze(level, period, klines)
             if r:
-                sig = r['latest_signal']
                 results[level] = LevelSignal(
                     level=level,
                     trend=r['trend'],
-                    latest_signal_type=sig.type if sig else "无",
-                    latest_signal_price=sig.price if sig else 0.0,
-                    latest_signal_dt=(sig.datetime.strftime('%m-%d %H:%M')
-                                      if sig and hasattr(sig.datetime, 'strftime')
-                                      else str(sig.datetime) if sig else ""),
+                    latest_signal_type=r['sig_type'],
+                    latest_signal_price=r['sig_price'],
+                    latest_signal_dt=r['sig_dt'],
                     zhongshu_low=r['zhongshu_low'],
                     zhongshu_high=r['zhongshu_high'],
                     current_price=r['current_price'],
@@ -153,9 +139,7 @@ class ChanlunStrategy:
         return results
 
     def _judge(self, levels: Dict[str, LevelSignal]) -> TradeAdvice:
-        """
-        区间套核心判断逻辑。
-        """
+        """区间套核心判断逻辑。"""
         m30 = levels.get('30min')
         m5 = levels.get('5min')
         m1 = levels.get('1min')
@@ -170,12 +154,9 @@ class ChanlunStrategy:
                 risk_level="高",
             )
 
-        # 提取大级别方向（结合信号类型 + 趋势判定）
         big_direction = self._signal_direction(m30.latest_signal_type, trend=m30.trend)
 
-        # 情形1: 大级别卖点有效（一卖/二卖/三卖）
         if big_direction == "卖":
-            # 检查小级别是否有买点
             small_buy = self._has_buy_signal(m5, m1)
             if small_buy:
                 return TradeAdvice(
@@ -203,7 +184,6 @@ class ChanlunStrategy:
                     risk_level="中",
                 )
 
-        # 情形2: 大级别买点有效（一买/二买/三买）
         if big_direction == "买":
             return TradeAdvice(
                 action="重仓做多",
@@ -217,7 +197,6 @@ class ChanlunStrategy:
                 risk_level="低",
             )
 
-        # 情形3: 大级别无明确信号，中级别有卖点
         if self._signal_direction(m5.latest_signal_type, trend=m5.trend) == "卖":
             return TradeAdvice(
                 action="减仓观望",
@@ -231,7 +210,6 @@ class ChanlunStrategy:
                 risk_level="中",
             )
 
-        # 情形4: 大级别无明确信号，中级别有买点
         if self._signal_direction(m5.latest_signal_type, trend=m5.trend) == "买":
             return TradeAdvice(
                 action="轻仓试多",
@@ -245,7 +223,6 @@ class ChanlunStrategy:
                 risk_level="中",
             )
 
-        # 情形5: 全部无信号
         return TradeAdvice(
             action="等待",
             confidence=0.5,
@@ -257,15 +234,13 @@ class ChanlunStrategy:
 
     @staticmethod
     def _signal_direction(sig_type: str, trend: str = "") -> str:
-        """根据信号类型 + 趋势综合判断方向。"""
         if '买' in sig_type:
             return "买"
         if '卖' in sig_type:
             return "卖"
-        # 无明确买卖信号时，靠趋势辅助判断
         if '背驰' in trend:
             if '上涨背驰' in trend:
-                return "卖"  # 上涨背驰 → 等同于卖方向
+                return "卖"
             if '下跌背驰' in trend:
                 return "买"
         return "无"
@@ -282,49 +257,8 @@ class ChanlunStrategy:
 
     def run(self) -> Dict[str, str]:
         """运行完整分析并返回可读的文本/HTML。"""
-        levels = self.analyze_all_levels()
-        advice = self._judge(levels)
-
-        # 获取任意级别的当前价（避免全空时报错）
-        current_price = next((lv.current_price for lv in levels.values() if lv), 0.0)
-
-        text_lines = [
-            f"=== {self.code} 区间套交易策略 ===",
-            f"当前价: {current_price:.2f}",
-            "",
-            "【各级别状态】",
-        ]
-        for lv_name in ['30min', '5min', '1min']:
-            lv = levels.get(lv_name)
-            if lv:
-                zs = f" 中枢[{lv.zhongshu_low:.2f}, {lv.zhongshu_high:.2f}]" if lv.zhongshu_low else ""
-                sig = f" {lv.latest_signal_type}@{lv.latest_signal_price:.2f}" if lv.latest_signal_type != "无" else " 无信号"
-                text_lines.append(f"  {lv_name}: {lv.trend}{sig} ({lv.latest_signal_dt}){zs}")
-            else:
-                text_lines.append(f"  {lv_name}: 数据缺失")
-
-        text_lines.extend([
-            "",
-            "【交易建议】",
-            f"  操作: {advice.action}",
-            f"  置信度: {advice.confidence:.0%}",
-            f"  风险: {advice.risk_level}",
-        ])
-        if advice.target_zone:
-            text_lines.append(f"  目标区间: [{advice.target_zone[0]:.2f}, {advice.target_zone[1]:.2f}]")
-        if advice.stop_loss:
-            text_lines.append(f"  止损: {advice.stop_loss:.2f}")
-        text_lines.extend([
-            "",
-            "【逻辑】",
-            f"  {advice.reasoning}",
-        ])
-
-        return {
-            'text': "\n".join(text_lines),
-            'levels': {k: v.__dict__ for k, v in levels.items()},
-            'advice': advice.__dict__,
-        }
+        strategy = IntervalStrategy(self.code)
+        return strategy.run()
 
 
 if __name__ == "__main__":

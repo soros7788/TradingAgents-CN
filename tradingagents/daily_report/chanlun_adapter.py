@@ -1,10 +1,7 @@
 """
 缠论分析适配器
 
-把 stock-chanlun 的缠论引擎封装成轻量接口，供日报流水线直接调用。
-
-依赖:
-    pip install pandas numpy pydantic
+使用自包含的缠论引擎 (scripts/chanlun_engine.py)，不再依赖 stock-chanlun 外部包。
 
 用法:
     from tradingagents.daily_report.chanlun_adapter import analyze_stock
@@ -19,110 +16,68 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import httpx
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# 让 stock-chanlun 后端模块可被导入
-# 假设 stock-chanlun 与 TradingAgents-CN 处于同级目录
-_CHANLUN_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "stock-chanlun" / "backend"
-if not _CHANLUN_ROOT.exists():
-    # 兜底：回退到旧绝对路径（沙箱环境）
-    _CHANLUN_ROOT = Path("/workspace/stock-chanlun/backend").resolve()
-CHANLUN_ROOT = _CHANLUN_ROOT
-if str(CHANLUN_ROOT) not in sys.path:
-    sys.path.insert(0, str(CHANLUN_ROOT))
+# 将 scripts 目录加入 path 以导入自包含引擎
+_ROOT = Path(__file__).resolve().parent.parent.parent
+_SCRIPTS = _ROOT / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
-# stock-chanlun 的数据服务（纯 httpx，不依赖 akshare）
-from chanlun.engine import ChanlunEngine  # noqa: E402
-from chanlun.elements import ChanlunAnalysis  # noqa: E402
+from chanlun_engine import analyze as _chanlun_analyze  # noqa: E402
+from chanlun_engine import result_to_dict as _result_to_dict  # noqa: E402
+from chanlun_engine import fetch_kline_akshare  # noqa: E402
 
 
-def _to_plain_dict(analysis: ChanlunAnalysis) -> Dict[str, Any]:
-    """把 Pydantic 模型转成纯 dict，方便 JSON 序列化和模板渲染。"""
+def _to_compat_dict(result_dict: Dict[str, Any], code: str) -> Dict[str, Any]:
+    """把新引擎的结果转成旧接口兼容的 dict 格式。"""
+    # 添加 support_resistance 字段别名
+    sr = result_dict.get("support_resistance", [])
+    # 转换 datetime 格式 (只保留日期)
     signals = []
-    for s in analysis.signals:
+    for s in result_dict.get("signals", []):
         signals.append({
-            "type": s.type,
-            "level": s.level,
-            "price": round(s.price, 2),
-            "datetime": s.datetime.strftime("%Y-%m-%d") if s.datetime else "",
-            "confidence": round(s.confidence, 2),
-            "stop_loss": round(s.stop_loss, 2) if s.stop_loss else None,
-            "take_profit": round(s.take_profit, 2) if s.take_profit else None,
-            "description": s.description,
+            "type": s["type"],
+            "level": s["level"],
+            "price": s["price"],
+            "datetime": s.get("datetime", "")[:10],
+            "confidence": s["confidence"],
+            "stop_loss": s.get("stop_loss"),
+            "take_profit": s.get("take_profit"),
+            "description": s.get("description", ""),
         })
 
-    sr_levels = []
-    for lvl in analysis.support_resistance:
-        sr_levels.append({
-            "type": lvl.type,
-            "price": round(lvl.price, 2),
-            "source": lvl.source,
-            "strength": round(lvl.strength, 2),
-        })
-
-    # 只保留最近 3 个中枢和最近 5 笔，避免数据膨胀
     zhongshus = []
-    for zs in analysis.zhongshus[-3:]:
+    for zs in result_dict.get("zhongshus", []):
         zhongshus.append({
-            "range_low": round(zs.range_low, 2),
-            "range_high": round(zs.range_high, 2),
-            "start": zs.start.strftime("%Y-%m-%d") if zs.start else "",
-            "end": zs.end.strftime("%Y-%m-%d") if zs.end else "",
+            "range_low": zs["range_low"],
+            "range_high": zs["range_high"],
+            "start": zs.get("start", ""),
+            "end": zs.get("end", ""),
         })
 
     bis = []
-    for b in analysis.bis[-5:]:
+    for b in result_dict.get("bis", [])[-5:]:
         bis.append({
-            "direction": b.direction,
-            "high": round(b.high, 2),
-            "low": round(b.low, 2),
-            "start": b.start.strftime("%Y-%m-%d") if b.start else "",
-            "end": b.end.strftime("%Y-%m-%d") if b.end else "",
+            "direction": b["direction"],
+            "high": b["high"],
+            "low": b["low"],
+            "start": b.get("start", "")[:10],
+            "end": b.get("end", "")[:10],
         })
 
     return {
-        "trend": analysis.trend,
+        "trend": result_dict.get("trend", "未知"),
         "signals": signals,
-        "support_resistance": sr_levels,
+        "support_resistance": sr,
         "zhongshus": zhongshus,
         "bis": bis,
-        "summary": analysis.summary,
+        "summary": result_dict.get("summary", ""),
+        "current_price": result_dict.get("current_price"),
+        "stock_code": code,
     }
-
-
-def _get_kline_akshare(code: str, days: int = 120):
-    """
-    用 AKShare 腾讯数据源获取日线 K 线，返回 DataFrame [date, open, high, low, close, volume]。
-
-    说明:
-        - 优先使用 stock_zh_a_daily（腾讯接口），避开沙箱/代理对东财的封锁
-        - symbol 需带交易所前缀：sh（上海）/ sz（深圳）
-    """
-    import akshare as ak  # noqa: E402
-
-    sym = code.zfill(6)
-    # 判断交易所前缀
-    if sym.startswith(("6", "9", "688")):
-        prefix = "sh"
-    else:
-        prefix = "sz"
-
-    try:
-        df = ak.stock_zh_a_daily(symbol=f"{prefix}{sym}", adjust="qfq")
-    except Exception as e:
-        logger.warning("腾讯 K 线接口失败 %s: %s", sym, e)
-        return None
-
-    if df is None or df.empty:
-        return None
-
-    df = df.tail(days).copy()
-    # stock_zh_a_daily 返回列名已经是小写英文，无需重命名
-    df["date"] = pd.to_datetime(df["date"])
-    return df[["date", "open", "high", "low", "close", "volume"]]
 
 
 def analyze_stock(code: str, days: int = 120) -> Optional[Dict[str, Any]]:
@@ -134,18 +89,15 @@ def analyze_stock(code: str, days: int = 120) -> Optional[Dict[str, Any]]:
         days: 取多少天的日线 K 线，默认 120 天（约半年）
 
     返回:
-        dict 或 None（数据不足 / 分析失败时返回 None，由上层决定如何处理）
+        dict 或 None（数据不足 / 分析失败时返回 None）
     """
     try:
-        df = _get_kline_akshare(code, days=days)
-        if df is None or df.empty or len(df) < 30:
-            logger.warning("缠论分析: %s K 线不足 (%d 条)，跳过", code, len(df) if df is not None else 0)
+        result = _chanlun_analyze(code, level="daily", days=days)
+        if result is None:
+            logger.warning("缠论分析: %s 分析失败", code)
             return None
-
-        engine = ChanlunEngine(df)
-        analysis = engine.analyze(level="daily")
-        analysis.stock_code = code
-        return _to_plain_dict(analysis)
+        raw = _result_to_dict(result)
+        return _to_compat_dict(raw, code)
     except Exception as e:
         logger.warning("缠论分析失败 %s: %s", code, e)
         return None
@@ -166,4 +118,9 @@ def batch_analyze(codes: list[str], days: int = 120) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    print(analyze_stock("000001"))
+    import json
+    r = analyze_stock("000001")
+    if r:
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+    else:
+        print("分析失败")
