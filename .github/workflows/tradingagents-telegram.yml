@@ -1,55 +1,42 @@
-name: TradingAgents Telegram Only
+name: TradingAgents Intraday Scan
 
 on:
   schedule:
-    # 北京时间 09:35
-    - cron: "35 1 * * 1-5"
-
-    # 北京时间 10:05、10:35
-    - cron: "5,35 2 * * 1-5"
-
-    # 北京时间 11:05、11:35
-    - cron: "5,35 3 * * 1-5"
-
-    # 北京时间 13:05、13:35
-    - cron: "5,35 5 * * 1-5"
-
-    # 北京时间 14:05、14:35
-    - cron: "5,35 6 * * 1-5"
+    # 盘中扫描: 交易日 09:35/10:05/11:05/13:05/14:05/14:35
+    # 使用 daily_workflow.py intraday 命令 (递归30min候选池+持仓检查)
+    - cron: "35 1 * * 1-5"     # 09:35 BJS
+    - cron: "5,35 2 * * 1-5"   # 10:05, 10:35
+    - cron: "5,35 3 * * 1-5"   # 11:05, 11:35
+    - cron: "5,35 5 * * 1-5"   # 13:05, 13:35
+    - cron: "5,35 6 * * 1-5"   # 14:05, 14:35
 
   workflow_dispatch:
     inputs:
-      stocks:
-        description: "股票代码，逗号分隔，如：000001,002463,000006"
+      command:
+        description: '工作流命令'
         required: false
-        default: "002463,000006"
-      analysis_type:
-        description: "分析类型"
-        required: false
+        default: 'intraday'
         type: choice
         options:
-          - quick
-          - full
-        default: "quick"
+          - intraday
+          - plan
+          - divergence
+
+env:
+  PYTHONPATH: ${{ github.workspace }}/scripts/chanlun-workflow
+  TZ: Asia/Shanghai
 
 permissions:
   contents: read
 
 jobs:
-  telegram-analysis:
+  intraday-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-
-      STOCKS: ${{ github.event.inputs.stocks || '000001,002463,000006' }}
-      ANALYSIS_TYPE: ${{ github.event.inputs.analysis_type || 'quick' }}
 
     steps:
       - name: Checkout code
@@ -64,207 +51,103 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          pip install requests aiohttp pandas numpy scikit-learn python-telegram-bot
+          pip install -r scripts/chanlun-workflow/requirements.txt 2>/dev/null || true
+          pip install openpyxl numpy pandas scikit-learn==1.7.2
 
-      - name: Run trading analysis
-        id: run_analysis
+      - name: Run intraday scan
+        id: run_intraday
         continue-on-error: true
         run: |
           set +e
+          echo "=== Intraday Scan $(date '+%Y-%m-%d %H:%M') ==="
 
-          echo "====== TradingAgents Telegram Only ======" > run.log
-          echo "Time UTC: $(date -u '+%Y-%m-%d %H:%M:%S')" >> run.log
-          echo "Stocks: $STOCKS" >> run.log
-          echo "Analysis Type: $ANALYSIS_TYPE" >> run.log
-          echo "" >> run.log
+          # 获取定时任务对应的命令
+          # 09:35/10:05/10:35/11:05/11:35/13:05/13:35/14:05/14:35 → intraday
+          CMD="intraday"
 
-          if [ -f scripts/sync_stock_data.py ]; then
-            echo "====== Sync stock data ======" >> run.log
-            python scripts/sync_stock_data.py --date today >> run.log 2>&1
-          else
-            echo "scripts/sync_stock_data.py 不存在，跳过同步。" >> run.log
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CMD="${{ github.event.inputs.command || 'intraday' }}"
           fi
 
-          echo "" >> run.log
-          echo "====== Run analysis ======" >> run.log
+          echo "Command: $CMD"
+          cd scripts/chanlun-workflow
+          python -u daily_workflow.py $CMD 2>&1 | tee /tmp/intraday_output.txt
+          echo "$?" > /tmp/exit_code.txt
 
-          if [ -f scripts/trading_analysis_main.py ]; then
-            python scripts/trading_analysis_main.py \
-              --stocks "$STOCKS" \
-              --analysis_type "$ANALYSIS_TYPE" \
-              --output json \
-              > result.json 2>> run.log
-            CODE=$?
-          else
-            echo "❌ 找不到 scripts/trading_analysis_main.py" >> run.log
-            CODE=127
-          fi
-
-          echo "$CODE" > exit_code.txt
-
-          echo "" >> run.log
-          echo "Exit code: $CODE" >> run.log
-
-          exit 0
-
-      - name: Build Telegram message
+      - name: Send Telegram notification
         run: |
-          python - <<'PY'
-          import json
+          python - <<'PYEOF'
+          import os, sys
           from pathlib import Path
           from datetime import datetime, timezone, timedelta
 
-          bj = datetime.now(timezone.utc) + timedelta(hours=8)
-
-          def yesno(v):
-              return "✅" if v else "❌"
-
-          def fmt_pct(v):
-              if v is None:
-                  return "-"
-              try:
-                  return f"{float(v):+.2f}%"
-              except Exception:
-                  return str(v)
-
-          def signal_cn(sig):
-              return {
-                  "BREAKOUT": "🚀 已突破",
-                  "WATCH": "👀 等突破",
-                  "WEAK_BREAKOUT": "⚠️ 弱突破",
-                  "NONE": "— 未触发",
-              }.get(sig, sig or "-")
-
-          msg = []
-          msg.append("📈 A股30分钟突破监控")
-          msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
-          msg.append("")
-
-          if not Path("result.json").exists() or Path("result.json").stat().st_size == 0:
-              log = Path("run.log").read_text(encoding="utf-8", errors="ignore") if Path("run.log").exists() else ""
-              msg.append("⚠️ 本次没有生成分析结果。")
-              msg.append("")
-              msg.append("运行日志尾部：")
-              msg.append("\n".join(log.splitlines()[-80:]))
-              Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
-              raise SystemExit(0)
-
-          raw = Path("result.json").read_text(encoding="utf-8", errors="ignore")
-
-          try:
-              data = json.loads(raw)
-          except Exception:
-              msg.append("⚠️ result.json 解析失败，原始输出如下：")
-              msg.append(raw[:10000])
-              Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
-              raise SystemExit(0)
-
-          summary = data.get("summary", {})
-          total = summary.get("total", 0)
-          ok = summary.get("ok", 0)
-          errors = summary.get("errors", 0)
-          candidates = data.get("candidates", [])
-          all_results = data.get("all_results", [])
-          err_list = data.get("errors", [])
-
-          msg.append(f"📊 扫描：{total} 只")
-          msg.append(f"✅ 成功：{ok} 只")
-          msg.append(f"❌ 异常：{errors} 只")
-          msg.append(f"🎯 候选：{len(candidates)} 只")
-          msg.append("")
-
-          if candidates:
-              msg.append("🔥 候选股票")
-              for x in candidates:
-                  code = x.get("code", "-")
-                  sig = signal_cn(x.get("signal"))
-                  price = x.get("last_price", "-")
-                  high = x.get("structure_high_60", "-")
-                  bp = fmt_pct(x.get("breakout_pct"))
-                  score = x.get("score", "-")
-                  decision = x.get("decision", "-")
-                  cond = x.get("conditions", {})
-
-                  msg.append(f"{code}｜{sig}｜得分 {score}")
-                  msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}")
-                  msg.append(
-                      f"A高点共振 {yesno(cond.get('A_high_resonance_5_20_60'))} "
-                      f"B低点抬高 {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
-                      f"D突破 {yesno(cond.get('D_price_above_structure_high'))}"
-                  )
-                  msg.append(f"结论：{decision}")
-                  msg.append("")
-          else:
-              msg.append("🎯 本次没有触发候选。")
-              msg.append("")
-
-          if all_results:
-              msg.append("📋 明细")
-              for x in all_results:
-                  code = x.get("code", "-")
-                  sig = signal_cn(x.get("signal"))
-                  price = x.get("last_price", "-")
-                  high = x.get("structure_high_60", "-")
-                  bp = fmt_pct(x.get("breakout_pct"))
-                  score = x.get("score", "-")
-                  source = x.get("data_source", "-")
-                  latest_time = x.get("latest_time", "-")
-                  cond = x.get("conditions", {})
-
-                  msg.append(f"{code}｜{sig}｜得分 {score}")
-                  msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}")
-                  msg.append(
-                      f"A {yesno(cond.get('A_high_resonance_5_20_60'))} "
-                      f"B {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
-                      f"D {yesno(cond.get('D_price_above_structure_high'))}"
-                  )
-                  msg.append(f"数据源：{source}｜K线时间：{latest_time}")
-                  msg.append("")
-
-          if err_list:
-              msg.append("⚠️ 异常")
-              for e in err_list[:8]:
-                  msg.append(f"{e.get('code', '-')}: {e.get('error', '-')}")
-              msg.append("")
-
-          msg.append("规则：")
-          msg.append("A = 5/20/60 高点共振")
-          msg.append("B = 近2根低点不破近5根低点")
-          msg.append("D = 当前价突破60根结构高点")
-
-          Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
-          PY
-
-      - name: Send Telegram
-        run: |
-          python - <<'PY'
-          import os
-          import requests
-          from pathlib import Path
-
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-
           if not token or not chat_id:
-              raise SystemExit("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID")
+              print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+              raise SystemExit(0)
 
-          text = Path("telegram_message.txt").read_text(encoding="utf-8", errors="ignore")
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          bj = datetime.now(timezone.utc) + timedelta(hours=8)
+          log_path = Path("/tmp/intraday_output.txt")
+          log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
 
+          # 从日志中提取关键信息构建Telegram消息
+          msg = []
+          msg.append(f"📡 盘中扫描 {bj:%Y-%m-%d %H:%M}")
+
+          # 提取30min确认信号
+          confirmed_lines = [l for l in log_text.split('\n') if '30min确认' in l or '★ 30min确认' in l]
+          for l in confirmed_lines:
+              msg.append(l)
+
+          # 提取5min信号
+          fivemin_lines = [l for l in log_text.split('\n') if '5min' in l and ('★' in l or 'DL_P' in l)]
+          for l in fivemin_lines[:5]:
+              msg.append(l)
+
+          # 提取持仓检查
+          entry_lines = [l for l in log_text.split('\n') if '📌' in l]
+          for l in entry_lines[:5]:
+              msg.append(l)
+
+          # 提取止损告警
+          alert_lines = [l for l in log_text.split('\n') if '⚠️' in l or '止损' in l]
+          for l in alert_lines[:3]:
+              msg.append(l)
+
+          # 提取卖点信号
+          sell_lines = [l for l in log_text.split('\n') if '🔴' in l or '确认卖点' in l]
+          for l in sell_lines[:5]:
+              msg.append(l)
+
+          # 提取中枢破位
+          bd_lines = [l for l in log_text.split('\n') if '🔻' in l or '中枢破位' in l]
+          for l in bd_lines[:3]:
+              msg.append(l)
+
+          # 提取异常
+          err_lines = [l for l in log_text.split('\n') if 'ERROR' in l or '错误' in l or '❌' in l]
+          for l in err_lines[:5]:
+              msg.append(l)
+
+          if len(msg) <= 1:
+              msg.append("⚠️ 扫描完成, 无信号输出")
+              # 附加日志尾部
+              tail = '\n'.join(log_text.split('\n')[-20:])
+              msg.append("")
+              msg.append("日志尾部:")
+              msg.append(tail)
+
+          import requests
+          text = '\n'.join(msg)
           chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
-
           for chunk in chunks:
-              payload = {
-                  "chat_id": chat_id,
-                  "text": chunk,
-                  "disable_web_page_preview": True
-              }
-              r = requests.post(url, json=payload, timeout=30)
+              r = requests.post(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  json={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
+                  timeout=30,
+              )
               if not r.ok:
-                  raise SystemExit(f"Telegram 发送失败: {r.status_code} {r.text}")
-
+                  print(f"Telegram send failed: {r.status_code} {r.text}")
           print("Telegram sent.")
-          PY
+          PYEOF

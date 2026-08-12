@@ -11,6 +11,10 @@ on:
     - cron: '5 7 * * 1-5'
     # 合规核查兜底: 交易日 15:30 → compliance (独立fallback, 防scan_then_compliance超时)
     - cron: '30 7 * * 1-5'
+    # 【Fix 2026-08-11】持仓背驰确认: 交易日 16:00 → divergence (顶背驰检测)
+    - cron: '0 8 * * 1-5'
+    # 【Fix 2026-08-11】交易计划生成: 交易日 16:30 → plan (多级别+加仓计算器)
+    - cron: '30 8 * * 1-5'
   workflow_dispatch:
     inputs:
       command:
@@ -23,6 +27,8 @@ on:
           - scan
           - compliance
           - scan_then_compliance  # scan成功后自动执行compliance
+          - plan                  # 交易计划生成
+          - divergence            # 持仓背驰确认
 
 env:
   PYTHONPATH: ${{ github.workspace }}/scripts/chanlun-workflow
@@ -31,7 +37,7 @@ env:
 jobs:
   daily-workflow:
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # 15→45分钟, scan_then_compliance需要双步骤时间
+    timeout-minutes: 90  # 45→90分钟 (2026-08-11): scan 2234只股票ML推理需~55分钟, 加compliance共需~80分钟
     permissions:
       contents: write
     steps:
@@ -72,6 +78,10 @@ jobs:
               CMD="scan_then_compliance"  # 15:05 收盘后日线扫描 → 成功后继续compliance
             elif [ "$SCHEDULE" = "30 7 * * 1-5" ]; then
               CMD="compliance"    # 15:30 合规核查兜底
+            elif [ "$SCHEDULE" = "0 8 * * 1-5" ]; then
+              CMD="divergence"    # 16:00 持仓背驰确认(顶背驰检测)
+            elif [ "$SCHEDULE" = "30 8 * * 1-5" ]; then
+              CMD="plan"          # 16:30 交易计划生成(多级别+加仓计算器)
             else
               CMD="intraday"      # 盘中30min扫描 + 持仓止损检查
             fi

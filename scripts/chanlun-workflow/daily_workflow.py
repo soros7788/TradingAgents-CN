@@ -1369,6 +1369,7 @@ def run_full_scan():
         total_asset=account["total_asset"] or 20326.12,
         cash=account["cash"] or 7847.12,
         silent=False,
+        prefetch=True,     # 2026-08-11: 并发预取5min数据, 加速ML推理
     )
 
     # ============================================================
@@ -1378,13 +1379,13 @@ def run_full_scan():
     # ============================================================
     scan_diag = result.get("scan_diagnostics", {})
     if scan_diag.get("triggered"):
-        print(f"\n{'='*50}")
-        print("⚠️ ⚠️ ⚠️  全市场扫描异常  ⚠️ ⚠️ ⚠️")
-        print(f"{'='*50}")
-        print(scan_diag.get("report", "未知诊断结果"))
-        print(f"{'='*50}")
-        print("→ 候选池将保留昨日数据, 等待修复后重新扫描")
-        print(f"{'='*50}\n")
+        print(f"\n{'='*50}", flush=True)
+        print("⚠️ ⚠️ ⚠️  全市场扫描异常  ⚠️ ⚠️ ⚠️", flush=True)
+        print(f"{'='*50}", flush=True)
+        print(scan_diag.get("report", "未知诊断结果"), flush=True)
+        print(f"{'='*50}", flush=True)
+        print("→ 候选池将保留昨日数据, 等待修复后重新扫描", flush=True)
+        print(f"{'='*50}\n", flush=True)
 
     # 排除持仓股(已持有的不再推荐为新候选)
     # BUG修复 (2026-07-30): 旧代码排除持仓股后, 沃华/贵绳不在候选池
@@ -1399,7 +1400,7 @@ def run_full_scan():
     if held_codes:
         held_in_pool = [r for r in all_confirmed if r["code"] in held_codes]
         if held_in_pool:
-            print(f"  持仓股也在候选池: {len(held_in_pool)}只 ({', '.join(r['name'] for r in held_in_pool)})")
+            print(f"  持仓股也在候选池: {len(held_in_pool)}只 ({', '.join(r['name'] for r in held_in_pool)})", flush=True)
 
     # ============================================================
     # 候选池 V3 (2026-07-29): 写入所有confirmed标的, 不截断
@@ -1425,9 +1426,9 @@ def run_full_scan():
     selected = sort_by_dlp(core) + sort_by_dlp(watch)
     selected += sort_by_dlp(edge)[:20]
 
-    print(f"\n[婴儿级候选池] 分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只")
-    print(f"写入: {len(selected)}只 (核心+观察全部, 边缘限20只)")
-    print(f"  核心{len([s for s in selected if s.get('tier')=='核心'])} + 观察{len([s for s in selected if s.get('tier')=='观察'])} + 边缘{len([s for s in selected if s.get('tier')=='边缘'])}")
+    print(f"\n[婴儿级候选池] 分层: 核心{len(core)}只 + 观察{len(watch)}只 + 边缘{len(edge)}只", flush=True)
+    print(f"写入: {len(selected)}只 (核心+观察全部, 边缘限20只)", flush=True)
+    print(f"  核心{len([s for s in selected if s.get('tier')=='核心'])} + 观察{len([s for s in selected if s.get('tier')=='观察'])} + 边缘{len([s for s in selected if s.get('tier')=='边缘'])}", flush=True)
 
     wb = safe_load_wb()
     ws = wb['候选池']
@@ -1749,10 +1750,15 @@ def _mark_p0_pending(wb, code, name, price, obl, pct):
 
 
 def run_intraday_scan():
-    """盘中扫描: 30min级别扫描候选池(排除持仓股) + 5min确认 + 持仓止损检查"""
+    """盘中扫描: 30min级别扫描候选池(排除持仓股) + 5min确认 + 持仓止损检查
+
+    【Fix 2026-08-11】使用detect_multilevel_buy_signals替代旧analyze_beichi
+    旧代码: analyze_beichi(level="30min") + sig["op"]=="一买" + ratio/DL_P阈值
+    问题: 旧代码依赖DL_P(30min数据近零)和ratio, 与当前系统矛盾
+    修复: 使用detect_multilevel_buy_signals的多级别tier和几何背驰检测
+    """
     sys.path.insert(0, BEICHI_DIR)
-    from beichi_analyzer import analyze_beichi
-    from beichi_analyzer import detect_sell_signals
+    from beichi_analyzer import detect_multilevel_buy_signals, detect_sell_signals
     import time as _time
 
     now = datetime.now()
@@ -1762,67 +1768,77 @@ def run_intraday_scan():
     holdings = get_today_holdings()
     held_codes = {str(h['code']) for h in holdings if h.get('code')}
 
-    # 1. 候选池30min扫描
+    # 1. 候选池30min扫描 (使用多级别信号检测)
     # 【BUG-9修复 (2026-07-27)】候选池为空时不再跳过持仓检查
-    # 旧代码: candidates为空 → return early → 持仓止损/卖点检查全部跳过
-    # 根因: BUG-9导致scan命令从未执行 → 候选池可能为空 → 持仓监控静默失效
-    # 修复: 候选池为空时跳过候选扫描, 但继续执行持仓检查(步骤3)
     candidates = get_candidate_pool()
     candidates = [c for c in candidates if c["code"] not in held_codes]
-    confirmed_30m = []
-    near_30m = []
+    confirmed_30m = []  # 核心池/观察池信号
+    near_30m = []       # 边缘池/接近信号
+    dc_signals = []     # 双中枢趋势背驰信号
     if not candidates:
         print("[1/3] 候选池为空(排除持仓后), 跳过候选扫描, 继续持仓检查")
     else:
-        print(f"[1/3] 候选池30min扫描 ({len(candidates)}只)...")
+        print(f"[1/3] 候选池多级别扫描 ({len(candidates)}只)...")
         t0 = _time.time()
         for s in candidates:
             try:
-                r = analyze_beichi(s["code"], level="30min")
-                if "error" in r:
+                ml = detect_multilevel_buy_signals(s["code"], price=s["price"])
+                if not ml or ml.get("tier") == "无信号":
                     continue
-                close = r["C"][-1] if r.get("C") else s["price"]
-                if s["price"] > 0 and close > 0 and (close / s["price"] > 10 or s["price"] / close > 10):
-                    close = s["price"]
-                for sig in r.get("signals", []):
-                    if sig["op"] != "一买":
-                        continue
-                    ratio = sig["ratio"]
-                    dlp = sig["dl_prob"]
-                    valid = sig["valid"]
-                    confirmed = ratio < 60 and dlp > 0.8 and valid
-                    near = (ratio < 60 and dlp > 0.6 and valid) or (ratio < 85 and dlp > 0.8 and valid)
-                    entry = {
-                        "code": s["code"], "name": s["name"], "price": close or s["price"],
-                        "ratio": ratio, "dlp": dlp, "valid": valid,
-                    }
-                    if confirmed:
-                        confirmed_30m.append(entry)
-                    elif near:
-                        near_30m.append(entry)
+                tier = ml.get("tier", "无信号")
+                # 使用几何背驰检测判断信号强度
+                dc = ml.get("min30_double_center", {})
+                sc = ml.get("min30_single_center", {})
+                has_dc = dc.get("is_divergence", False)
+                has_sc = sc.get("is_divergence", False)
+                dc_conf = dc.get("confidence", 0)
+                sc_conf = sc.get("confidence", 0)
+                ermai = ml.get("ermai") is not None and ml.get("ermai", {}).get("valid", False)
+                sanmai = ml.get("sanmai") is not None and ml.get("sanmai", {}).get("valid", False)
+                has_buy_signal = ermai or sanmai
+
+                entry = {
+                    "code": s["code"], "name": s["name"],
+                    "price": s["price"],
+                    "tier": tier,
+                    "has_dc": has_dc, "dc_conf": dc_conf,
+                    "has_sc": has_sc, "sc_conf": sc_conf,
+                    "ermai": ermai, "sanmai": sanmai,
+                    "ep_30": ml.get("30min_ep_p", 0),
+                }
+
+                # 核心池: 双中枢趋势背驰或二买/三买确认
+                if tier == "核心池" or has_dc or has_buy_signal:
+                    confirmed_30m.append(entry)
+                    if has_dc:
+                        dc_signals.append(entry)
+                # 观察池/边缘池: 接近确认
+                elif tier in ("观察池", "边缘池"):
+                    near_30m.append(entry)
             except:
                 pass
         elapsed_30m = _time.time() - t0
-        print(f"  30min: 确认{len(confirmed_30m)}只, 接近{len(near_30m)}只, 耗时{elapsed_30m:.0f}s")
+        print(f"  多级别: 确认{len(confirmed_30m)}只 (双中枢{len(dc_signals)}只), 接近{len(near_30m)}只, 耗时{elapsed_30m:.0f}s")
+        for s in confirmed_30m:
+            tag = "双中枢" if s["has_dc"] else "单中枢" if s["has_sc"] else "tier"
+            print(f"  ★ {s['name']} {s['code']} ¥{s['price']:.2f} [{tag}] tier={s['tier']}")
+        for s in near_30m[:5]:
+            print(f"  ◆ {s['name']} {s['code']} ¥{s['price']:.2f} tier={s['tier']}")
 
-    # 2. 30min确认标的 → 5min精确买点
+    # 2. 30min确认标的 → 5min精确买点 (使用多级别信号)
     confirmed_5m = []
     if confirmed_30m:
         print(f"\n[2/3] 5min精确买点扫描 ({len(confirmed_30m)}只)...")
         for s in confirmed_30m:
             try:
-                r = analyze_beichi(s["code"], level="5min")
-                if "error" in r:
+                ml = detect_multilevel_buy_signals(s["code"], price=s["price"])
+                if not ml:
                     continue
-                for sig in r.get("signals", []):
-                    if sig["op"] != "一买":
-                        continue
-                    ratio = sig["ratio"]
-                    dlp = sig["dl_prob"]
-                    valid = sig["valid"]
-                    confirmed_5m = ratio < 60 and dlp > 0.8 and valid
-                    if confirmed_5m or (ratio < 85 and dlp > 0.6 and valid):
-                        print(f"  ★ {s['name']} {s['code']} 5min: ratio={ratio:.0f}% DL_P={dlp:.2f} valid={valid}")
+                # 5min EP_L > 0.5 或 5min有信号
+                ep_5 = ml.get("5min_ep_p", 0)
+                if ep_5 > 0.5:
+                    confirmed_5m.append(s)
+                    print(f"  ★ {s['name']} {s['code']} 5min: EP_L={ep_5:.2f} ✓")
             except:
                 pass
     else:
@@ -2162,19 +2178,19 @@ def run_intraday_scan():
     # 汇总
     print(f"\n{'='*50}")
     if confirmed_30m:
-        print(f"★ 30min确认信号: {len(confirmed_30m)}只")
+        print(f"★ 确认信号: {len(confirmed_30m)}只 (双中枢{len(dc_signals)}只)")
         for s in confirmed_30m:
-            print(f"  {s['name']} {s['code']} ¥{s['price']:.2f} ratio={s['ratio']:.0f}% DL_P={s['dlp']:.2f}")
+            tag = "双中枢" if s.get("has_dc") else "单中枢" if s.get("has_sc") else "二买/三买" if s.get("ermai") or s.get("sanmai") else "tier"
+            ep30 = s.get("ep_30", 0)
+            print(f"  {s['name']} {s['code']} ¥{s['price']:.2f} [{tag}] tier={s.get('tier','?')} EP_L={ep30:.2f}")
     else:
-        print("★ 30min确认信号: 0只")
+        print("★ 确认信号: 0只")
 
     if near_30m:
-        print(f"\n◆ 30min接近确认: {len(near_30m)}只")
+        print(f"\n◆ 接近确认: {len(near_30m)}只")
         for s in near_30m[:5]:
-            missing = []
-            if s["ratio"] >= 60: missing.append("ratio=%d%%" % s["ratio"])
-            if s["dlp"] <= 0.8: missing.append("DL_P=%.2f" % s["dlp"])
-            print(f"  {s['name']} {s['code']} ¥{s['price']:.2f} 缺:{'+'.join(missing)}")
+            ep30 = s.get("ep_30", 0)
+            print(f"  {s['name']} {s['code']} ¥{s['price']:.2f} tier={s.get('tier','?')} EP_L={ep30:.2f}")
 
     if alerts:
         print(f"\n⚠️ 止损告警: {len(alerts)}只需处理")
@@ -2194,6 +2210,7 @@ def run_intraday_scan():
     return {
         "confirmed_30m": confirmed_30m,
         "near_30m": near_30m,
+        "dc_signals": dc_signals,
         "alerts": alerts,
         "confirmed_sells": confirmed_sells,
         "near_sells": near_sells,
@@ -2299,30 +2316,34 @@ def send_telegram(text, title=""):
 
 
 def format_intraday_summary(result, ts):
-    """Format intraday scan results into clean Telegram message."""
+    """Format intraday scan results into clean Telegram message.
+
+    【Fix 2026-08-11】使用tier分类+几何背驰替代旧ratio/DL_P显示
+    """
     lines = [f"📡 盘中扫描 {ts}", ""]
 
     scanned = result.get("scanned", 0)
-    lines.append(f"📊 扫描: {scanned}只候选")
+    dc_count = len(result.get("dc_signals", []))
+    lines.append(f"📊 扫描: {scanned}只候选 | 双中枢: {dc_count}只")
     lines.append("")
 
-    # 30min确认
+    # 30min确认 (多级别tier + 几何背驰)
     confirmed = result.get("confirmed_30m", [])
     if confirmed:
-        lines.append(f"★ 30min确认: {len(confirmed)}只")
+        lines.append(f"★ 确认信号: {len(confirmed)}只")
         for s in confirmed:
-            lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} ratio={s['ratio']:.0f}% DL_P={s['dlp']:.2f}")
+            tag = "双中枢" if s.get("has_dc") else "单中枢" if s.get("has_sc") else "二买/三买" if s.get("ermai") or s.get("sanmai") else "tier"
+            ep30 = s.get("ep_30", 0)
+            lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} [{tag}] tier={s.get('tier','?')} EP_L={ep30:.2f}")
         lines.append("")
 
     # 30min接近
     near = result.get("near_30m", [])
     if near:
-        lines.append(f"◆ 30min接近: {len(near)}只")
+        lines.append(f"◆ 接近信号: {len(near)}只")
         for s in near[:8]:
-            missing = []
-            if s["ratio"] >= 60: missing.append(f"ratio={s['ratio']:.0f}%")
-            if s["dlp"] <= 0.8: missing.append(f"DL_P={s['dlp']:.2f}")
-            lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} 缺:{'+'.join(missing)}")
+            ep30 = s.get("ep_30", 0)
+            lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} tier={s.get('tier','?')} EP_L={ep30:.2f}")
         if len(near) > 8:
             lines.append(f"  ...还有{len(near)-8}只")
         lines.append("")
@@ -2401,7 +2422,13 @@ def format_intraday_summary(result, ts):
 
 
 def format_scan_summary(scan_data, ts):
-    """Format full scan results into clean Telegram message."""
+    """Format full scan results into clean Telegram message.
+
+    【Fix 2026-08-11】使用tier分类替代旧ratio/DL_P显示
+    旧代码: 显示ratio和DL_P作为筛选条件
+    问题: 当前系统使用多级别tier+几何背驰检测, ratio/DL_P已不是主要条件
+    修复: 显示tier分类、信号类型(双中枢/单中枢/二买/三买)
+    """
     lines = [f"📊 收盘扫描报告 {ts}", ""]
 
     result = scan_data.get("scan_result", {})
@@ -2409,22 +2436,46 @@ def format_scan_summary(scan_data, ts):
     errors = scan_data.get("errors", 0)
 
     total = result.get("total_scanned", 0) or len(result.get("near", []))
-    near_count = len(result.get("near", []))
+    core = result.get("core", [])
+    watch = result.get("watch", [])
+    edge = result.get("edge", [])
 
-    lines.append(f"扫描: {total}只 | 接近确认: {near_count}只")
+    lines.append(f"扫描: {total}只 | 核心池: {len(core)}只 | 观察池: {len(watch)}只 | 边缘池: {len(edge)}只")
     lines.append(f"候选池写入: {len(selected)}只 | 公式错误: {errors}")
     lines.append("")
 
+    # 按tier分层显示候选池
     if selected:
-        lines.append("候选池明细:")
-        for s in selected[:15]:
-            missing = []
-            if s.get("ratio", 0) >= 60: missing.append(f"ratio={s['ratio']:.0f}%")
-            if s.get("dlp", 0) <= 0.8: missing.append(f"DL_P={s['dlp']:.2f}")
-            note = f" 缺:{'+'.join(missing)}" if missing else " ✓确认"
-            lines.append(f"  {s.get('name','')} {s['code']} ¥{s['price']:.2f}{note}")
-        if len(selected) > 15:
-            lines.append(f"  ...还有{len(selected)-15}只")
+        # 核心池优先显示
+        core_in_pool = [s for s in selected if s.get("tier") == "核心"]
+        watch_in_pool = [s for s in selected if s.get("tier") == "观察"]
+        edge_in_pool = [s for s in selected if s.get("tier") == "边缘"]
+
+        if core_in_pool:
+            lines.append("🏆 核心池 (调仓首选):")
+            for s in core_in_pool[:8]:
+                sig_type = s.get("sig_type", "盘整背驰")
+                label = s.get("sig_label", "ABC买卖区间")
+                # 双中枢趋势背驰信号优先标注
+                if s.get("min30_dc_divergence"):
+                    sig_type = "趋势背驰"
+                    label = "123买卖区间"
+                lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} | {label} | {sig_type}")
+            if len(core_in_pool) > 8:
+                lines.append(f"  ...还有{len(core_in_pool)-8}只")
+            lines.append("")
+
+        if watch_in_pool:
+            lines.append("👀 观察池 (核心池不足时补充):")
+            for s in watch_in_pool[:5]:
+                ep_30 = s.get("30min_ep_p", 0)
+                lines.append(f"  {s['name']} {s['code']} ¥{s['price']:.2f} | EP_L={ep_30:.2f}")
+            if len(watch_in_pool) > 5:
+                lines.append(f"  ...还有{len(watch_in_pool)-5}只")
+            lines.append("")
+
+        if edge_in_pool:
+            lines.append(f"⚪ 边缘池 ({len(edge_in_pool)}只, 仅观察不买入)")
 
     return '\n'.join(lines)
 
@@ -3340,7 +3391,7 @@ def clean_excel():
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: daily_workflow.py [compliance|scan|intraday|account|holdings|weekly|clean]")
+        print("用法: daily_workflow.py [compliance|scan|intraday|account|holdings|weekly|clean|plan|prefetch|divergence]")
         return
     cmd = sys.argv[1]
     ts = datetime.now().strftime('%m-%d %H:%M')
@@ -3355,8 +3406,13 @@ def main():
             msg = format_rebalance_summary(holdings, ts)
             send_telegram(msg)
         elif cmd == "scan":
+            use_prefetch = "--prefetch" in sys.argv
             clean_excel()
             scan_data = run_full_scan()
+            if use_prefetch:
+                # 先预取再扫描
+                from concurrent_prefetch import prefetch_candidate_pool
+                prefetch_candidate_pool(max_workers=20)
             msg = format_scan_summary(scan_data, ts)
             send_telegram(msg)
         elif cmd == "intraday":
@@ -3380,6 +3436,72 @@ def main():
         elif cmd == "clean":
             clean_excel()
             print("✅ Excel修复完成")
+        elif cmd == "prefetch":
+            """并发预取全市场数据"""
+            from concurrent_prefetch import prefetch_candidate_pool, prefetch_holdings
+            # 先预取持仓股 (多级别)
+            try:
+                holdings = get_today_holdings()
+                if holdings:
+                    print(f"预取持仓股{len(holdings)}只数据...")
+                    prefetch_holdings(holdings, max_workers=15)
+            except Exception as e:
+                print(f"持仓预取跳过: {e}")
+            # 再预取全市场 (日线)
+            prefetch_candidate_pool(max_workers=20)
+        elif cmd == "plan":
+            """生成交易计划"""
+            from trading_plan import generate_plan_from_workflow, format_plan, format_plan_short
+            # 先预取持仓股数据
+            try:
+                from concurrent_prefetch import prefetch_holdings
+                holdings = get_today_holdings()
+                if holdings:
+                    print(f"预取{len(holdings)}只持仓股数据...")
+                    prefetch_holdings(holdings, max_workers=15)
+            except Exception as e:
+                print(f"预取跳过: {e}")
+            plan = generate_plan_from_workflow()
+            output = format_plan(plan)
+            print(output)
+            # 尝试Telegram推送精简版
+            try:
+                short = format_plan_short(plan)
+                send_telegram(short, title="📋 交易计划")
+            except Exception:
+                pass
+        elif cmd == "divergence":
+            """持仓背驰确认 (V2: 顶背驰检测)"""
+            from position_divergence import position_divergence_report
+            result = position_divergence_report(silent=False)
+            # 尝试Telegram推送
+            try:
+                msg_lines = [f"📊 持仓背驰确认(V2) — {ts}"]
+                summary = result.get("summary", {})
+                msg_lines.append(f"持仓{summary.get('total_holdings',0)}只 | "
+                                 f"顶背驰{summary.get('top_divergence_confirmed',0)} | "
+                                 f"失效{summary.get('buy_thesis_failed',0)} | "
+                                 f"风险{summary.get('risk_rising',0)} | "
+                                 f"有效{summary.get('valid',0)}")
+                sell_alerts = result.get("sell_alerts", [])
+                if sell_alerts:
+                    msg_lines.append(f"\n🔴 清仓预警({len(sell_alerts)}只):")
+                    for s in sell_alerts[:5]:
+                        _r = s.get("risk", "?")
+                        _n = s.get("name", "?")
+                        _t = s.get("divergence_type", "?")
+                        _p = s.get("profit", 0)
+                        msg_lines.append(f"  {_r} {_n}({_t}) {_p:+.2f}%")
+                reduce_alerts = result.get("reduce_alerts", [])
+                if reduce_alerts:
+                    msg_lines.append(f"\n🟡 减仓预警({len(reduce_alerts)}只):")
+                    for r in reduce_alerts[:3]:
+                        _n = r.get("name", "?")
+                        _t = r.get("divergence_type", "?")
+                        msg_lines.append(f"  {_n} ({_t})")
+                send_telegram("\n".join(msg_lines), title="📊 持仓背驰")
+            except Exception:
+                pass
         else:
             print(f"未知命令: {cmd}")
     except Exception as e:
