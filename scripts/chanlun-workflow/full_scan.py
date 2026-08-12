@@ -311,22 +311,32 @@ def full_scan(total_asset=20326.12, cash=7847.12, silent=False, prefetch=False):
         if i < skip_count:
             continue
 
-        # 【超时保护 2026-08-11】每只股票最多30秒, 超时自动跳过
-        # 使用ThreadPoolExecutor单线程执行+30秒超时
-        # 避免单只股票请求卡死整个2886只循环
+        # 【超时保护 V2 2026-08-12】每只股票最多20秒, 超时强制跳过
+        # 【Bug修复】原版用 ThreadPoolExecutor(max_workers=1) + _fut.result(timeout=30),
+        #   超时后 with 退出时 __exit__ 调用 shutdown(wait=True) 会阻塞等待那个卡死的线程完成,
+        #   导致超时保护形同虚设 — 30秒超时变成无限等待, 卡住整个2886只循环.
+        # 修复: 用 multiprocessing.Process + Queue 实现真杀, 超时后 terminate() 强制终止子进程.
+        #   主循环不受卡死股票影响, 真正实现"超时即跳过".
+        import multiprocessing
+        _scan_queue = multiprocessing.Queue()
+        _scan_proc = None
         try:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
-            with ThreadPoolExecutor(max_workers=1) as _pool:
-                _fut = _pool.submit(scan_one, s["code"], s["name"], s["price"])
-                result = _fut.result(timeout=30)
-        except _TimeoutError:
+            _scan_proc = multiprocessing.Process(
+                target=lambda q, c, n, p: q.put(scan_one(c, n, p)),
+                args=(_scan_queue, s["code"], s["name"], s["price"])
+            )
+            _scan_proc.daemon = True
+            _scan_proc.start()
+            result = _scan_queue.get(timeout=20)
+            _scan_proc.join(timeout=2)
+        except Exception:
             result = None
             if not silent:
-                print(f"  ⏰ 超时(30s): {s['name']}({s['code']}), 跳过", flush=True)
-        except Exception as _e:
-            result = None
-            if not silent and (i+1) % 500 == 0:
-                print(f"  ❌ 异常: {s['name']}({s['code']}): {_e}, 跳过", flush=True)
+                print(f"  ⏰ 超时(20s): {s['name']}({s['code']}), 跳过", flush=True)
+        finally:
+            if _scan_proc is not None and _scan_proc.is_alive():
+                _scan_proc.terminate()
+                _scan_proc.join(timeout=1)
 
         if result is None:
             failed += 1
