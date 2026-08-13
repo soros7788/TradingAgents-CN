@@ -155,7 +155,9 @@ def scan_one(code, name, price):
         dlp = sig["dl_prob"]
         valid = sig["valid"]
         confirmed = ratio < 60 and dlp > 0.8 and valid
-        near = (ratio < 60 and dlp > 0.6 and valid) or (ratio < 85 and dlp > 0.8 and valid)
+        # 【2026-08-13 修复】收紧接近确认门槛: 原 ratio<85 过宽(85%面积比几乎无背驰)
+        # 现在要求真正接近 confirmed: 面积比<75 或 面积比<60+DL_P>0.6
+        near = (ratio < 60 and dlp > 0.6 and valid) or (ratio < 75 and dlp > 0.8 and valid)
         score = 0
         if ratio < 60: score += 50
         elif ratio < 85: score += 20
@@ -179,10 +181,14 @@ def scan_one(code, name, price):
         ml = detect_multilevel_buy_signals(code, price=close)
         if ml.get("tier") and ml["tier"] != "无信号":
             if best is None:
+                # 【2026-08-13 修复 BUG】日线无"一买"信号时, 不应列为"接近确认"
+                # 原逻辑 near=True + ratio=999/dlpp=0 会把所有有tier的股票硬塞进接近列表
+                # 导致 2464 只接近确认全部 DL_P=0.00(无信号垃圾条目)
+                # 现在: 无日线信号 → near=False, 不进接近列表(仅保留tier用于分层)
                 best = {
                     "code": code, "name": name, "price": close or price,
                     "ratio": 999, "dlp": 0, "valid": False,
-                    "confirmed": False, "near": True, "score": 10,
+                    "confirmed": False, "near": False, "score": 10,
                     "sig_type": "盘整背驰",    # 默认: 单中枢盘整
                     "sig_label": "ABC买卖区间",
                     "label": "ABC买卖区间",
