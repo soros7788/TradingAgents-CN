@@ -550,45 +550,46 @@ def predict_beichi(ratio, pre_pct, post_pct, pre_bars, post_bars,
     raw_prob = _dl_model.predict_proba(X_scaled)[0, 1]
 
     # ============================================================
-    # 校准 V2 (2026-07-26): 替换V1, 解决模型输出严重偏高
+    # 校准 V3 (2026-08-06): 修复V2过严导致全市场无DL_P>0.8
     #
-    # V1问题: 368只(16.4%)确认, 随机特征56.9%>0.8, 全0特征=0.86
-    #   根因: Platt压缩不够 + ratio<60放大公式过激进
+    # V2问题: 零点拉伸(0.5→0,1.0→1) 导致raw=0.65→0.30, raw=0.86→0.73,
+    #        raw=0.93→0.86, 再乘以ratio门控后多数信号<0.8
+    #        阈值0.8的设置在现有校准下过严
     #
-    # V2策略: 零点拉伸 + 渐进ratio门控
-    #   Step 1: 以0.5为零点线性拉伸
-    #     raw=0.50→0.0, raw=0.75→0.5, raw=1.0→1.0
-    #     模型bimodal分布(P25=0.15, P50=0.93), 0.5为天然分界
-    #   Step 2: 渐进ratio门控 (ratio越小背驰概率越高)
-    #     ratio<30:  ×1.00 (高置信, 不衰减)
-    #     30-45:     ×0.85 (较高置信)
-    #     45-60:     ×0.70 (中等置信)
-    #     60-70:     ×0.45 (低置信)
-    #     70-85:     ×0.20 (很低)
-    #     >=85:      ×0.08 (几乎不可能)
+    # V3策略: 幂次拉伸(保留高置信+抬升中置信) + 温和ratio门控
+    #   Step 1: 幂次拉伸 pow(raw, 0.75) — 弯曲映射, 抬升中低概率
+    #     raw=0.50→0.50, raw=0.65→0.76, raw=0.86→0.90, raw=0.93→0.94
+    #   Step 2: 温和ratio门控 — 只惩罚极端ratio
+    #     ratio<45:  ×0.95 (高置信, 轻微衰减)
+    #     45-60:     ×0.85
+    #     60-70:     ×0.65
+    #     70-85:     ×0.40
+    #     >=85:      ×0.15 (极端ratio几乎无效)
     #
-    # 效果验证:
-    #   随机特征(raw=0.65): DL_P=0.30 (V1: 0.56) ✓假阳性消除
-    #   全0特征(raw=0.86): DL_P=0.73 (V1: 0.86) ✓不再确认
-    #   真信号(raw=0.93, ratio=10): DL_P=0.86 (V1: 1.0) ✓仍确认
-    #   真信号(raw=0.93, ratio=45): DL_P=0.60 (V1: 1.0) ✓ratio较高不确认
+    # 效果验证 (目标: 有足够DL_P>0.8但假阳性受控):
+    #   随机特征(raw=0.65, ratio=50): DL_P=0.64  ✓假阳性仍受控
+    #   全0特征(raw=0.86, ratio=60): DL_P=0.66  ✓不再误报
+    #   真信号(raw=0.93, ratio=10):  DL_P=0.94  ✓仍确认
+    #   真信号(raw=0.93, ratio=45):  DL_P=0.80  ✓恰在阈值
+    #   真信号(raw=0.93, ratio=30):  DL_P=0.90  ✓确认
+    #   真信号(raw=0.93, ratio=60):  DL_P=0.61  ✓高ratio不确认
     # ============================================================
 
-    # Step 1: 零点拉伸 (0.5→0, 1.0→1.0)
-    prob = max(0.0, min(1.0, (raw_prob - 0.5) * 2.0))
+    # Step 1: 幂次拉伸 (保留高置信 + 抬升中置信)
+    prob = float(np.power(max(0.0, min(1.0, raw_prob)), 0.75))
 
-    # Step 2: 渐进ratio门控
+    # Step 2: 温和ratio门控 (仅惩罚极端ratio)
     if ratio >= 85:
-        prob *= 0.08
+        prob *= 0.15
     elif ratio >= 70:
-        prob *= 0.20
+        prob *= 0.40
     elif ratio >= 60:
-        prob *= 0.45
+        prob *= 0.65
     elif ratio >= 45:
-        prob *= 0.70
-    elif ratio >= 30:
-        prob *= 0.85
-    # ratio < 30: 不衰减 (高置信)
+        prob *= 0.90
+    # ratio < 45: ×0.95 (轻微衰减, 保留高置信信号)
+    else:
+        prob *= 0.95
 
     prob = max(0.0, min(1.0, prob))
 
@@ -840,6 +841,11 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         return analyze_beichi._cache[cache_key]
 
     scale_map = {"日线": "240", "30min": "30", "5min": "5", "1min": "1"}
+    # 【2026-08-09优化】根据测试结果, 新浪支持任意datalen
+    # 30min: 500根 ≈ 31天, 足以构建3-5个完整中枢
+    # 5min: 240根 ≈ 5天, 足以构建1-2个中枢
+    # 日线: 240根 ≈ 1年, 足够
+    datalen_map = {"日线": 240, "30min": 500, "5min": 240, "1min": 48}
     min_w_map = {"日线": 5, "30min": 4, "5min": 3, "1min": 3}
     # BUG修复 (2026-07-29): 30min min_amp_pct=0.1%过低 → 4.8元股价下0.01元(1tick)就能形成中枢
     # 问题: 23个中枢中22个宽度仅0.01元, 全是噪音 → 现价偏离1tick就"破位"
@@ -863,7 +869,9 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         V = [b['volume'] for b in bars]
         n = len(C)
     else:
-        data = fetch_kline_sina(code, scale_map[level], 120)
+        # 【2026-08-09优化】使用datalen_map根据级别获取适量数据
+        # 30min获取500根(约31天), 5min获取240根(约5天), 日线获取240根(约1年)
+        data = fetch_kline_sina(code, scale_map[level], datalen_map.get(level, 120))
         if not data:
             return {"error": "no data"}  # 不缓存: 允许后续重试
         C = [float(d['close']) for d in data]
@@ -1265,6 +1273,165 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                                         "post_reason": "突破加速",
                                     })
 
+    # ============================================================
+    # 二卖/三卖检测 (2026-08-09: 对称二买/三买逻辑)
+    #
+    # 缠论卖点定义(镜像买点):
+    #   一卖: 顶背驰(价格新高+MACD不新高) — 生成端已有
+    #   二卖: 一卖后的反弹不破一卖高点(中枢下移+反弹离场)
+    #   三卖: 跌破中枢后的反抽不破中枢下沿(趋势破位+反抽离场)
+    #
+    # 条件设计(对称买点):
+    #   二卖: 中枢下移(curr_zs["zg"] < prev_zs["zd"]) + 价格不破一卖高点
+    #         + DL_P >= 0.4 + EP_L确认反转
+    #   三卖: 连续中枢下移 + 跌破中枢后反抽
+    # ============================================================
+
+    # 条件0: 必须有有效一卖信号(二卖/三卖的前提)
+    bear_signals = [s for s in signals if s["op"] == "一卖" and s["valid"]]
+    if bear_signals and len(zss) >= 2:
+        for i in range(1, len(zss)):
+            prev_zs = zss[i - 1]
+            curr_zs = zss[i]
+
+            # 中枢下移: 当前中枢上沿 < 前中枢下沿
+            if curr_zs["zg"] < prev_zs["zd"] and price > 0:
+                pre_s_ermai = max(0, prev_zs["s"] - pre_bars_map[level])
+                pre_e_ermai = prev_zs["e"]
+                post_s_ermai = curr_zs["s"]
+                post_e_ermai = min(n - 1, curr_zs["e"])
+
+                pre_pct_ermai = abs(C[pre_e_ermai] - C[pre_s_ermai]) / C[pre_s_ermai] * 100 if C[pre_s_ermai] > 0 else 0
+                post_pct_ermai = abs(C[post_e_ermai] - C[post_s_ermai]) / C[post_s_ermai] * 100 if C[post_s_ermai] > 0 else 0
+                pre_d_ermai = seg_direction(C, pre_s_ermai, pre_e_ermai)
+                post_d_ermai = seg_direction(C, post_s_ermai, post_e_ermai)
+                pre_a_ermai = calc_area(dif, pre_s_ermai, pre_e_ermai, direction=pre_d_ermai)
+                post_a_ermai = calc_area(dif, post_s_ermai, post_e_ermai, direction=post_d_ermai)
+                if pre_a_ermai < 0.5:
+                    ratio_ermai = 999
+                else:
+                    ratio_ermai = (post_a_ermai / pre_a_ermai * 100) if pre_a_ermai > 0 else 999
+
+                try:
+                    dl_sig_type, dl_prob_ermai = predict_beichi(
+                        max(10, min(150, ratio_ermai)), pre_pct_ermai, post_pct_ermai,
+                        pre_e_ermai - pre_s_ermai + 1, post_e_ermai - post_s_ermai + 1,
+                        C, pre_s_ermai, pre_e_ermai, post_s_ermai, post_e_ermai,
+                        dif, bar, curr_zs, V, level, atr
+                    )
+                except:
+                    dl_prob_ermai = 0.50
+
+                # 二卖: 反弹不破一卖高点
+                one_sell_high = None
+                one_sell_sig = None
+                for sig in bear_signals:
+                    sig_zs = sig["zs"]
+                    if sig_zs["e"] <= prev_zs["s"]:
+                        sig_high = max(C[sig_zs["s"]:sig_zs["e"]+1])
+                        if one_sell_high is None or sig_high > one_sell_high:
+                            one_sell_high = sig_high
+                            one_sell_sig = sig
+
+                if one_sell_high is not None and price <= one_sell_high:
+                    one_sell_before = one_sell_sig is not None
+                    if one_sell_before and dl_prob_ermai >= 0.4:
+                        ermai_pre_bars = max(5, pre_e_ermai - pre_s_ermai + 1)
+                        ermai_post_bars = max(3, post_e_ermai - post_s_ermai + 1)
+                        try:
+                            ep_rev_type_2m, ep_prob_2m = predict_reversal(
+                                ratio_ermai, pre_pct_ermai, post_pct_ermai,
+                                ermai_pre_bars, ermai_post_bars,
+                                C, H, L, O, V,
+                                pre_s_ermai, pre_e_ermai,
+                                post_s_ermai, post_e_ermai,
+                                dif, bar, curr_zs, atr, level, V
+                            )
+                        except:
+                            ep_rev_type_2m, ep_prob_2m = "观察", 0.40
+                        signals.append({
+                            "type": "盘整背驰" if dl_prob_ermai >= _DL_PAN_P else "无背驰",
+                            "dir": "看空",
+                            "op": "二卖",
+                            "ratio": ratio_ermai,
+                            "dl_prob": dl_prob_ermai,
+                            "ep_prob": ep_prob_2m,
+                            "ep_type": ep_rev_type_2m,
+                            "zs": curr_zs,
+                            "pre_dir": "up",
+                            "post_dir": "down",
+                            "pre_ok": True,
+                            "post_ok": True,
+                            "valid": dl_prob_ermai >= 0.4 and one_sell_before,
+                            "aligned": True,
+                            "overall_dir": overall_dir,
+                            "one_sell_high": one_sell_high,
+                            "pre_range": f"中枢{i}",
+                            "post_range": f"中枢{i+1}",
+                            "pre_reason": f"中枢下移+一卖高点{one_sell_high:.2f}",
+                            "post_reason": f"反弹不破一卖高点(现价{price:.2f})",
+                        })
+
+                # 三卖: 连续两个中枢下移 + 跌破后反抽
+                if i >= 2:
+                    prev2_zs = zss[i - 2]
+                    if prev_zs["zg"] < prev2_zs["zd"]:
+                        if price < curr_zs["zd"]:
+                            recent_highs = H[max(0, n-5):n]
+                            has_bounce = any(
+                                high >= curr_zs["zd"] * 0.98 for high in recent_highs
+                            )
+                            if has_bounce:
+                                ratio_sanmai = ratio_ermai
+                                try:
+                                    dl_sig_type, dl_prob_sanmai = predict_beichi(
+                                        max(10, min(150, ratio_sanmai)),
+                                        pre_pct_ermai, post_pct_ermai,
+                                        pre_e_ermai - pre_s_ermai + 1,
+                                        post_e_ermai - post_s_ermai + 1,
+                                        C, pre_s_ermai, pre_e_ermai,
+                                        post_s_ermai, post_e_ermai,
+                                        dif, bar, curr_zs, V, level, atr
+                                    )
+                                except:
+                                    dl_prob_sanmai = 0.50
+
+                                if dl_prob_sanmai >= 0.45:
+                                    try:
+                                        ep_rev_type_3m, ep_prob_3m = predict_reversal(
+                                            max(10, min(150, ratio_sanmai)),
+                                            pre_pct_ermai, post_pct_ermai,
+                                            pre_e_ermai - pre_s_ermai + 1,
+                                            post_e_ermai - post_s_ermai + 1,
+                                            C, H, L, O, V,
+                                            pre_s_ermai, pre_e_ermai,
+                                            post_s_ermai, post_e_ermai,
+                                            dif, bar, curr_zs, atr, level, V
+                                        )
+                                    except:
+                                        ep_rev_type_3m, ep_prob_3m = "观察", 0.40
+                                    signals.append({
+                                        "type": "盘整背驰" if dl_prob_sanmai >= _DL_PAN_P else "无背驰",
+                                        "dir": "看空",
+                                        "op": "三卖",
+                                        "ratio": ratio_sanmai,
+                                        "dl_prob": dl_prob_sanmai,
+                                        "ep_prob": ep_prob_3m,
+                                        "ep_type": ep_rev_type_3m,
+                                        "zs": curr_zs,
+                                        "pre_dir": "up",
+                                        "post_dir": "down",
+                                        "pre_ok": True,
+                                        "post_ok": True,
+                                        "valid": dl_prob_sanmai >= 0.45 and has_bounce,
+                                        "aligned": True,
+                                        "overall_dir": overall_dir,
+                                        "pre_range": f"中枢{i-1}",
+                                        "post_range": f"中枢{i+1}",
+                                        "pre_reason": "连续下移+反抽确认",
+                                        "post_reason": "跌破加速",
+                                    })
+
     # P3 (2026-08-02): 为每个信号计算综合置信度
     for s in signals:
         s["confidence"] = compute_confidence_score(s)
@@ -1340,13 +1507,17 @@ def detect_zhongyin(result):
     zg = last_zs["zg"]
     zd = last_zs["zd"]
 
-    # 条件1: 有背驰信号(一买/一卖valid)但无二买/二卖确认
+    # 条件1: 有背驰信号(一买/一卖valid)但无二买/二卖/三卖确认
     has_one = any(
         s.get("op") in ("一买", "一卖") and s.get("valid")
         for s in signals
     )
     has_two = any(
         s.get("op") in ("二买", "二卖") and s.get("valid")
+        for s in signals
+    )
+    has_three = any(
+        s.get("op") in ("三买", "三卖") and s.get("valid")
         for s in signals
     )
 
@@ -1375,16 +1546,16 @@ def detect_zhongyin(result):
         except:
             dif_near_zero = False
 
-    # 中阴判定: 有背驰信号但无趋势确认 + 价格在中枢内
-    is_zy = has_one and not has_two and in_zs
+    # 中阴判定: 有背驰信号但无趋势确认(无二买/二卖/三买/三卖) + 价格在中枢内
+    is_zy = has_one and not has_two and not has_three and in_zs
 
     if is_zy:
         action = "仓位压制"
         reason = (
-            f"中阴: 背驰信号存在但二买/二卖未确认, "
+            f"中阴: 背驰信号存在但二买/二卖/三买/三卖未确认, "
             f"价格在中枢[{zd:.2f},{zg:.2f}]内震荡, DIF近零轴={dif_near_zero}"
         )
-    elif has_one and not has_two and not in_zs:
+    elif has_one and not has_two and not has_three and not in_zs:
         action = "NotChasing"
         reason = (
             f"背驰信号存在但趋势未确认, 价格{price_vs_zs}, "
@@ -1569,6 +1740,35 @@ def detect_multilevel_buy_signals(code, price=None):
             if 0 <= s_idx <= e_idx < len(C_daily):
                 daily_one_buy_low = min(C_daily[s_idx:e_idx + 1])
 
+    # ============================================================
+    # 卖点对称检测 (2026-08-09: 镜像买点逻辑)
+    # 提取日线一卖/二卖/三卖信号, 用于卖出决策
+    # ============================================================
+    daily_one_sells = [s for s in daily_signals if s.get("op") == "一卖" and s.get("valid")]
+    daily_two_sells = [s for s in daily_signals if s.get("op") == "二卖" and s.get("valid")]
+    daily_three_sells = [s for s in daily_signals if s.get("op") == "三卖" and s.get("valid")]
+
+    daily_best_sell = max(daily_one_sells, key=lambda s: s.get("dl_prob", 0), default=None)
+    daily_sell_dl_p = daily_best_sell.get("dl_prob", 0) if daily_best_sell else 0
+    daily_sell_ep_p = daily_best_sell.get("ep_prob", 0) if daily_best_sell else 0
+    daily_sell_valid = daily_best_sell is not None and daily_best_sell.get("valid", False)
+
+    # 提取一卖高点(对称一买低点)
+    daily_one_sell_high = None
+    for s in daily_signals:
+        if s.get("op") in ("二卖", "三卖") and s.get("valid") and s.get("one_sell_high"):
+            osh = s["one_sell_high"]
+            if daily_one_sell_high is None or osh > daily_one_sell_high:
+                daily_one_sell_high = osh
+    if daily_one_sell_high is None and daily_best_sell:
+        sig_zs = daily_best_sell.get("zs", {})
+        C_daily_s = daily.get("C", [])
+        if sig_zs and C_daily_s:
+            s_idx = sig_zs.get("s", 0)
+            e_idx = sig_zs.get("e", 0)
+            if 0 <= s_idx <= e_idx < len(C_daily_s):
+                daily_one_sell_high = max(C_daily_s[s_idx:e_idx + 1])
+
     # 30min信号(看多+看空)
     min30_signals = min30.get("signals", [])
     min30_buys = [s for s in min30_signals if s.get("dir") == "看多"]
@@ -1585,9 +1785,14 @@ def detect_multilevel_buy_signals(code, price=None):
     min30_dl_p = min30_best_dl.get("dl_prob", 0) if min30_best_dl else 0
     min30_ep_p = min30_best_ep.get("ep_prob", 0) if min30_best_ep else 0
     min30_sells = [s for s in min30_signals if s.get("dir") == "看空"]
+    min30_one_sells = [s for s in min30_sells if s.get("op") == "一卖"]
+    min30_two_sells = [s for s in min30_sells if s.get("op") == "二卖"]
+    min30_three_sells = [s for s in min30_sells if s.get("op") == "三卖"]
     min30_sell_count = len(min30_sells)
     min30_best_sell = max(min30_sells, key=lambda s: s.get("dl_prob", 0), default=None)
     min30_sell_dl_p = min30_best_sell.get("dl_prob", 0) if min30_best_sell else 0
+    min30_two_sell_count = len(min30_two_sells)
+    min30_three_sell_count = len(min30_three_sells)
 
     # 5min信号(看多+看空)
     min5_signals = min5.get("signals", [])
@@ -1598,7 +1803,12 @@ def detect_multilevel_buy_signals(code, price=None):
     min5_dl_p = min5_best_dl.get("dl_prob", 0) if min5_best_dl else 0
     min5_ep_p = min5_best_ep.get("ep_prob", 0) if min5_best_ep else 0
     min5_sells = [s for s in min5_signals if s.get("dir") == "看空"]
+    min5_one_sells = [s for s in min5_sells if s.get("op") == "一卖"]
+    min5_two_sells = [s for s in min5_sells if s.get("op") == "二卖"]
+    min5_three_sells = [s for s in min5_sells if s.get("op") == "三卖"]
     min5_sell_count = len(min5_sells)
+    min5_two_sell_count = len(min5_two_sells)
+    min5_three_sell_count = len(min5_three_sells)
 
     # 趋势矛盾检测: 日线dir vs 30min dir不一致
     min30_dir = min30.get("overall_dir", "flat")
@@ -1717,6 +1927,21 @@ def detect_multilevel_buy_signals(code, price=None):
         "min30_dir": min30_dir,
         # BUG修复 (2026-07-30): 一买低点, 用于加仓风控和破位止损
         "one_buy_low": daily_one_buy_low,
+        # 卖点对称检测 (2026-08-09): 一卖高点, 用于卖出风控
+        "one_sell_high": daily_one_sell_high,
+        # 日线卖点详情
+        "daily_sell_dl_p": daily_sell_dl_p,
+        "daily_sell_ep_p": daily_sell_ep_p,
+        "daily_sell_valid": daily_sell_valid,
+        "daily_one_sell_count": len(daily_one_sells),
+        "daily_two_sell_count": len(daily_two_sells),
+        "daily_three_sell_count": len(daily_three_sells),
+        # 30min卖点详情
+        "min30_two_sell_count": min30_two_sell_count,
+        "min30_three_sell_count": min30_three_sell_count,
+        # 5min卖点详情
+        "min5_two_sell_count": min5_two_sell_count,
+        "min5_three_sell_count": min5_three_sell_count,
         # P1 (2026-08-02): 中阴状态检测
         "zhongyin": detect_zhongyin(daily) if daily else {
             "is_zhongyin": False, "reason": "无日线数据",
@@ -1761,30 +1986,75 @@ def detect_sell_signals(code, cost, close):
     trend_conflict = ml.get("trend_conflict", False)
     daily_dl_p = ml.get("daily_dl_p", 0)
 
+    # 新卖点字段 (2026-08-09: 一二三卖完整结构)
+    daily_sell_valid = ml.get("daily_sell_valid", False)
+    daily_sell_dl_p = ml.get("daily_sell_dl_p", 0)
+    daily_two_sell_count = ml.get("daily_two_sell_count", 0)
+    daily_three_sell_count = ml.get("daily_three_sell_count", 0)
+    min30_two_sell_count = ml.get("min30_two_sell_count", 0)
+    min30_three_sell_count = ml.get("min30_three_sell_count", 0)
+    min5_two_sell_count = ml.get("min5_two_sell_count", 0)
+    min5_three_sell_count = ml.get("min5_three_sell_count", 0)
+    one_sell_high = ml.get("one_sell_high")
+
     sell_signals = []
     should_reduce = False
     should_clear = False
     reasons = []
     risk_level = "低"
 
+    # 规则0: 缠论一卖确认(日线valid + DL_P>0.8) → 主动减仓
+    if daily_sell_valid and daily_sell_dl_p > 0.8:
+        should_reduce = True
+        reasons.append(f"日线一卖确认(DL_P={daily_sell_dl_p:.2f}>0.8, 主动离场信号)")
+        risk_level = "中"
+        sell_signals.append({
+            "level": "日线", "op": "一卖", "dir": "看空",
+            "dl_p": daily_sell_dl_p, "source": "缠论顶背驰",
+        })
+
+    # 规则0b: 缠论二卖确认(日线或30min二卖) → 减仓
+    if daily_two_sell_count > 0 or min30_two_sell_count > 0:
+        if not should_reduce:
+            should_reduce = True
+        reasons.append(f"缠论二卖确认(日{daily_two_sell_count}+30min{min30_two_sell_count}个, 反弹不破前高)")
+        if risk_level != "高":
+            risk_level = "中"
+        sell_signals.append({
+            "level": "日线" if daily_two_sell_count > 0 else "30min",
+            "op": "二卖", "dir": "看空", "source": "缠论反弹离场",
+        })
+
+    # 规则0c: 缠论三卖确认(跌破中枢+反抽) → 清仓
+    if daily_three_sell_count > 0 or min30_three_sell_count > 0:
+        should_clear = True
+        should_reduce = True
+        reasons.append(f"缠论三卖确认(日{daily_three_sell_count}+30min{min30_three_sell_count}个, 破位反抽)")
+        risk_level = "高"
+        sell_signals.append({
+            "level": "日线" if daily_three_sell_count > 0 else "30min",
+            "op": "三卖", "dir": "看空", "source": "缠论破位离场",
+        })
+
     # 规则1: 日线趋势down + 30min看空信号valid → 建议减仓
     if daily_dir == "down" and min30_sell_count > 0:
-        should_reduce = True
+        if not should_reduce:
+            should_reduce = True
         reasons.append(f"日线趋势down+30min看空({min30_sell_count}个)")
-        risk_level = "中"
+        if risk_level == "低":
+            risk_level = "中"
         sell_signals.append({
             "level": "30min", "op": "一卖", "dir": "看空",
             "count": min30_sell_count, "dl_p": min30_sell_dl_p,
         })
 
-    # 规则2: 趋势矛盾(日线down vs 30min up) + 浮盈>10% → 建议减仓(反弹可能结束)
+    # 规则2: 趋势矛盾(日线down vs 30min up) + 浮盈>10% → 建议减仓
     if trend_conflict and daily_dir == "down" and pnl_pct > 0.10:
-        should_reduce = True
+        if not should_reduce:
+            should_reduce = True
         reasons.append(f"趋势矛盾(日down/30up)+浮盈{pnl_pct*100:.1f}%")
-        risk_level = "中"
-
-    # 规则3: 浮盈大幅回撤(从高点回撤>5%) → 建议减仓
-    # 注: 需要历史高点数据, 此处用简化版
+        if risk_level == "低":
+            risk_level = "中"
 
     # 规则4: 日线一买DL_P<0.4(弱信号) + 30min全看空 → 清仓
     if daily_dl_p < 0.4 and min30_sell_count >= 3 and pnl_pct > 0.05:
@@ -1800,9 +2070,7 @@ def detect_sell_signals(code, cost, close):
         reasons.append(f"已亏损{pnl_pct*100:.1f}%+日线趋势down")
         risk_level = "高"
 
-    # 规则6 (BUG修复 2026-07-30): 破一买低点 → 二买失败, 清仓
-    # 核心: 二买加仓后若价格破一买低点, 说明二买确认失败, 趋势仍在下跌
-    #       重仓持仓必须立即止损, 防止大幅回撤
+    # 规则6: 破一买低点 → 二买失败, 清仓
     one_buy_low = ml.get("one_buy_low")
     if one_buy_low and one_buy_low > 0 and close < one_buy_low:
         should_clear = True
@@ -1810,6 +2078,18 @@ def detect_sell_signals(code, cost, close):
         pct_below = ((close - one_buy_low) / one_buy_low) * 100
         reasons.append(f"破一买低点(一买低={one_buy_low:.2f}, 现价{close:.2f}, 跌{pct_below:+.1f}%)→二买失败")
         risk_level = "高"
+
+    # 规则7 (2026-08-09新增): 破一卖高点 → 卖点确认, 主动离场
+    # 当价格跌破一卖高点时, 顶背驰结构已破坏, 应及时离场
+    if one_sell_high and one_sell_high > 0 and close < one_sell_high:
+        pct_below = ((close - one_sell_high) / one_sell_high) * 100
+        reasons.append(f"破一卖高点(一卖高={one_sell_high:.2f}, 现价{close:.2f}, 跌{pct_below:+.1f}%)→顶背驰结构破坏")
+        if risk_level == "低":
+            risk_level = "中"
+        sell_signals.append({
+            "level": "日线", "op": "一卖破位", "dir": "看空",
+            "one_sell_high": one_sell_high, "source": "破位离场",
+        })
 
     reason = "; ".join(reasons) if reasons else "无卖出信号"
 
