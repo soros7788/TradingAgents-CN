@@ -23,6 +23,13 @@ load_dotenv(project_root / ".env", override=True)
 # 导入统一日志系统
 from tradingagents.utils.logging_init import setup_web_logging
 logger = setup_web_logging()
+# === 消费层 shim 注入 (SINGLE_WRITER 启动期一次) ===
+# 将 ak.stock_zh_a_minute 重定向到共享盘 K 线缓存, 破除 1970 行硬顶, 去网络依赖。
+# 零改 sealed: 仅运行时 setattr; 未覆盖 / 非 "" adjust -> 回退 live (graceful)。
+# 数据源 KLINE_CACHE_DIR 默认 5TB 共享盘挂载, VM-B 可设本地 sh mirror。
+from tradingagents.utils.kline_cache_shim import install_kline_cache_shim
+install_kline_cache_shim()
+
 
 # 添加配置管理器
 try:
