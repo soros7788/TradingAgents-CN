@@ -22,6 +22,7 @@ import os
 import signal
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -343,6 +344,85 @@ def _scan_one_with_timeout(code, name, price, timeout=None):
         signal.signal(signal.SIGALRM, old)
 
 
+def _build_jev_prompt(row: dict) -> str:
+    """把 PASS 标的的双引擎判据汇总成 JEV 可读的英文描述。
+
+    JEV 是纯文本输入模型, 不接受 K 线。这里把递归A(方向/趋势/证据计数)
+    + 区间套B(多空确认) + 分层方向 转成一段紧凑的评估文本。
+    """
+    rs = row.get("recursive_summary", {}) or {}
+    timing = row.get("interval_timing", {}) or {}
+    align = row.get("alignment_overall", {}) or {}
+
+    t = [
+        f"symbol {row.get('code')} ({row.get('name') or 'unknown'})",
+        f"A-engine direction {row.get('recursive_direction')}",
+        f"confirmed bullish trends {rs.get('trend_bullish')}, bearish {rs.get('trend_bearish')}",
+        f"confirmed bullish segments {rs.get('segment_bullish')}, bearish {rs.get('segment_bearish')}",
+        f"trend score {rs.get('trend_score')}, segment score {rs.get('segment_score')}",
+        f"evidence total {rs.get('evidence_total')} (confirmed {rs.get('confirmed')}, forming {rs.get('forming')})",
+        f"unison R2/R1/R0 {rs.get('r2_dir')}/{rs.get('r1_dir')}/{rs.get('r0_dir')}, three_way {rs.get('three_way_unison')}",
+        f"B-engine bullish confirmed {timing.get('bullish_confirmed')}, bearish {timing.get('bearish_confirmed')}, interval total {timing.get('total')}",
+        f"alignment gate_modifier {align.get('gate_modifier')}, alignment ok {align.get('aligned')}",
+    ]
+    return ". ".join(t)
+
+
+def jev_secondary_gate(row: dict, key: str = None, threshold: float = 0.55) -> dict:
+    """JEV 二次门禁 (PASS 后追加): 用 JEV 对双引擎已判 PASS 的标的再做一次评估。
+
+    2026-09-22: JEV 系统一模型, 纯文本。将行内递归/区间套判据喂给 JEV 的
+    Noul(Yes/No) 接口判断"该标的是否构成值得纳入的看多机会"。
+
+    默认关闭 (需环境变量 JEV_GATE=1 或调用方显式启用)。
+    返回 dict: {prob, verdict, error}。verdict: 'PASS'/'FAIL'/'ERROR'。
+    threshold 未命中返回 FAIL; 调用异常返回 ERROR (不阻断主流程)。
+    """
+    try:
+        import os as _os
+        # key 来源: 显式参数 > 环境变量 > ~/.typesafe_key 文件
+        # (.bashrc 只在交互 shell 生效, 非交互启动需显式读文件, 与项目约定一致)
+        _key = key or _os.environ.get("TYPESAFE_API_KEY")
+        if not _key:
+            try:
+                _kf = _os.path.expanduser("~/.typesafe_key")
+                import builtins
+                with builtins.open(_kf, "r", encoding="utf-8") as _fh:
+                    _key = _fh.read().strip()
+            except Exception:
+                _key = None
+        if not _key:
+            return {"prob": None, "verdict": "ERROR", "error": "TYPESAFE_API_KEY not set"}
+        from typesafe_sdk import Noul
+        from typesafe_sdk import TypeSafeClient
+
+        base = _os.environ.get("JEV_BASE_URL", "https://api.typesafe.ai")
+        transport = None
+        _px = _os.environ.get("JEV_PROXY") or _os.environ.get("HTTPS_PROXY")
+        if _px:
+            try:
+                import httpx2 as _hh
+                transport = _hh.HTTPTransport(proxy=_px, verify=True)
+            except Exception:
+                transport = None
+
+        client = TypeSafeClient(
+            api_key=_key,
+            base_url=base, transport=transport, timeout=_os.environ.get("JEV_TIMEOUT", 30.0) or 30.0,
+        )
+        prompt = _build_jev_prompt(row)
+        resp = client.system_one(
+            state=prompt,
+            questions={"is_worthlong": Noul(
+                instructions="Given the A-direction, B-timing and evidence counts, is this stock a worthwhile long candidate to include?")},
+        )
+        prob = float(resp.answers["is_worthlong"].noul)
+        verdict = "PASS" if prob >= threshold else "FAIL"
+        return {"prob": prob, "verdict": verdict, "error": None}
+    except Exception as e:  # noqa: BLE001 — JEV 失败不阻断主流程
+        return {"prob": None, "verdict": "ERROR", "error": f"{type(e).__name__}: {e}"}
+
+
 def _append_ledger_row(ledger_path: str, row: dict) -> None:
     """把 Stage2 行写入账本 (jsonl, append-only)。行内带完整信号字段。
 
@@ -356,6 +436,13 @@ def _append_ledger_row(ledger_path: str, row: dict) -> None:
         if v is None:
             return None
         if isinstance(v, (bool, int, float, str)):
+            try:
+                if isinstance(v, float):
+                    import math as _m
+                    if _m.isnan(v) or _m.isinf(v):
+                        return None
+            except Exception:
+                pass
             return v
         try:
             import numpy as _np
@@ -377,6 +464,13 @@ def _append_ledger_row(ledger_path: str, row: dict) -> None:
         "confirmed": _native(row.get("confirmed")),
         "near": _native(row.get("near")),
         "name": row.get("name", ""),
+        # F1 (2026-09-23 WORKBUDDY): JEV 二次门禁判分落盘, 使 JEV 判了什么可审计.
+        # row["jev"] = {prob, verdict, error} (见 jev_secondary_gate). 无 JEV 时为 None.
+        "jev_prob": _native((row.get("jev") or {}).get("prob")),
+        "jev_verdict": (row.get("jev") or {}).get("verdict"),
+        # H2a (2026-09-24): 透传 error 键 — ERROR 标带真实原因, 消除 JEV v9 读到的 error=None 空洞假象
+        # (此前 _append_ledger_row entry 未写 error 字段, 导致数据质量/异常原因丢失)
+        "error": row.get("error"),
     }
     try:
         p = os.path.expanduser(ledger_path)
@@ -385,6 +479,73 @@ def _append_ledger_row(ledger_path: str, row: dict) -> None:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:  # noqa: BLE001 — 账本写失败不阻断扫描
         print(f"  [ledger] WARN write failed for {row.get('code')}: {e}", flush=True)
+
+
+def _process_one(code, base, is_confirmed, as_of, no_beichi, vm_tag):
+    """F2 (2026-09-24): Stage2 单只处理单元, 供 ProcessPoolExecutor 并发调用。
+
+    包含原串行循环体内的全部逻辑: run_dual_engine -> PASS补算 -> JEV二次门禁,
+    但**不写账本/不 sleep/不 print 进度**(这些由主进程串行负责, 保持账本原子性)。
+    注意: 子进程是独立进程, 各自有主线程, _scan_one_with_timeout 内的 SIGALRM 可用。
+    依赖 fork 启动 (Linux 默认), 子进程继承已导入的模块与 shim 状态。
+    最外层 try 保证单只崩溃(含非预期异常)降级为 ERROR 而非炸掉整个进程池。
+    """
+    try:
+        row = {"code": code, "name": base.get("name", ""), "price": base.get("price"),
+               "ratio": base.get("ratio"), "dlp": base.get("dlp"),
+               "stage1_confirmed": is_confirmed}
+        try:
+            verdict = run_dual_engine(code, as_of, price=row.get("price"))
+            row.update(verdict)
+        except Exception as e:  # noqa: BLE001 — 单标的失败不阻断
+            row.update({"gate": "ERROR", "error": f"{type(e).__name__}: {e}"})
+
+        # ── PASS 标的补算 DL_P/ratio ──
+        if (not no_beichi) and row.get("gate") == "PASS" \
+                and row.get("ratio") is None and row.get("price"):
+            try:
+                sig = _scan_one_with_timeout(code, row.get("name", ""), row["price"])
+                if sig:
+                    row["ratio"] = sig.get("ratio")
+                    row["dlp"] = sig.get("dlp")
+                    row["valid"] = sig.get("valid")
+                    row["confirmed"] = sig.get("confirmed")
+                    row["near"] = sig.get("near")
+                    row["score"] = sig.get("score")
+                    row["slp"] = sig.get("slp")
+                    row["slp_score"] = sig.get("slp_score")
+                    row["slp_valid"] = sig.get("slp_valid")
+                    row["slp_source"] = "scan_one_backfill"
+                    row["dlp_source"] = "scan_one_backfill"
+            except Exception as e:  # noqa: BLE001 — 补算失败不阻断主流程
+                row["dlp_error"] = f"{type(e).__name__}: {e}"
+
+        # ── JEV 二次门禁 ──
+        _jev_env = os.environ.get("JEV_GATE", "").strip()
+        _jev_on = _jev_env in ("1", "on", "true", "TRUE")
+        if not _jev_env:
+            try:
+                _jg = Path.home() / ".jev_gate"
+                if _jg.exists():
+                    _jev_on = _jg.read_text(encoding="utf-8").strip().lower() in ("1", "on", "true")
+            except Exception:
+                _jev_on = False
+        if _jev_on and row.get("gate") == "PASS":
+            _j = jev_secondary_gate(row)
+            row["jev"] = _j
+            if _j.get("verdict") == "FAIL":
+                row["gate"] = "PASS_JEVN"
+                row["jev_gate"] = "FAIL"
+            elif _j.get("verdict") == "ERROR":
+                row["jev_gate"] = "ERROR"
+            else:
+                row["jev_gate"] = "PASS"
+
+        row["vm"] = vm_tag
+        return row
+    except Exception as e:  # noqa: BLE001 — worker 兜底, 单只崩溃不炸池
+        return {"code": code, "gate": "ERROR",
+                "error": f"worker:{type(e).__name__}: {e}"}
 
 
 def main() -> int:
@@ -436,47 +597,33 @@ def main() -> int:
 
     # ── Stage 2: 双引擎门禁 ──
     print(f"[Stage2] 双引擎门禁 (递归A定方向 + 区间套B定时机), {len(codes)}只...")
-    for i, code in enumerate(codes, 1):
-        base = stage1_map.get(code, {})
-        row = {"code": code, "name": base.get("name", ""), "price": base.get("price"),
-               "ratio": base.get("ratio"), "dlp": base.get("dlp"),
-               "stage1_confirmed": code in confirmed_codes}
-        try:
-            verdict = run_dual_engine(code, as_of, price=row.get("price"))
-            row.update(verdict)
-        except Exception as e:  # noqa: BLE001 — 单标的失败不阻断
-            row.update({"gate": "ERROR", "error": f"{type(e).__name__}: {e}"})
+    # ── Stage 2 并发执行 (F2, 2026-09-24) ──
+    # 原串行循环改为: 抽取 _process_one 单元, ProcessPoolExecutor 并发跑,
+    # 主进程按原始顺序串行写账本(保持 jsonl 原子性) + 打印进度。
+    # 并发度默认 4 (DUAL2_WORKERS 可调); 子进程各自独立, SIGALRM/耗时可并行。
+    _workers = int(os.environ.get("DUAL2_WORKERS", "4"))
+    _serial = (args.codes and len(codes) <= 1) or _workers <= 1 or not codes
+    print(f"[Stage2] 双引擎门禁 (并发 workers={_workers}{' | 串行回退' if _serial else ''}), {len(codes)}只...")
 
-        # ── PASS 标的补算 DL_P/ratio (2026-09-13) ──
-        # Stage1 被跳过时 base 为空, price/ratio/dlp 全 None。
-        # 仅在 gate==PASS 时调 scan_one 补算, BLOCKED/NEUTRAL 跳过以省时间。
-        if (not args.no_beichi) and row.get("gate") == "PASS" \
-                and row.get("ratio") is None and row.get("price"):
-            try:
-                sig = _scan_one_with_timeout(code, row.get("name", ""), row["price"])
-                if sig:
-                    row["ratio"] = sig.get("ratio")
-                    row["dlp"] = sig.get("dlp")
-                    row["valid"] = sig.get("valid")
-                    row["confirmed"] = sig.get("confirmed")
-                    row["near"] = sig.get("near")
-                    row["score"] = sig.get("score")
-                    row["slp"] = sig.get("slp")
-                    row["slp_score"] = sig.get("slp_score")
-                    row["slp_valid"] = sig.get("slp_valid")
-                    row["slp_source"] = "scan_one_backfill"
-                    row["dlp_source"] = "scan_one_backfill"
-            except Exception as e:  # noqa: BLE001 — 补算失败不阻断主流程
-                row["dlp_error"] = f"{type(e).__name__}: {e}"
+    _jobs = [
+        (c, stage1_map.get(c, {}), c in confirmed_codes, as_of, args.no_beichi,
+         (args.vm or ("A" if args.codes_file else "?")))
+        for c in codes
+    ]
+    rows = []
+    if _serial:
+        for _j in _jobs:
+            rows.append(_process_one(*_j))
+    else:
+        with ProcessPoolExecutor(max_workers=_workers) as _ex:
+            rows = list(_ex.map(_process_one, *zip(*_jobs)))
 
-        # ── 账本写入 (2026-09-13: 打通 DL_P 链路) ──
-        _vm_tag = args.vm or ("A" if args.codes_file else "?")
-        row["vm"] = _vm_tag
+    # 主进程串行: 写账本(原子) + 累计 + 打印 (顺序与 codes 一致)
+    for i, row in enumerate(rows, 1):
         _append_ledger_row(args.ledger or LEDGER_PATH, row)
-
         report["dual"].append(row)
         rs = row.get('recursive_summary', {})
-        print(f"  [{i}/{len(codes)}] {code} {row.get('name','')} "
+        print(f"  [{i}/{len(codes)}] {row.get('code')} {row.get('name','')} "
               f"A={row.get('recursive_direction','-')} "
               f"(T↑{rs.get('trend_bullish',0)}/T↓{rs.get('trend_bearish',0)} "
               f"S↑{rs.get('segment_bullish',0)}/S↓{rs.get('segment_bearish',0)}"
@@ -485,8 +632,6 @@ def main() -> int:
               f" → {row.get('gate','ERROR')} "
               f"(B 多/空: {row.get('interval_timing',{}).get('bullish_confirmed','-')}/"
               f"{row.get('interval_timing',{}).get('bearish_confirmed','-')})")
-        if i < len(codes):
-            time.sleep(args.sleep)
 
     # ── 汇总 ──
     gates = {}
@@ -496,7 +641,9 @@ def main() -> int:
         # 双引擎 PASS 里按 DL_P 降序排 (DL 是补充选择项)
     # 2026-09-09: dlp > 0.618 黄金门槛过滤 (用户规则)
     DL_P_MIN = 0.618
-    all_pass = [r for r in report["dual"] if r["gate"] == "PASS"]
+    # 2026-09-22: PASS_JEVN 是 JEV 二次门禁拒掉的标的, 不计入通过名单
+    all_pass = [r for r in report["dual"] if r["gate"] in ("PASS", "PASS_JEVN")]
+    all_pass = [r for r in all_pass if r["gate"] == "PASS"]
     # 判断 dlp 是否可用（Stage1 可能被跳过导致全 null）
     has_dlp = any(r.get("dlp") is not None and r.get("dlp") > 0 for r in all_pass)
     if has_dlp:
