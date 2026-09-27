@@ -79,6 +79,14 @@ _EP_TREND_P = 0.6   # P>=0.6 → 高反转概率
 _EP_WATCH_P = 0.4    # P>=0.4 → 观察区间
 
 
+# 2026-09-08: EP_L 反转概率模型禁用。理由:
+#   - dual_scan Stage1 全市场扫描只用 DL_P (背驰概率) 生成一买候选池
+#   - EP_L (反转概率 AUC=0.68) 每只股票 analyze_beichi 都会预测, 但 Stage1 不消费
+#   - 杀掉 EP_L = 省模型加载 + 每只推理开销, 候选池零影响
+#   - 二买/三买的 EP_L 依赖 → fallback 默认 ep_prob=0.60, 保守不变
+
+_EP_ENABLED = False
+
 def _load_ep_model():
     """加载EP_L反转概率模型(懒加载)
 
@@ -86,6 +94,8 @@ def _load_ep_model():
     修复: 仅在成功或永久性错误时设_loaded=True
     """
     global _ep_model, _ep_scaler, _ep_meta, _ep_loaded
+    if not _EP_ENABLED:
+        return False
     if _ep_loaded:
         return _ep_model is not None
     try:
@@ -611,8 +621,248 @@ def _market_prefix(code):
         return "sz"
 
 
+def _validate_level_consistency(closes, realtime_price, tol=0.02):
+    """
+    校验某级别最新收盘价与实时价的一致性。
+    返回 (ok: bool, deviation_pct: float)。
+    - ok=True: 一致或在容差内 / 无实时价可比
+    - ok=False: 偏离超容差(典型为复权不一致或数据源异常)
+    deviation_pct = |close[-1]-price|/price*100
+    """
+    if not closes or not realtime_price or realtime_price <= 0:
+        return True, 0.0
+    last = closes[-1]
+    dev = abs(last - realtime_price) / realtime_price
+    return dev <= tol, dev * 100
+
+
+def _apply_qfq_factor(raw_ohlc, qfq_daily):
+    """
+    用 AKShare 前复权日线数据计算每个交易日的复权因子,
+    并对同一交易日的 O/H/L/C 统一应用 factor。
+
+    factor[date] = qfq_daily_close[date] / raw_daily_close[date]
+
+    参数:
+        raw_ohlc: dict  {"dates":[...], "O":[...], "H":[...], "L":[...], "C":[...]}
+        qfq_daily: dict {"dates":[...], "C":[...]}  前复权日线收盘价
+    返回:
+        成功 -> 调整后的 ohlc dict (O/H/L/C 都乘以对应日期 factor)
+        失败/无法对齐 -> None  (表示应回退 raw 数据)
+
+    设计约束:
+    - 同一 bar 的 O/H/L/C 使用同一个 factor
+    - 任何异常(factor<=0 / 对齐率不足 / 空数据)都返回 None, 禁止部分调整
+    - volume 不处理
+    """
+    if not raw_ohlc or not qfq_daily:
+        return None
+    raw_dates = raw_ohlc.get("dates")
+    raw_c = raw_ohlc.get("C")
+    qfq_dates = qfq_daily.get("dates")
+    qfq_c = qfq_daily.get("C")
+    if not raw_dates or not raw_c or not qfq_dates or not qfq_c:
+        return None
+    if len(raw_dates) != len(raw_c):
+        return None
+
+    qfq_map = {}
+    for d, c in zip(qfq_dates, qfq_c):
+        if d and c and c > 0:
+            qfq_map[str(d)[:10]] = float(c)
+
+    factor_map = {}
+    aligned = 0
+    for d, rc in zip(raw_dates, raw_c):
+        dk = str(d)[:10]
+        qc = qfq_map.get(dk)
+        if qc is None or rc is None or rc <= 0 or qc <= 0:
+            continue
+        factor = qc / float(rc)
+        if factor <= 0:
+            continue
+        factor_map[dk] = factor
+        aligned += 1
+
+    if aligned == 0 or aligned < len(raw_dates) * 0.5:
+        return None
+
+    o = raw_ohlc.get("O")
+    h = raw_ohlc.get("H")
+    l = raw_ohlc.get("L")
+    c = raw_ohlc.get("C")
+    if not o or not h or not l or not c:
+        return None
+    if not (len(o) == len(h) == len(l) == len(c) == len(raw_dates)):
+        return None
+
+    adj_o, adj_h, adj_l, adj_c = [], [], [], []
+    for i, d in enumerate(raw_dates):
+        dk = str(d)[:10]
+        f = factor_map.get(dk)
+        if f is None:
+            return None
+        adj_o.append(o[i] * f)
+        adj_h.append(h[i] * f)
+        adj_l.append(l[i] * f)
+        adj_c.append(c[i] * f)
+
+    return {
+        "dates": list(raw_dates),
+        "O": adj_o,
+        "H": adj_h,
+        "L": adj_l,
+        "C": adj_c,
+    }
+
+
+def _get_qfq_factor_for_code(code):
+    """
+    按code计算并缓存日线级别的前复权factor_map。
+    所有级别(日线/30min/5min/1min)共享同一交易日的factor,
+    保证多级别价格坐标一致, 不破坏区间套/中枢/高低点比较逻辑。
+
+    返回:
+        成功 -> { "YYYY-MM-DD": factor_float, ... }
+        失败 -> None  (任何异常: qfq请求失败/对齐不足/factor非法)
+
+    缓存键: code 字符串. 缓存于 _get_qfq_factor_for_code._cache
+    """
+    cache = getattr(_get_qfq_factor_for_code, '_cache', None)
+    if cache is None:
+        cache = {}
+        _get_qfq_factor_for_code._cache = cache
+    code_str = str(code)
+    if code_str in cache:
+        return cache[code_str]
+
+    factor_map = None
+    try:
+        qfq_daily = _fetch_qfq_closes(code_str, datalen=120)
+        if qfq_daily is None:
+            cache[code_str] = None
+            return None
+        raw_data = fetch_kline_sina(code_str, "240", 120)
+        if not raw_data:
+            cache[code_str] = None
+            return None
+        raw_dates = [str(d['day'])[:10] for d in raw_data]
+        raw_closes = [float(d['close']) for d in raw_data]
+        qfq_dates = qfq_daily.get("dates", [])
+        qfq_closes = qfq_daily.get("C", [])
+
+        qfq_map = {}
+        for d, c in zip(qfq_dates, qfq_closes):
+            if d and c is not None and c > 0:
+                qfq_map[str(d)[:10]] = float(c)
+
+        fm = {}
+        aligned = 0
+        for d, rc in zip(raw_dates, raw_closes):
+            qc = qfq_map.get(d)
+            if qc is None or rc is None or rc <= 0 or qc <= 0:
+                continue
+            f = qc / rc
+            if f <= 0:
+                continue
+            fm[d] = f
+            aligned += 1
+
+        if aligned > 0 and aligned >= len(raw_dates) * 0.5:
+            factor_map = fm
+    except Exception:
+        factor_map = None
+
+    cache[code_str] = factor_map
+    return factor_map
+
+
+def _fetch_qfq_closes(code, datalen=120):
+    """
+    从 AKShare 获取前复权日线数据(日期+收盘价)。
+    失败 / 空数据 / 异常 -> 返回 None。
+
+    返回格式: {"dates": ["YYYY-MM-DD", ...], "C": [float, ...]}
+    """
+    # 主源: AKShare 新浪日线(前复权)。
+    # 2026-09-03 变更: 原 ak.stock_zh_a_hist 走东方财富, 因全市场高频调用
+    # 导致本机 IP 被封(HTTP 000 / RemoteDisconnected), 改为新浪源。
+    # 降级链: ak.stock_zh_a_daily(qfq) -> fetch_kline_sina(不复权)
+    try:
+        import akshare as ak
+        prefix = _market_prefix(code)
+        df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq")
+        if df is not None and len(df) > 0:
+            dates = df.iloc[:, 0].astype(str).tolist()[-datalen:]
+            closes = df["close"].astype(float).tolist()[-datalen:]
+            if dates and closes and len(dates) == len(closes):
+                return {"dates": dates, "C": closes}
+    except Exception:
+        pass
+
+    # 降级: 新浪 K线接口(不复权, 近期无除权时与前复权一致)
+    try:
+        raw = fetch_kline_sina(code, scale="240", datalen=datalen)
+        if raw:
+            dates = [str(k["day"])[:10] for k in raw][-datalen:]
+            closes = [float(k["close"]) for k in raw][-datalen:]
+            if dates and closes and len(dates) == len(closes):
+                return {"dates": dates, "C": closes}
+    except Exception:
+        pass
+    return None
+
+
 def fetch_kline_sina(code, scale="240", datalen=120):
-    """从新浪获取K线数据"""
+    """从新浪获取K线数据 — CSV 缓存优先, API 兜底"""
+    # 🏗️ CSV 缓存优先 (2026-09-10: 新浪 456 限流)
+    _kdir = os.path.expanduser("~/TradingAgents-CN/kline_cache")
+    _day_csv = os.path.join(_kdir, f"{code}_day.csv")
+    if scale == "240" and os.path.exists(_day_csv):
+        try:
+            import pandas as pd
+            df = pd.read_csv(_day_csv)
+            if len(df) >= 100:
+                # 新浪返回格式: [{"day":"2026-07-14","open":x,"high":x,"low":x,"close":x,"volume":x}, ...]
+                _rows = df.tail(datalen)
+                _out = []
+                for _, r in _rows.iterrows():
+                    _out.append({
+                        "day": str(r.get("date", r.get("日期", "")))[:10],
+                        "open": float(r.get("open", r.get("开盘", 0))),
+                        "high": float(r.get("high", r.get("最高", 0))),
+                        "low": float(r.get("low", r.get("最低", 0))),
+                        "close": float(r.get("close", r.get("收盘", 0))),
+                        "volume": float(r.get("volume", r.get("成交量", 0))),
+                    })
+                if _out:
+                    # print(f"  [CSV HIT] {code} {len(_out)} bars")
+                    return _out
+        except Exception:
+            pass
+    # CSV miss — fallback 新浪 API
+    # 🏗️ CSV 缓存优先 (2026-09-10: 新浪 456 限流)
+    _kdir = os.path.expanduser("~/TradingAgents-CN/kline_cache")
+    _day_csv = os.path.join(_kdir, f"{code}_day.csv")
+    if scale == "240" and os.path.exists(_day_csv):
+        try:
+            import pandas as pd
+            df = pd.read_csv(_day_csv)
+            if len(df) >= 100:
+                _rows = df.tail(datalen)
+                _out = []
+                for _, r in _rows.iterrows():
+                    _out.append({
+                        "day": str(r.get("date", r.get("日期", "")))[:10],
+                        "open": float(r.get("open", r.get("开盘", 0))),
+                        "high": float(r.get("high", r.get("最高", 0))),
+                        "low": float(r.get("low", r.get("最低", 0))),
+                        "close": float(r.get("close", r.get("收盘", 0))),
+                        "volume": float(r.get("volume", r.get("成交量", 0))),
+                    })
+                if _out: return _out
+        except Exception: pass
+    # CSV miss — fallback 新浪 API
     prefix = _market_prefix(code)
     url = (f"https://money.finance.sina.com.cn/quotes_service/api/"
            f"json_v2.php/CN_MarketData.getKLineData?symbol={prefix}{code}"
@@ -761,6 +1011,66 @@ def find_zhongshu(highs, lows, min_width=5, min_amp_pct=0.08):
     return filtered
 
 
+def validate_zhongshu_nesting(level_zhongshu, levels_order):
+    """
+    校验多级别中枢的区间套嵌套关系。
+    区间套原则: 高级别中枢区间应包含低级别中枢区间。
+    即 higher.zd <= lower.zd 且 higher.zg >= lower.zg。
+    反向包含(低级别突破高级别边界)视为违反。
+
+    Args:
+        level_zhongshu: {level: last_zs_dict_or_None}
+        levels_order: 级别优先级列表, 如 ["日线", "30min", "5min"]
+    Returns:
+        {"ok": bool, "violations": [{"higher", "lower", "type", ...}]}
+    """
+    violations = []
+    for i in range(len(levels_order) - 1):
+        higher = levels_order[i]
+        lower = levels_order[i + 1]
+        hz = level_zhongshu.get(higher)
+        lz = level_zhongshu.get(lower)
+        if not hz or not lz:
+            continue
+        if hz.get("zd") is None or lz.get("zd") is None:
+            continue
+        if lz["zd"] < hz["zd"]:
+            violations.append({
+                "higher": higher, "lower": lower, "type": "zd_breach",
+                "higher_zd": hz["zd"], "lower_zd": lz["zd"],
+            })
+        if lz["zg"] > hz["zg"]:
+            violations.append({
+                "higher": higher, "lower": lower, "type": "zg_breach",
+                "higher_zg": hz["zg"], "lower_zg": lz["zg"],
+            })
+    return {"ok": len(violations) == 0, "violations": violations}
+
+
+def correct_zhongshu_nesting(level_zhongshu, levels_order, violations):
+    """
+    修正中枢嵌套违反(expand_high模式): 扩展高级别中枢边界以包含低级别。
+    - zd_breach: 高级别下沿下移至低级别下沿
+    - zg_breach: 高级别上沿上移至低级别上沿
+    返回修正后的 level_zhongshu 深拷贝(不改原数据)。
+    """
+    import copy
+    corrected = {lvl: copy.deepcopy(zs) if zs else None
+                 for lvl, zs in level_zhongshu.items()}
+    for v in violations:
+        higher = v["higher"]
+        hz = corrected.get(higher)
+        lower = v["lower"]
+        lz = corrected.get(lower)
+        if not hz or not lz:
+            continue
+        if v["type"] == "zd_breach":
+            hz["zd"] = lz["zd"]
+        elif v["type"] == "zg_breach":
+            hz["zg"] = lz["zg"]
+    return corrected
+
+
 def calc_area(vals, s, e, direction=None):
     """
     计算MACD DIF面积(方向性面积)
@@ -874,6 +1184,35 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         V = [float(d.get('volume', 0)) for d in data]
         n = len(C)
 
+    # 【A4 修复】全级别统一前复权: 按交易日factor, O/H/L/C同比例, 失败整体回退raw
+    # 1. 取 code 级别的 qfq factor_map (按日线 raw vs qfq 计算, 缓存共享给所有级别)
+    # 2. 对当前级别每根bar取其交易日date, 乘以factor
+    # 3. 任何bar缺factor / factor非法 -> 整体保持raw(原子回退)
+    # 4. volume 不修改
+    adjustment_mode = "raw_fallback"
+    adjustment_aligned = False
+    factor_map = _get_qfq_factor_for_code(code)
+    if factor_map is not None and len(factor_map) > 0:
+        applied_all = True
+        new_O, new_H, new_L, new_C = [], [], [], []
+        for i in range(n):
+            dk = str(times[i])[:10]
+            f = factor_map.get(dk)
+            if f is None or f <= 0:
+                applied_all = False
+                break
+            new_O.append(O[i] * f)
+            new_H.append(H[i] * f)
+            new_L.append(L[i] * f)
+            new_C.append(C[i] * f)
+        if applied_all:
+            O = new_O
+            H = new_H
+            L = new_L
+            C = new_C
+            adjustment_mode = "qfq"
+            adjustment_aligned = True
+
     dif, dea, bar = calc_macd(C)
     atr = _compute_atr(H, L, C)  # 【DL修复】计算真实ATR供深度学习特征使用
 
@@ -884,6 +1223,16 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
     # 修复: price=None时使用最新收盘价
     if price is None:
         price = C[-1] if C else 0
+
+    # 【数据对齐校验 Bug2】级别最新收盘价 vs 实时价一致性
+    ok_q, dev_q = _validate_level_consistency(C, price, tol=0.02)
+    data_quality = {"ok": ok_q, "deviation_pct": round(dev_q, 2),
+                    "level": level, "realtime": price,
+                    "last_close": C[-1] if C else 0,
+                    "adjustment_mode": adjustment_mode,
+                    "adjustment_aligned": adjustment_aligned}
+    if not ok_q:
+        print(f"[数据质量] code={code} level={level} dev={dev_q:.2f}% close={C[-1] if C else 0} price={price}")
 
     # 【BUG修复】大级别方向判断 (最近60根/或整体)
     lookback = min(60, n)
@@ -1043,7 +1392,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                 "type": sig_type,
                 "dir": direction,
                 "op": op,
-                "ratio": ratio,
+                "ratio": ratio_clamped,  # 2026-09-23 WORKBUDDY: 存裁剪值[10,150], 与喂给模型的量纲一致
                 "dl_prob": dl_prob,  # 深度学习背驰概率
                 "ep_prob": ep_prob,  # 反转概率 EP_L
                 "ep_type": ep_rev_type,  # 反转类型: 高反转/观察/低反转
@@ -1180,7 +1529,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                             "type": "盘整背驰" if dl_prob_ermai >= _DL_PAN_P else "无背驰",
                             "dir": "看多",
                             "op": "二买",
-                            "ratio": ratio_ermai,
+                            "ratio": max(10.0, min(150.0, ratio_ermai)),  # 2026-09-23 WORKBUDDY: 裁剪至[10,150]
                             "dl_prob": dl_prob_ermai,
                             "ep_prob": ep_prob_2m,
                             "ep_type": ep_rev_type_2m,
@@ -1247,7 +1596,7 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
                                         "type": "盘整背驰" if dl_prob_sanmai >= _DL_PAN_P else "无背驰",
                                         "dir": "看多",
                                         "op": "三买",
-                                        "ratio": ratio_sanmai,
+                                        "ratio": max(10.0, min(150.0, ratio_sanmai)),  # 2026-09-23 WORKBUDDY: 裁剪至[10,150]
                                         "dl_prob": dl_prob_sanmai,
                                         "ep_prob": ep_prob_3m,
                                         "ep_type": ep_rev_type_3m,
@@ -1279,15 +1628,17 @@ def analyze_beichi(code, level="日线", price=None, cost=0):
         "level": level,
         "n": n,
         "times": times,
+        "O": O,
         "C": C,
-        "H": H,  # BUG修复: 补充H/L返回
-        "L": L,  # BUG修复: 补充H/L返回
+        "H": H,
+        "L": L,
         "zss": zss,
         "signals": signals,
         "price": price,
         "cost": cost,
         "overall_dir": overall_dir,
         "overall_pct": overall_pct,
+        "data_quality": data_quality,
     }
     analyze_beichi._cache[cache_key] = result
     return result
