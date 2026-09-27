@@ -1,0 +1,15 @@
+# J-LAYER v0.7.1 Seal SHA256 manifest
+# tag: JLAYER_SLP_v1_SEALED
+# commit: 8b3e61f338f99da6a5f8a5d9fd818331d92cdf95
+# generated: 2026-09-27T05:33:33Z
+#
+# hashes are seal-time blob bytes: git show JLAYER_SLP_v1_SEALED:<path> | sha256sum
+# worktree drifts are expected; see learn/w33-jlayer-seal-verify.md for the drift table
+7048548a5d5853c6bbe17257f94d0ba30fc69e01f3b8c4ffffc4d326b2ee5a1f  scripts/chanlun-workflow/beichi_analyzer.py
+5a293d4a434dd770e762af10adb79e13e23ed25a61a597d5a3067bed48e1ff8b  scripts/chanlun-workflow/daily_workflow.py
+3c78f51326165423d85891aca8fbc24193716acad781d285cf8d41faa2050a3c  scripts/chanlun-workflow/dual2_scan.py
+039f686fff4c3a104da18a963488863981ce5b387a019c632f9ae334665408a2  scripts/chanlun-workflow/dual_scan.py
+ab4793b90b97fd6c4b1038f2ac4643c51781adf73713aeb02f19b6152e1da0b8  scripts/chanlun-workflow/full_scan.py
+ad5329024d732b9e9a315551edf41c5470ab637a93cf98be8d3a9f6ab359e288  scripts/chanlun-workflow/dl_model.pkl
+0c9f3537b3d538b195683b85cfe4d38aed990de8694873ffc47b228e1b610805  scripts/chanlun-workflow/dl_scaler.pkl
+c82db79dc479f8f97bdf897a8a26ed4a5abfbd1eea44e1acdee43b9efd8beec2  scripts/chanlun-workflow/ep_model.pkl
