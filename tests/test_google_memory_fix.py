@@ -147,7 +147,9 @@ def test_google_tradingagents_with_memory():
         print("📊 开始带内存的股票分析...")
         
         try:
-            state, decision = graph.propagate("AAPL", "2025-06-27")
+            from datetime import datetime, timezone
+            _run_generated_at = datetime.now(timezone.utc)
+            state, decision = graph.propagate("AAPL", "2025-06-27", generated_at=_run_generated_at)
             
             if state and decision:
                 print("✅ 带内存的Gemini股票分析成功！")

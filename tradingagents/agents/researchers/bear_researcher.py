@@ -75,6 +75,56 @@ def create_bear_researcher(llm, memory):
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
 
+        # A4-R9: optional precomputed Chan context (shared neutral text, injected verbatim).
+        # 有效性只做字符串存在性/空白判断；注入必须使用原始 raw 字符串（byte-identical）。
+        _raw_chan = state.get("chan_debate_context")
+        _has_chan = isinstance(_raw_chan, str) and bool(_raw_chan.strip())
+        chan_context_block = (
+            f"缠论结构上下文：\n{_raw_chan}\n" if _has_chan else ""
+        )
+
+        # DEFECT-2026-09-05-A 方案 B：统计 B 引擎(INTERVAL)真买卖点，替代无效的 A 引擎 direction 统计
+        # 依据：formatter 每行输出 "EVIDENCE {id} engine={e} level={l} type={t} direction={d} status={s}"
+        #   engine=INTERVAL → B 引擎；type=BUY_POINT/SELL_POINT → 真买卖点（唯一可信信号）
+        #   A 引擎(RECURSIVE)的 direction 逐段交替、恒 50/50，无指示性，不可用作方向依据
+        # 不 import sealed Chan 模块，保持 A4-R9 "No Chan schema import" 约束
+        import re as _re
+        _dir_block = ""
+        if _has_chan:
+            _ev = _re.findall(
+                r"EVIDENCE\s+(\S+)\s+engine=(\w+)\s+level=(\S+)\s+type=(\w+)\s+direction=(\w+)\s+status=(\w+)",
+                _raw_chan,
+            )
+            _buys, _sells = [], []
+            for _eid, _engine, _level, _type, _dir, _status in _ev:
+                if _engine.upper() != "INTERVAL":
+                    continue  # 只信 B 引擎
+                if _type.upper() == "BUY_POINT":
+                    _buys.append(_level)
+                elif _type.upper() == "SELL_POINT":
+                    _sells.append(_level)
+            _weight = {"30min": 3, "5min": 2, "1min": 1, "15min": 2, "60min": 3}
+            _b_score = sum(_weight.get(lv, 1) for lv in _buys)
+            _s_score = sum(_weight.get(lv, 1) for lv in _sells)
+            _lines = [
+                "缠论买卖点汇总（B 引擎区间套，纯统计非 LLM 解读）：",
+                f"  买点 BUY_POINT={len(_buys)} (加权 {_b_score})  明细 {sorted(set(_buys)) or '无'}",
+                f"  卖点 SELL_POINT={len(_sells)} (加权 {_s_score})  明细 {sorted(set(_sells)) or '无'}",
+            ]
+            if _buys and not _sells:
+                _lines.append("  → B 引擎单向给出买点（背驰底）✅")
+            elif _sells and not _buys:
+                _lines.append("  → B 引擎单向给出卖点（背驰顶）✅")
+            elif _buys and _sells:
+                _lines.append("  → B 引擎买卖点并存（级别打架，方向未定）⚠️")
+            else:
+                _lines.append("  → B 引擎本轮无买卖点（无背驰结构）")
+            if "30min" in _buys or "60min" in _buys:
+                _lines.append("  ★ 含 30min/60min 高级别买点，信号强度最高")
+            if "30min" in _sells or "60min" in _sells:
+                _lines.append("  ★ 含 30min/60min 高级别卖点，回避优先级最高")
+            _dir_block = "\n" + "\n".join(_lines) + "\n"
+
         # 安全检查：确保memory不为None
         if memory is not None:
             past_memories = memory.get_memories(curr_situation, n_matches=2)
@@ -107,7 +157,7 @@ def create_bear_researcher(llm, memory):
 社交媒体情绪报告：{sentiment_report}
 最新世界事务新闻：{news_report}
 公司基本面报告：{fundamentals_report}
-辩论对话历史：{history}
+{chan_context_block}{_dir_block}辩论对话历史：{history}
 最后的看涨论点：{current_response}
 类似情况的反思和经验教训：{past_memory_str}
 

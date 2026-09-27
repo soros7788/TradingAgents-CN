@@ -69,7 +69,9 @@ def test_gemini_simple_analysis():
         print("   使用离线数据，避免API限制...")
         
         try:
-            state, decision = graph.propagate("AAPL", "2025-06-27")
+            from datetime import datetime, timezone
+            _run_generated_at = datetime.now(timezone.utc)
+            state, decision = graph.propagate("AAPL", "2025-06-27", generated_at=_run_generated_at)
             
             if state and decision:
                 print("✅ Gemini驱动的股票分析成功完成！")

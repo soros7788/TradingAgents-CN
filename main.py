@@ -19,7 +19,9 @@ config["online_tools"] = True  # Increase debate rounds
 ta = TradingAgentsGraph(debug=True, config=config)
 
 # forward propagate
-_, decision = ta.propagate("NVDA", "2024-05-10")
+from datetime import datetime, timezone
+_run_generated_at = datetime.now(timezone.utc)
+_, decision = ta.propagate("NVDA", "2024-05-10", generated_at=_run_generated_at)
 print(decision)
 
 # Memorize mistakes and reflect

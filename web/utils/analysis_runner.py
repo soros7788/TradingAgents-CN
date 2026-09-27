@@ -6,7 +6,7 @@ import sys
 import os
 import uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # 导入日志模块
@@ -23,13 +23,13 @@ load_dotenv(project_root / ".env", override=True)
 # 导入统一日志系统
 from tradingagents.utils.logging_init import setup_web_logging
 logger = setup_web_logging()
+
 # === 消费层 shim 注入 (SINGLE_WRITER 启动期一次) ===
 # 将 ak.stock_zh_a_minute 重定向到共享盘 K 线缓存, 破除 1970 行硬顶, 去网络依赖。
 # 零改 sealed: 仅运行时 setattr; 未覆盖 / 非 "" adjust -> 回退 live (graceful)。
 # 数据源 KLINE_CACHE_DIR 默认 5TB 共享盘挂载, VM-B 可设本地 sh mirror。
 from tradingagents.utils.kline_cache_shim import install_kline_cache_shim
 install_kline_cache_shim()
-
 
 # 添加配置管理器
 try:
@@ -222,9 +222,10 @@ def run_stock_analysis(stock_symbol, analysis_date, analysts, research_depth, ll
     logger.info(f"  DASHSCOPE_API_KEY: {'已设置' if dashscope_key else '未设置'}")
     logger.info(f"  FINNHUB_API_KEY: {'已设置' if finnhub_key else '未设置'}")
 
-    if not dashscope_key:
+    if llm_provider == "dashscope" and not dashscope_key:
         raise ValueError("DASHSCOPE_API_KEY 环境变量未设置")
-    if not finnhub_key:
+
+    if market_type != "A股" and not finnhub_key:
         raise ValueError("FINNHUB_API_KEY 环境变量未设置")
 
     update_progress("环境变量验证通过")
@@ -376,7 +377,7 @@ def run_stock_analysis(stock_symbol, analysis_date, analysts, research_depth, ll
             logger.info(f"🌐 [SiliconFlow] API端点: https://api.siliconflow.cn/v1")
         elif llm_provider == "custom_openai":
             # 自定义OpenAI端点
-            custom_base_url = st.session_state.get("custom_openai_base_url", "https://api.openai.com/v1")
+            custom_base_url = os.getenv("CUSTOM_OPENAI_BASE_URL", "https://api.openai.com/v1")
             config["backend_url"] = custom_base_url
             config["custom_openai_base_url"] = custom_base_url
             logger.info(f"🔧 [自定义OpenAI] 使用模型: {llm_model}")
@@ -473,7 +474,8 @@ def run_stock_analysis(stock_symbol, analysis_date, analysts, research_depth, ll
         logger.debug(f"🔍 [RUNNER DEBUG]   symbol: '{formatted_symbol}'")
         logger.debug(f"🔍 [RUNNER DEBUG]   date: '{analysis_date}'")
 
-        state, decision = graph.propagate(formatted_symbol, analysis_date)
+        _run_generated_at = datetime.now(timezone.utc)
+        state, decision = graph.propagate(formatted_symbol, analysis_date, generated_at=_run_generated_at)
 
         # 调试信息
         logger.debug(f"🔍 [DEBUG] 分析完成，decision类型: {type(decision)}")
@@ -826,7 +828,6 @@ def validate_analysis_params(stock_symbol, analysis_date, analysts, research_dep
     
     # 验证分析日期
     try:
-        from datetime import datetime
         datetime.strptime(analysis_date, '%Y-%m-%d')
     except ValueError:
         errors.append("分析日期格式无效，应为YYYY-MM-DD格式")

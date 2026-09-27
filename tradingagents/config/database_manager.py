@@ -13,6 +13,9 @@ from typing import Dict, Any, Optional, Tuple
 class DatabaseManager:
     """智能数据库管理器"""
 
+    _redis_probe_failed = False
+    _mongo_probe_failed = False
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
 
@@ -84,15 +87,17 @@ class DatabaseManager:
     
     def _detect_mongodb(self) -> Tuple[bool, str]:
         """检测MongoDB是否可用"""
-        # 首先检查是否启用
         if not self.mongodb_enabled:
             return False, "MongoDB未启用 (MONGODB_ENABLED=false)"
+
+        if DatabaseManager._mongo_probe_failed:
+            self.logger.info("MongoDB 前次探测已失败，跳过本次 probe")
+            return False, "MongoDB连接失败 (前次探测已失败)"
 
         try:
             import pymongo
             from pymongo import MongoClient
 
-            # 构建连接参数
             connect_kwargs = {
                 "host": self.mongodb_config["host"],
                 "port": self.mongodb_config["port"],
@@ -101,7 +106,6 @@ class DatabaseManager:
                 "socketTimeoutMS": self.mongodb_config["socket_timeout"]
             }
 
-            # 如果有用户名和密码，添加认证
             if self.mongodb_config["username"] and self.mongodb_config["password"]:
                 connect_kwargs.update({
                     "username": self.mongodb_config["username"],
@@ -110,50 +114,58 @@ class DatabaseManager:
                 })
 
             client = MongoClient(**connect_kwargs)
-
-            # 测试连接
             client.server_info()
             client.close()
 
             return True, "MongoDB连接成功"
 
         except ImportError:
+            DatabaseManager._mongo_probe_failed = True
             return False, "pymongo未安装"
         except Exception as e:
+            DatabaseManager._mongo_probe_failed = True
             return False, f"MongoDB连接失败: {str(e)}"
     
     def _detect_redis(self) -> Tuple[bool, str]:
         """检测Redis是否可用"""
-        # 首先检查是否启用
         if not self.redis_enabled:
             return False, "Redis未启用 (REDIS_ENABLED=false)"
 
+        if DatabaseManager._redis_probe_failed:
+            self.logger.info("Redis 前次探测已失败，跳过本次 probe")
+            return False, "Redis连接失败 (前次探测已失败)"
+
         try:
             import redis
+            from redis.backoff import NoBackoff
+            from redis.retry import Retry
 
-            # 构建连接参数
             connect_kwargs = {
                 "host": self.redis_config["host"],
                 "port": self.redis_config["port"],
                 "db": self.redis_config["db"],
                 "socket_timeout": self.redis_config["timeout"],
-                "socket_connect_timeout": self.redis_config["timeout"]
+                "socket_connect_timeout": self.redis_config["timeout"],
+                # 显式 zero-retry：禁止继承 redis-py 8.1.0 默认
+                # Retry(ExponentialWithJitterBackoff, retries=10)。否则不可达 Redis
+                # 会被放大为 1 initial + 10 retries == 11 次 _connect
+                # (localhost 又解析 IPv6+IPv4) == 约 48s 冷启动阻塞。
+                "retry": Retry(NoBackoff(), 0),
             }
 
-            # 如果有密码，添加密码
             if self.redis_config["password"]:
                 connect_kwargs["password"] = self.redis_config["password"]
 
             client = redis.Redis(**connect_kwargs)
-
-            # 测试连接
             client.ping()
 
             return True, "Redis连接成功"
 
         except ImportError:
+            DatabaseManager._redis_probe_failed = True
             return False, "redis未安装"
         except Exception as e:
+            DatabaseManager._redis_probe_failed = True
             return False, f"Redis连接失败: {str(e)}"
     
     def _detect_databases(self):
@@ -227,13 +239,18 @@ class DatabaseManager:
         if self.redis_available:
             try:
                 import redis
+                from redis.backoff import NoBackoff
+                from redis.retry import Retry
 
                 # 构建连接参数
                 connect_kwargs = {
                     "host": self.redis_config["host"],
                     "port": self.redis_config["port"],
                     "db": self.redis_config["db"],
-                    "socket_timeout": self.redis_config["timeout"]
+                    "socket_timeout": self.redis_config["timeout"],
+                    # 与 _detect_redis() 一致的受控 zero-retry 策略，
+                    # 避免可用路径也继承 redis-py 默认 10 retries。
+                    "retry": Retry(NoBackoff(), 0),
                 }
 
                 # 如果有密码，添加密码

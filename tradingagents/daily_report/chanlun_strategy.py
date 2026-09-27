@@ -82,6 +82,72 @@ class ChanlunStrategy:
             self._engine_class = ChanlunEngine
         return self._engine_class
 
+    def _analyze_frame(self, level: str, df) -> Optional[Dict]:
+        """Shared post-prep analysis implementation (NO network).
+
+        Both the network path (_fetch_and_analyze) and the injected path
+        (analyze_from_frames) funnel prepared frames through this method, so the
+        Chanlun engine analysis + signal/zhongshu extraction logic lives in
+        exactly ONE place.
+
+        `df` must already be prepared: a 'date' column (datetime) plus numeric
+        open/high/low/close/volume, and already tail'd to the required window.
+        """
+        if df is None or df.empty or len(df) < 30:
+            return None
+
+        engine = self._engine_instance()(df)
+        result = engine.analyze(level=level)
+
+        # 提取最近一个信号
+        latest_sig = None
+        if result.signals:
+            latest_sig = max(result.signals, key=lambda s: s.datetime)
+
+        zs_low = zs_high = None
+        if result.zhongshus:
+            zs = result.zhongshus[-1]
+            zs_low, zs_high = zs.range_low, zs.range_high
+
+        return {
+            'level': level,
+            'trend': result.trend,
+            'latest_signal': latest_sig,
+            'zhongshu_low': zs_low,
+            'zhongshu_high': zs_high,
+            'current_price': float(df['close'].iloc[-1]),
+            'summary': result.summary,
+        }
+
+    def _to_level_signal(self, level: str, r: Dict) -> LevelSignal:
+        """Map an analysis result dict to a LevelSignal (shared by both paths)."""
+        sig = r['latest_signal']
+        return LevelSignal(
+            level=level,
+            trend=r['trend'],
+            latest_signal_type=sig.type if sig else "无",
+            latest_signal_price=sig.price if sig else 0.0,
+            latest_signal_dt=(sig.datetime.strftime('%m-%d %H:%M')
+                              if sig and hasattr(sig.datetime, 'strftime')
+                              else str(sig.datetime) if sig else ""),
+            zhongshu_low=r['zhongshu_low'],
+            zhongshu_high=r['zhongshu_high'],
+            current_price=r['current_price'],
+            summary=r['summary'],
+        )
+
+    def _prepare_minute_frame(self, df, klines):
+        """Apply the SAME preparation the network path applies to a raw akshare
+        minute DataFrame: rename 'day'->'date', parse datetime, coerce OHLCV to
+        numeric, then tail to the required window. Returns a copy; does NOT
+        mutate the caller's frame. No sort / dedup / resample / fill.
+        """
+        df = df.rename(columns={'day': 'date'})
+        df['date'] = pd.to_datetime(df['date'])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df.tail(klines).copy()
+
     def _fetch_and_analyze(self, level: str, period: str, klines: int) -> Optional[Dict]:
         """拉取K线并跑缠论分析，返回简化结果。"""
         try:
@@ -90,40 +156,48 @@ class ChanlunStrategy:
             else:
                 prefix = 'sh' if self.code.startswith(('6', '9', '688')) else 'sz'
                 df = ak.stock_zh_a_minute(symbol=f'{prefix}{self.code}', period=period)
-                df.rename(columns={'day': 'date'}, inplace=True)
-                df['date'] = pd.to_datetime(df['date'])
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                df = df.tail(klines).copy()
-
-            if df is None or df.empty or len(df) < 30:
-                return None
-
-            engine = self._engine_instance()(df)
-            result = engine.analyze(level=level)
-
-            # 提取最近一个信号
-            latest_sig = None
-            if result.signals:
-                latest_sig = max(result.signals, key=lambda s: s.datetime)
-
-            zs_low = zs_high = None
-            if result.zhongshus:
-                zs = result.zhongshus[-1]
-                zs_low, zs_high = zs.range_low, zs.range_high
-
-            return {
-                'level': level,
-                'trend': result.trend,
-                'latest_signal': latest_sig,
-                'zhongshu_low': zs_low,
-                'zhongshu_high': zs_high,
-                'current_price': float(df['close'].iloc[-1]),
-                'summary': result.summary,
-            }
+                df = self._prepare_minute_frame(df, klines)
+            return self._analyze_frame(level, df)
         except Exception as e:
             logger.warning("%s 级别分析失败: %s", level, e)
             return None
+
+    def analyze_from_frames(self, frames: Dict[str, "pd.DataFrame"]) -> Dict[str, LevelSignal]:
+        """Dependency-injection seam: run the SAME analysis implementation on
+        caller-supplied frames, with NO network call.
+
+        `frames` maps level name -> a raw akshare-format DataFrame (columns
+        'day'/open/high/low/close/volume). Each frame is prepared with the
+        exact same window semantics (tail to the required history) as the
+        network path, so old and injected paths are guaranteed identical.
+
+        This is the single place where externally-sourced bars enter the
+        Chanlun analysis — it does NOT introduce CanonicalBar /
+        CanonicalMarketSnapshot / the provider normalizer. No sort, dedup,
+        resample, or fill is applied beyond the existing preparation.
+        """
+        # 15/60min 装表（2026-08-30）：放开区间套引擎支持 15/60min 级别
+        configs = [
+            ('60min', 300),
+            ('30min', 120),
+            ('15min', 500),
+            ('5min', 1000),
+            ('1min', 2000),
+        ]
+        results: Dict[str, LevelSignal] = {}
+        for level, klines in configs:
+            raw = frames.get(level)
+            if raw is None:
+                continue
+            try:
+                df = self._prepare_minute_frame(raw.copy(), klines)
+                r = self._analyze_frame(level, df)
+            except Exception as e:
+                logger.warning("%s 级别(injected)分析失败: %s", level, e)
+                continue
+            if r:
+                results[level] = self._to_level_signal(level, r)
+        return results
 
     def analyze_all_levels(self) -> Dict[str, LevelSignal]:
         """同时分析三个级别。"""
@@ -136,20 +210,7 @@ class ChanlunStrategy:
         for level, period, klines in configs:
             r = self._fetch_and_analyze(level, period, klines)
             if r:
-                sig = r['latest_signal']
-                results[level] = LevelSignal(
-                    level=level,
-                    trend=r['trend'],
-                    latest_signal_type=sig.type if sig else "无",
-                    latest_signal_price=sig.price if sig else 0.0,
-                    latest_signal_dt=(sig.datetime.strftime('%m-%d %H:%M')
-                                      if sig and hasattr(sig.datetime, 'strftime')
-                                      else str(sig.datetime) if sig else ""),
-                    zhongshu_low=r['zhongshu_low'],
-                    zhongshu_high=r['zhongshu_high'],
-                    current_price=r['current_price'],
-                    summary=r['summary'],
-                )
+                results[level] = self._to_level_signal(level, r)
         return results
 
     def _judge(self, levels: Dict[str, LevelSignal]) -> TradeAdvice:

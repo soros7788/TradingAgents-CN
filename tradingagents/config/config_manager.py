@@ -60,7 +60,9 @@ except Exception as e:
 
 class ConfigManager:
     """配置管理器"""
-    
+
+    _mongodb_storage_disabled = False
+
     def __init__(self, config_dir: str = "config"):
         self.config_dir = Path(config_dir)
         self.config_dir.mkdir(exist_ok=True)
@@ -153,6 +155,10 @@ class ConfigManager:
         """初始化MongoDB存储"""
         logger.info("🔧 [ConfigManager] 开始初始化 MongoDB 存储...")
 
+        if ConfigManager._mongodb_storage_disabled:
+            logger.warning("⚠️ [ConfigManager] MongoDB 存储前次初始化失败，跳过本次")
+            return
+
         if not MONGODB_AVAILABLE:
             logger.warning("⚠️ [ConfigManager] pymongo 未安装，无法使用 MongoDB 存储")
             return
@@ -188,11 +194,13 @@ class ConfigManager:
                 logger.info(f"✅ [ConfigManager] MongoDB存储已启用: {database_name}.token_usage")
             else:
                 self.mongodb_storage = None
+                ConfigManager._mongodb_storage_disabled = True
                 logger.warning("⚠️ [ConfigManager] MongoDB连接失败，将使用JSON文件存储")
 
         except Exception as e:
             logger.error(f"❌ [ConfigManager] MongoDB初始化失败: {e}", exc_info=True)
             self.mongodb_storage = None
+            ConfigManager._mongodb_storage_disabled = True
 
     def _init_default_configs(self):
         """初始化默认配置"""

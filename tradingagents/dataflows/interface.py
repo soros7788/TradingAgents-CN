@@ -1,4 +1,4 @@
-from typing import Annotated, Dict
+from typing import Annotated, Dict, Tuple
 import time
 import os
 from datetime import datetime
@@ -1627,6 +1627,11 @@ def get_china_stock_data_unified(
         return f"❌ 获取{ticker}股票数据失败: {e}"
 
 
+_last_cache_key: str = ""
+_last_cache_value: dict = {}
+_last_resolver = None
+
+
 def get_china_stock_info_unified(
     ticker: Annotated[str, "中国股票代码，如：000001、600036等"]
 ) -> str:
@@ -1640,12 +1645,26 @@ def get_china_stock_info_unified(
     Returns:
         str: 股票基本信息
     """
+    global _last_cache_key, _last_cache_value, _last_resolver
+
     try:
-        from .data_source_manager import get_china_stock_info_unified
+        from .data_source_manager import get_china_stock_info_unified as _resolver
+
+        if _resolver is not _last_resolver:
+            _last_cache_key = ""
+            _last_cache_value = {}
+            _last_resolver = _resolver
 
         logger.info(f"📊 [统一接口] 获取{ticker}基本信息...")
 
-        info = get_china_stock_info_unified(ticker)
+        if ticker == _last_cache_key and _last_cache_value:
+            logger.info(f"📊 [统一接口] 命中缓存: {ticker}")
+            info = _last_cache_value
+        else:
+            info = _resolver(ticker)
+            if info is not None:
+                _last_cache_key = ticker
+                _last_cache_value = info
 
         if info and info.get('name'):
             result = f"股票代码: {ticker}\n"

@@ -12,6 +12,7 @@ from dateutil.relativedelta import relativedelta
 from langchain_openai import ChatOpenAI
 import tradingagents.dataflows.interface as interface
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.tools.ths_bridge.langchain_tools import get_ths_kline, get_ths_snapshot
 from langchain_core.messages import HumanMessage
 
 # 导入统一日志系统和工具日志装饰器
@@ -1377,3 +1378,11 @@ class Toolkit:
             error_msg = f"统一情绪分析工具执行失败: {str(e)}"
             logger.error(f"❌ [统一情绪工具] {error_msg}")
             return error_msg
+
+    # ---- tonghuasun (同花顺) MCP bridge tools ----
+    # Expose the @tool objects from ths_bridge.langchain_tools as Toolkit
+    # attributes so analysts can reference them as toolkit.get_ths_kline etc.
+    # When the MCP bridge is unavailable the tools return a descriptive error
+    # string, allowing the LLM to fall back to akshare/tushare data sources.
+    get_ths_kline = get_ths_kline
+    get_ths_snapshot = get_ths_snapshot

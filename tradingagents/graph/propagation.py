@@ -20,9 +20,16 @@ class Propagator:
         self.max_recur_limit = max_recur_limit
 
     def create_initial_state(
-        self, company_name: str, trade_date: str
+        self, company_name: str, trade_date: str, generated_at
     ) -> Dict[str, Any]:
-        """Create the initial state for the agent graph."""
+        """Create the initial state for the agent graph.
+
+        Args:
+            company_name: Company name or stock symbol
+            trade_date: Date string for analysis
+            generated_at: REQUIRED. Independent provenance timestamp for this run.
+                          Must NOT be derived from trade_date/as_of.
+        """
         from langchain_core.messages import HumanMessage
 
         # 🔥 修复：创建明确的分析请求消息，而不是只传递股票代码
@@ -33,6 +40,7 @@ class Propagator:
             "messages": [HumanMessage(content=analysis_request)],
             "company_of_interest": company_name,
             "trade_date": str(trade_date),
+            "generated_at": generated_at,
             "investment_debate_state": InvestDebateState(
                 {"history": "", "current_response": "", "count": 0}
             ),

@@ -125,7 +125,11 @@ def create_market_analyst(llm, toolkit):
         # 统一使用 get_stock_market_data_unified 工具
         # 该工具内部会自动识别股票类型（A股/港股/美股）并调用相应的数据源
         logger.info(f"📊 [市场分析师] 使用统一市场数据工具，自动识别股票类型")
-        tools = [toolkit.get_stock_market_data_unified]
+        tools = [
+            toolkit.get_stock_market_data_unified,
+            toolkit.get_ths_kline,
+            toolkit.get_ths_snapshot,
+        ]
 
         # 安全地获取工具名称用于调试
         tool_names_debug = []
@@ -158,6 +162,7 @@ def create_market_analyst(llm, toolkit):
                     "你可以使用以下工具：{tool_names}\n"
                     "⚠️ 重要工作流程：\n"
                     "1. 如果消息历史中没有工具结果，立即调用 get_stock_market_data_unified 工具\n"
+                    "   对于A股，也可使用 get_ths_kline（K线数据）或 get_ths_snapshot（实时快照）获取同花顺数据\n"
                     "   - ticker: {ticker}\n"
                     "   - start_date: {current_date}\n"
                     "   - end_date: {current_date}\n"

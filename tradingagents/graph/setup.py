@@ -22,6 +22,11 @@ from tradingagents.agents import (
 )
 from tradingagents.agents.utils.agent_states import AgentState
 from tradingagents.agents.utils.agent_utils import Toolkit
+from tradingagents.agents.utils.chan_context_node import create_chan_context_node
+
+from tradingagents.llm_adapters.codex_task_routing import (
+    resolve_codex_task_routing,
+)
 
 from .conditional_logic import ConditionalLogic
 
@@ -61,6 +66,16 @@ class GraphSetup:
         self.conditional_logic = conditional_logic
         self.config = config or {}
         self.react_llm = react_llm
+
+        # A8-R1: mixed LLM routing — CodexTaskChatModel (when enabled) is used
+        # ONLY for the invoke-only nodes; the 4 tool-bound analysts keep the
+        # original tool-capable quick LLM. Disabled = identity passthrough.
+        routing = resolve_codex_task_routing(
+            self.config, self.quick_thinking_llm, self.deep_thinking_llm
+        )
+        self._tool_llm = routing.tool_llm
+        self._invoke_quick_llm = routing.invoke_quick_llm
+        self._invoke_deep_llm = routing.invoke_deep_llm
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
@@ -104,21 +119,21 @@ class GraphSetup:
 
             # 所有LLM都使用标准分析师
             analyst_nodes["market"] = create_market_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self._tool_llm, self.toolkit
             )
             delete_nodes["market"] = create_msg_delete()
             tool_nodes["market"] = self.tool_nodes["market"]
 
         if "social" in selected_analysts:
             analyst_nodes["social"] = create_social_media_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self._tool_llm, self.toolkit
             )
             delete_nodes["social"] = create_msg_delete()
             tool_nodes["social"] = self.tool_nodes["social"]
 
         if "news" in selected_analysts:
             analyst_nodes["news"] = create_news_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self._tool_llm, self.toolkit
             )
             delete_nodes["news"] = create_msg_delete()
             tool_nodes["news"] = self.tool_nodes["news"]
@@ -145,30 +160,35 @@ class GraphSetup:
 
             # 所有LLM都使用标准分析师（包含强制工具调用机制）
             analyst_nodes["fundamentals"] = create_fundamentals_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self._tool_llm, self.toolkit
             )
             delete_nodes["fundamentals"] = create_msg_delete()
             tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
 
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(
-            self.quick_thinking_llm, self.bull_memory
+            self._invoke_quick_llm, self.bull_memory
         )
         bear_researcher_node = create_bear_researcher(
-            self.quick_thinking_llm, self.bear_memory
+            self._invoke_quick_llm, self.bear_memory
         )
         research_manager_node = create_research_manager(
-            self.deep_thinking_llm, self.invest_judge_memory
+            self._invoke_deep_llm, self.invest_judge_memory
         )
-        trader_node = create_trader(self.quick_thinking_llm, self.trader_memory)
+        trader_node = create_trader(self._invoke_quick_llm, self.trader_memory)
 
         # Create risk analysis nodes
-        risky_analyst = create_risky_debator(self.quick_thinking_llm)
-        neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
-        safe_analyst = create_safe_debator(self.quick_thinking_llm)
+        risky_analyst = create_risky_debator(self._invoke_quick_llm)
+        neutral_analyst = create_neutral_debator(self._invoke_quick_llm)
+        safe_analyst = create_safe_debator(self._invoke_quick_llm)
         risk_manager_node = create_risk_manager(
-            self.deep_thinking_llm, self.risk_manager_memory
+            self._invoke_deep_llm, self.risk_manager_memory
         )
+
+        # A4-R10: dedicated Chan Context producer/node.
+        # Runs once at graph entry (before analysts), writes the optional
+        # precomputed Chan structural context str consumed by Bull/Bear per A4-R9.
+        chan_context_node = create_chan_context_node()
 
         # Create workflow
         workflow = StateGraph(AgentState)
@@ -182,6 +202,7 @@ class GraphSetup:
             workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
 
         # Add other nodes
+        workflow.add_node("Chan Context", chan_context_node)
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
         workflow.add_node("Research Manager", research_manager_node)
@@ -192,9 +213,12 @@ class GraphSetup:
         workflow.add_node("Risk Judge", risk_manager_node)
 
         # Define edges
+        # A4-R10: Chan Context runs once at entry, before the first analyst.
+        workflow.add_edge(START, "Chan Context")
+
         # Start with the first analyst
         first_analyst = selected_analysts[0]
-        workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
+        workflow.add_edge("Chan Context", f"{first_analyst.capitalize()} Analyst")
 
         # Connect analysts in sequence
         for i, analyst_type in enumerate(selected_analysts):

@@ -1680,15 +1680,21 @@ class DataSourceManager:
                 # 转换为字典格式
                 info = {'symbol': symbol, 'source': 'akshare'}
 
-                # 提取股票名称
-                name_row = stock_info[stock_info['item'] == '股票简称']
-                if not name_row.empty:
-                    stock_name = name_row['value'].iloc[0]
+                # 提取股票名称（兼容多种字段名）
+                name_fields = ['股票简称', '股票名称', '名称']
+                stock_name = None
+                for field in name_fields:
+                    name_row = stock_info[stock_info['item'] == field]
+                    if not name_row.empty:
+                        stock_name = name_row['value'].iloc[0]
+                        logger.info(f"✅ [AKShare股票信息] {symbol} -> {stock_name} (字段: {field})")
+                        break
+
+                if stock_name:
                     info['name'] = stock_name
-                    logger.info(f"✅ [AKShare股票信息] {symbol} -> {stock_name}")
                 else:
                     info['name'] = f'股票{symbol}'
-                    logger.warning(f"⚠️ [AKShare股票信息] 未找到股票简称: {symbol}")
+                    logger.warning(f"⚠️ [AKShare股票信息] 未找到名称字段: {symbol}")
 
                 # 提取其他信息
                 info['area'] = '未知'  # AKShare没有地区信息

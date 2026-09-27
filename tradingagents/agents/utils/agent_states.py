@@ -1,6 +1,6 @@
 from typing import Annotated, Sequence
 from datetime import date, timedelta, datetime
-from typing_extensions import TypedDict, Optional
+from typing_extensions import NotRequired, TypedDict, Optional
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import END, StateGraph, START, MessagesState
@@ -53,6 +53,11 @@ class RiskDebateState(TypedDict):
 class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     trade_date: Annotated[str, "What date we are trading at"]
+    # J-LAYER v0.7.1: independent provenance timestamp for this analysis run.
+    # Created at the OUTER execution boundary; MUST NOT be derived from trade_date.
+    # Required at runtime (fail-fast if absent in critical nodes); declared
+    # NotRequired so states built without it remain structurally valid.
+    generated_at: NotRequired[datetime]
 
     sender: Annotated[str, "Agent that sent this message"]
 
@@ -63,6 +68,12 @@ class AgentState(MessagesState):
         str, "Report from the News Researcher of current world affairs"
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
+
+    # A4-R9: optional precomputed Chan structural context (formatted neutral text).
+    # Absent / None / "" / whitespace-only → no Chan context (Bull/Bear omit the block).
+    # Non-empty string → injected verbatim into Bull/Bear prompts (shared neutral).
+    # Optional / backward-compatible: old states without this key keep working.
+    chan_debate_context: NotRequired[str]
 
     # 🔧 死循环修复: 工具调用计数器
     market_tool_call_count: Annotated[int, "Market analyst tool call counter"]

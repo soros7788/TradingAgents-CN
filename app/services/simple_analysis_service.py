@@ -6,7 +6,7 @@
 import asyncio
 import uuid
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 import sys
@@ -1237,7 +1237,7 @@ class SimpleAnalysisService:
             logger.info(f"🔍 [引擎验证] TradingGraph配置中的深度模型: {trading_graph.config.get('deep_think_llm')}")
 
             # 准备分析数据
-            start_time = datetime.now()
+            start_time = datetime.now(timezone.utc)
 
             # 🔧 使用前端传递的分析日期，如果没有则使用当前日期
             if request.parameters and hasattr(request.parameters, 'analysis_date') and request.parameters.analysis_date:
@@ -1476,6 +1476,7 @@ class SimpleAnalysisService:
             state, decision = trading_graph.propagate(
                 request.stock_code,
                 analysis_date,
+                generated_at=start_time,
                 progress_callback=graph_progress_callback,
                 task_id=task_id
             )
@@ -1495,7 +1496,7 @@ class SimpleAnalysisService:
                 progress_tracker.update_progress("📊 处理分析结果")
             update_progress_sync(90, "处理分析结果...", "result_processing")
 
-            execution_time = (datetime.now() - start_time).total_seconds()
+            execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
 
             # 从state中提取reports字段
             reports = {}

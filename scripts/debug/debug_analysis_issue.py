@@ -24,6 +24,7 @@ def debug_analysis_result():
         # 导入必要的模块
         from tradingagents.graph.trading_graph import TradingAgentsGraph
         from tradingagents.default_config import DEFAULT_CONFIG
+        from datetime import datetime, timezone
         
         # 创建配置
         config = DEFAULT_CONFIG.copy()
@@ -47,7 +48,8 @@ def debug_analysis_result():
         
         # 执行分析
         print(f"\n🚀 开始执行分析...")
-        state, decision = graph.propagate("000002", "2025-08-20")
+        _run_generated_at = datetime.now(timezone.utc)
+        state, decision = graph.propagate("000002", "2025-08-20", generated_at=_run_generated_at)
         
         print(f"✅ 分析执行完成")
         

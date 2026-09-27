@@ -18,6 +18,7 @@ sys.path.insert(0, str(project_root))
 
 from dotenv import load_dotenv
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from datetime import datetime, timezone
 from tradingagents.default_config import DEFAULT_CONFIG
 
 # 加载 .env 文件
@@ -86,7 +87,8 @@ def main():
         print()
         
         # 执行分析
-        state, decision = ta.propagate(stock_symbol, analysis_date)
+        _run_generated_at = datetime.now(timezone.utc)
+        state, decision = ta.propagate(stock_symbol, analysis_date, generated_at=_run_generated_at)
         
         logger.info(f"🎯 分析结果:")
         logger.info(f"=")

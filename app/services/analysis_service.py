@@ -7,7 +7,7 @@ import asyncio
 import uuid
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Callable
 from pathlib import Path
 import sys
@@ -204,7 +204,7 @@ class AnalysisService:
                 progress_tracker.update_progress(message)
 
             # 调用现有的分析方法（同步调用，传递进度回调）
-            _, decision = trading_graph.propagate(task.symbol, analysis_date, progress_callback)
+            _, decision = trading_graph.propagate(task.symbol, analysis_date, generated_at=start_time, progress_callback=progress_callback)
 
             execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
 
@@ -321,7 +321,7 @@ class AnalysisService:
             analysis_date = task.parameters.analysis_date or datetime.now().strftime("%Y-%m-%d")
 
             # 调用现有的分析方法（同步调用）
-            _, decision = trading_graph.propagate(task.symbol, analysis_date)
+            _, decision = trading_graph.propagate(task.symbol, analysis_date, generated_at=start_time)
 
             execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
 
@@ -689,13 +689,13 @@ class AnalysisService:
                 progress_callback(50, "执行股票分析...")
             
             # 执行分析
-            start_time = datetime.utcnow()
+            start_time = datetime.now(timezone.utc)
             analysis_date = task.parameters.analysis_date or datetime.now().strftime("%Y-%m-%d")
             
             # 调用现有的分析方法
-            _, decision = trading_graph.propagate(task.symbol, analysis_date)
+            _, decision = trading_graph.propagate(task.symbol, analysis_date, generated_at=start_time)
             
-            execution_time = (datetime.utcnow() - start_time).total_seconds()
+            execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
             
             if progress_callback:
                 progress_callback(80, "处理分析结果...")

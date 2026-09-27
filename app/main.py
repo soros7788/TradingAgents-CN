@@ -29,6 +29,7 @@ from app.core.config import settings
 from app.core.database import init_db, close_db
 from app.core.logging_config import setup_logging
 from app.routers import auth_db as auth, analysis, screening, queue, sse, health, favorites, config, reports, database, operation_logs, tags, tushare_init, akshare_init, baostock_init, historical_data, multi_period_sync, financial_data, news_data, social_media, internal_messages, usage_statistics, model_capabilities, cache, logs
+from app.routers import langgraph_e2e as langgraph_e2e_router
 from app.routers import sync as sync_router, multi_source_sync
 from app.routers import stocks as stocks_router
 from app.routers import stock_data as stock_data_router
@@ -728,6 +729,9 @@ app.include_router(financial_data.router, tags=["financial-data"])
 app.include_router(news_data.router, tags=["news-data"])
 app.include_router(social_media.router, tags=["social-media"])
 app.include_router(internal_messages.router, tags=["internal-messages"])
+
+# LangGraph E2E 路由 - 缠论双系统全链路分析
+app.include_router(langgraph_e2e_router.router, prefix="/api/langgraph", tags=["langgraph-e2e"])
 
 
 @app.get("/")

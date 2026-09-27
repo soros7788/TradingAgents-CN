@@ -43,7 +43,11 @@ except ImportError as e:
     print(f"错误: 未安装 mcp 库。请运行: pip install mcp")
     raise SystemExit(1)
 
-mcp = FastMCP("chanlun_mcp")
+mcp = FastMCP(
+    "chanlun_mcp",
+    host=os.environ.get("MCP_HOST", "0.0.0.0"),
+    port=int(os.environ.get("MCP_PORT", "17191")),
+)
 
 # ── 日志 ─────────────────────────────────────────────────────
 logger = logging.getLogger("chanlun_mcp")
@@ -389,11 +393,27 @@ async def chanlun_daily_report(params: DailyReportInput) -> str:
         return f"错误: 日报生成失败 - {type(e).__name__}: {e}"
 
 
-# ── 主入口 ──────────────────────────────────────────────────
+import argparse
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="缠论分析 MCP Server")
+    p.add_argument("--transport", choices=["stdio", "sse", "streamable-http"],
+                   default=os.environ.get("MCP_TRANSPORT", "stdio"))
+    p.add_argument("--host", default=None)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--mount-path", default=None)
+    return p.parse_args()
+
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    # stdio 传输（Codex 默认调用方式）
-    mcp.run()
+    args = _parse_args()
+    if args.host: mcp.settings.host = args.host
+    if args.port: mcp.settings.port = args.port
+    logging.basicConfig(level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    host = mcp.settings.host; port = mcp.settings.port; t = args.transport
+    if t == "stdio":
+        print(f"[chanlun_mcp] stdio (Codex)", file=sys.stderr)
+        mcp.run(transport="stdio")
+    else:
+        print(f"[chanlun_mcp] {t} -> {host}:{port}", file=sys.stderr, flush=True)
+        mcp.run(transport=t, mount_path=args.mount_path)

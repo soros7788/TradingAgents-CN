@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 import json
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, Any, Tuple, List, Optional
 import time
 
@@ -599,6 +599,9 @@ class TradingAgentsGraph:
                 [
                     # 统一工具（推荐）
                     self.toolkit.get_stock_market_data_unified,
+                    # 同花顺远航版MCP工具（A股本地行情，bridge不可用时自动降级）
+                    self.toolkit.get_ths_kline,
+                    self.toolkit.get_ths_snapshot,
                     # 在线工具（备用）
                     self.toolkit.get_YFin_data_online,
                     self.toolkit.get_stockstats_indicators_report_online,
@@ -646,12 +649,15 @@ class TradingAgentsGraph:
             ),
         }
 
-    def propagate(self, company_name, trade_date, progress_callback=None, task_id=None):
+    def propagate(self, company_name, trade_date, *, generated_at, progress_callback=None, task_id=None):
         """Run the trading agents graph for a company on a specific date.
 
         Args:
             company_name: Company name or stock symbol
             trade_date: Date for analysis
+            generated_at: REQUIRED. Independent provenance timestamp for this analysis run.
+                          Must NOT be derived from trade_date/as_of. Created at the outer
+                          execution boundary immediately before calling propagate().
             progress_callback: Optional callback function for progress updates
             task_id: Optional task ID for tracking performance data
         """
@@ -660,15 +666,16 @@ class TradingAgentsGraph:
         logger.debug(f"🔍 [GRAPH DEBUG] ===== TradingAgentsGraph.propagate 接收参数 =====")
         logger.debug(f"🔍 [GRAPH DEBUG] 接收到的company_name: '{company_name}' (类型: {type(company_name)})")
         logger.debug(f"🔍 [GRAPH DEBUG] 接收到的trade_date: '{trade_date}' (类型: {type(trade_date)})")
+        logger.debug(f"🔍 [GRAPH DEBUG] 接收到的generated_at: '{generated_at}' (类型: {type(generated_at)})")
         logger.debug(f"🔍 [GRAPH DEBUG] 接收到的task_id: '{task_id}'")
 
         self.ticker = company_name
         logger.debug(f"🔍 [GRAPH DEBUG] 设置self.ticker: '{self.ticker}'")
 
         # Initialize state
-        logger.debug(f"🔍 [GRAPH DEBUG] 创建初始状态，传递参数: company_name='{company_name}', trade_date='{trade_date}'")
+        logger.debug(f"🔍 [GRAPH DEBUG] 创建初始状态，传递参数: company_name='{company_name}', trade_date='{trade_date}', generated_at='{generated_at}'")
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date
+            company_name, trade_date, generated_at
         )
         logger.debug(f"🔍 [GRAPH DEBUG] 初始状态中的company_of_interest: '{init_agent_state.get('company_of_interest', 'NOT_FOUND')}'")
         logger.debug(f"🔍 [GRAPH DEBUG] 初始状态中的trade_date: '{init_agent_state.get('trade_date', 'NOT_FOUND')}'")

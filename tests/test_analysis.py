@@ -80,7 +80,9 @@ def test_simple_analysis():
     try:
         print("🚀 开始简单分析测试...")
         # 执行简单分析
-        state, decision = graph.propagate("AAPL", "2025-06-27")
+        from datetime import datetime, timezone
+        _run_generated_at = datetime.now(timezone.utc)
+        state, decision = graph.propagate("AAPL", "2025-06-27", generated_at=_run_generated_at)
         print("✅ 分析完成")
         print(f"决策: {decision}")
         return True
