@@ -108,7 +108,9 @@ def resolve_pids(args) -> list[int]:
         try:
             out = subprocess.run(["pgrep", "-f", args.pgrep_pattern],
                                  capture_output=True, text=True, timeout=10)
-            return [int(x) for x in out.stdout.split() if x.strip().isdigit()]
+            me, parent = os.getpid(), os.getppid()
+            return [int(x) for x in out.stdout.split()
+                    if x.strip().isdigit() and int(x) not in (me, parent)]
         except (OSError, subprocess.TimeoutExpired):
             return []
     return []
