@@ -93,11 +93,23 @@ def main():
     ap.add_argument("--ssh-host", default=None)
     ap.add_argument("--ssh-key", default=None)
     ap.add_argument("--out", default=None, help="输出 JSON 路径 (默认 stdout)")
-    ap.add_argument("--min-gate", default="PASS", help="最低接受 gate (PASS/BLOCKED)")
+    ap.add_argument("--date", default=None, help="扫描日 YYYYMMDD：只保留 ts 日期 >= 该日的记录（日期过滤，2026-09-27）")
     args = ap.parse_args()
 
     t0 = time.time()
     records = read_ledger(args.ledger, args.ssh_host, args.ssh_key)
+    # 日期过滤 (2026-09-27)：只保留 ts 日期 >= 扫描日的记录，陈旧记录不再混入 merged
+    date_filtered_out = 0
+    if args.date:
+        try:
+            dstr = datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            print(f"错误: --date 须为 YYYYMMDD 格式，收到: {args.date}", file=sys.stderr)
+            return 2
+        before = len(records)
+        records = [r for r in records
+                   if isinstance(r.get("ts"), str) and len(r["ts"]) >= 10 and r["ts"][:10] >= dstr]
+        date_filtered_out = before - len(records)
     deduped, stale_superseded = dedupe(records)
     buckets = classify(deduped)
 
@@ -114,6 +126,7 @@ def main():
             "total_records": total,
             "unique_codes": uniq,
             "stale_superseded": stale_superseded,
+            "date_filtered_out": date_filtered_out,
             "watch_count": len(watch),
             "vm_A_count": sum(1 for r in deduped.values() if r.get("vm") == "A"),
             "vm_B_count": sum(1 for r in deduped.values() if r.get("vm") == "B"),
@@ -141,6 +154,7 @@ def main():
     print(f"源: {m['source']}")
     print(f"原始记录: {m['total_records']}  去重后: {m['unique_codes']}")
     print(f"stale_superseded (曾被PASS、后被更晚非PASS覆盖): {m['stale_superseded']}")
+    print(f"日期过滤剔除 (ts 早于扫描日): {m['date_filtered_out']}")
     print(f"watch_candidates (观察池 PASS_JEVN+NEUTRAL): {m['watch_count']}")
     print(f"VM-A 写入: {m['vm_A_count']}  VM-B 写入: {m['vm_B_count']}")
     for g, n in result["gates"].items():
@@ -155,4 +169,4 @@ def main():
     print(f"{'='*60}", flush=True)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
