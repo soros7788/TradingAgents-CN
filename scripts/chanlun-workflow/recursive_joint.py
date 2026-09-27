@@ -83,8 +83,8 @@ def extract(code, as_of):
         "has_R0_bull": has["R0"],
         "has_R1_bull": has["R1"],
         "has_R2_bull": has["R2"],
-        "two_level_joint_R0R1": two_joint,
-        "three_level_joint_R0R1R2": three_joint,
+        "bullish_confluence_r0r1": two_joint,
+        "bullish_confluence_r0r1r2": three_joint,
         "interval_evidence_count": len(intv),
         "interval_bull_confirmed": sum(1 for e in intv if e.direction == EvidenceDirection.BULLISH and e.status.value == "confirmed"),
         "interval_bear_confirmed": sum(1 for e in intv if e.direction == EvidenceDirection.BEARISH and e.status.value == "confirmed"),
@@ -103,7 +103,7 @@ def main():
         except Exception as e:
             r = {"code": code, "error": f"{type(e).__name__}: {e}"}
         results.append(r)
-        tag = "J2" if r.get("two_level_joint_R0R1") else ("J3" if r.get("three_level_joint_R0R1R2") else "-")
+        tag = "J2" if r.get("bullish_confluence_r0r1") else ("J3" if r.get("bullish_confluence_r0r1r2") else "-")
         print(f"  [{i}/{len(codes)}] {code} dirs={r.get('recursive_level_direction')} "
               f"buy={list(r.get('buy_points',{}).keys())} {tag}", flush=True)
         time.sleep(0.5)
