@@ -70,10 +70,8 @@ def check_pid(pid: int, swap_warn: float, swap_crit: float, mem_min_mb: int):
     elif state in ("T", "t"):
         reasons.append("stopped (T)")
         level = max(level, WARN)
-    if ppid == 1 and pid != 1:
-        entry["orphaned"] = True
-        reasons.append("orphaned (ppid=1, adopted by init)")
-        level = max(level, WARN)
+    # 注: ppid==1 在本架构是常态（systemd 服务 / setsid 守护），不告警；
+    # 单实例由 ensure_mtim.sh 的 pgrep 保证。Z/D/T 与 swap 水位才是真信号。
 
     mi = read_meminfo()
     if mi and mi.get("SwapTotal", 0) > 0:
