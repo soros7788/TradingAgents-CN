@@ -14,8 +14,8 @@
   4. effective (fresh_days<=FRESH) (C 修复: above 用周线末K线日衡量, 不再被古老中枢结束日误杀)
 
 数据源:
-  - 自动选源: 最近 24h 内 dual 条数最多的 dualscan_*.json(全量主扫描, 绕开分批小json),
-    与 trend_pool_daily.sh / beichi_turn_daily.sh 选源策略一致
+  - 自动选源: union 最近 24h 内所有 dualscan_*.json 的 dual 记录(按 code dedup 保最新,
+    跳过历史 union 产物), 绕开分批小 json 陷阱, 与 trend_pool_daily.sh / beichi_turn_daily.sh 选源策略一致
   - weekly_nesting.analyze 实时算周线方向锚(读 ~/kline_cache_local, 零网络)
 
 零 sealed 改动: 仅消费 weekly_nesting / weekly_watchlist 公共接口, 不碰 recursive_core/interval_engine/tradingagents/chan/*。
@@ -58,9 +58,6 @@ def resolve_dual():
     json.dump(out, open(op, "w"), ensure_ascii=False)
     return op
 
-DS = resolve_dual()
-if not DS:
-    sys.exit("FATAL: 找不到 dualscan_*.json 数据源")
 TODAY = datetime.now().strftime("%Y%m%d")
 BASELINE_DATE = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 OUT_TXT = os.environ.get("COMBO_TXT", os.path.join(LOGDIR, "combo_pool_watchlist_%s.txt" % TODAY))
@@ -69,8 +66,22 @@ DL_P_MIN = 0.618
 FRESH = W.FRESH
 
 def dev_pct(z):
+    # P2-2 修复 (2026-10-01): cur=None 时不抛 TypeError, 偏离度记 0
     ref = z["zg"] if z["pos"] == "above" else z["zd"]
-    return (z["cur"] - ref) / ref * 100.0 if ref else 0.0
+    cur = z.get("cur")
+    if not ref or not isinstance(cur, (int, float)) or cur != cur:
+        return 0.0
+    return (cur - ref) / ref * 100.0
+
+
+def _fmt_price(v):
+    # P2-2 修复 (2026-10-01): None/NaN 价格格式化为 N/A, 不崩整池
+    return "%.2f" % v if isinstance(v, (int, float)) and v == v else "N/A"
+
+
+def _fmt_days(v):
+    # P2-2 修复 (2026-10-01): freshness() 可返回 None, 新鲜度格式化为 N/A
+    return "%d" % v if isinstance(v, int) else "N/A"
 
 # ② 补齐: 优先级分级(仅用现有信号 dlp/新鲜度, 不引入新数据源)
 #   A = 强背驰(dlp>=1.0) 且 锚新鲜(<=5日) 且 有效
@@ -86,6 +97,10 @@ def grade_tier(r):
     return "C"
 
 def main():
+    # P2-1 修复 (2026-10-01): 选源移入 main, import 不再执行 union+写文件/退出
+    DS = resolve_dual()
+    if not DS:
+        sys.exit("FATAL: 找不到 dualscan_*.json 数据源")
     ds = json.load(open(DS))
     # 粗筛: R1 conflict ∩ dlp>0.618 (少量候选, 再实时 analyze 确认周线方向)
     cands = []
@@ -148,13 +163,13 @@ def main():
     L.append("=" * 66)
     L.append("【有效候选 · 周线顺 ∩ 日线底背驰】%d 只:" % len(eff_recs))
     for r in eff_recs:
-        L.append("  [%s] %s 现价%.2f 周中枢%s %+.2f%% 背驰力度dlp=%.3f 新鲜%d日 [锚基准%s]"
-                 % (r["tier"], r["code"], r["cur"], r["zs_range"], r["dev_pct"], r["dlp"], r["fresh_days"], r["anchor_e"]))
+        L.append("  [%s] %s 现价%s 周中枢%s %+.2f%% 背驰力度dlp=%.3f 新鲜%s日 [锚基准%s]"
+                 % (r["tier"], r["code"], _fmt_price(r["cur"]), r["zs_range"], r["dev_pct"], r["dlp"], _fmt_days(r["fresh_days"]), r["anchor_e"]))
     L.append("")
     L.append("【锚陈旧 · 已剔除】(周线above但锚过期, 待周线刷新后复核):")
     for r in recs:
         if not r["effective"]:
-            L.append("  %s 现价%.2f 周中枢%s dlp=%.3f 新鲜%d日" % (r["code"], r["cur"], r["zs_range"], r["dlp"], r["fresh_days"]))
+            L.append("  %s 现价%s 周中枢%s dlp=%.3f 新鲜%s日" % (r["code"], _fmt_price(r["cur"]), r["zs_range"], r["dlp"], _fmt_days(r["fresh_days"])))
     L.append("")
     L.append("说明: 本池独立于顺势池(要同向)与高背驰力度池(要大顺+小背驰), 抓的是「大顺+小背驰」区间套买点。")
     L.append("      即周线向上提供安全边际, 日线级高 dlp 背驰给出回调低点(二买/三买), 非逆势抄底。")

@@ -56,6 +56,9 @@ def _read_cache_df(code: str, tf: str):
         return None
     if df is None or len(df) == 0:
         return None
+    # akshare CSV 用 "date" 列, shim 统一用 "day" — rename once
+    if "date" in df.columns and "day" not in df.columns:
+        df = df.rename(columns={"date": "day"})
     if not set(_REQUIRED_COLS).issubset(set(df.columns)):
         return None
     # 防御性: 保证 day 严格递增且唯一 (normalizer fail-fast 契约)。

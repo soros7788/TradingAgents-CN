@@ -50,6 +50,7 @@ ctx.verify_mode = ssl.CERT_NONE
 _dl_model = None
 _dl_scaler = None
 _dl_loaded = False
+_dl_fallback_warned = False  # P2-10 (2026-10-01): fallback 告警只打一次
 _DL_DIR = os.path.dirname(os.path.abspath(__file__))
 _DL_MODEL_PATH = os.path.join(_DL_DIR, "dl_model.pkl")
 _DL_SCALER_PATH = os.path.join(_DL_DIR, "dl_scaler.pkl")
@@ -542,6 +543,11 @@ def predict_beichi(ratio, pre_pct, post_pct, pre_bars, post_bars,
         # 模型不可用, 回退到硬编码
         # 【TRAE复核修复】prob语义必须与DL路径一致(背驰概率)
         # 旧代码 min(ratio/100, 1.0) 导致"无背驰"时prob=1.0, 下游strength=5
+        # P2-10 (2026-10-01): fallback 触发时打一次性 ALERT, 避免全市场静默降级无人知
+        global _dl_fallback_warned
+        if not _dl_fallback_warned:
+            _dl_fallback_warned = True
+            print("[ALERT][DL模型] 模型不可用, 已回退硬编码(ratio<60→0.70): dlp 口径降级, 请检查 dl_model.pkl/dl_scaler.pkl")
         if ratio < 60:
             return "趋势背驰", 0.70
         elif ratio < 85:

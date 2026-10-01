@@ -10,7 +10,7 @@
 用法:
   python3 chan-merge.py --ledger ~/chan_logs/scan_ledger.jsonl
   python3 chan-merge.py --ledger VM-B:~/chan_logs/scan_ledger.jsonl \
-                        --ssh-host katelolita7788@35.212.190.147 \
+                        --ssh-host katelolita7788@34.4.105.158 \
                         --ssh-key ~/.ssh/hermes_key --out ~/chan_logs/candidates.json
 """
 from __future__ import annotations
@@ -25,7 +25,8 @@ BLOCKED_GATES = {"BLOCKED", "TIMEOUT", "UNKNOWN", "ERROR"}
 def _ssh_cmd(host, key=None):
     cmd = ["ssh"]
     if key: cmd += ["-i", os.path.expanduser(key)]
-    cmd += ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", host]
+    # P1-8 (2026-10-01): no → accept-new（治理要求；TOOLS.md 已有约定）
+    cmd += ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", host]
     return cmd
 
 def read_ledger(ledger, ssh_host=None, ssh_key=None):

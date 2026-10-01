@@ -1,0 +1,87 @@
+<!-- ============================================================================
+trade_plan_card_template.html —— 交易计划卡每日输出模板
+渲染脚本: render_plan_card.py (同目录)
+
+
+__DATE_NICE__ 日期(YYYY-MM-DD) __PILL_TXT__/__PILL_BG__ 环境章文案/底色
+__N_A__/__N_B__ A/B级数量 __MAIN_CARD__ 主卡片(MAIN或EMPTY区渲染结果)
+__WATCH_ROWS__ 观察名单行 __SRC__ 数据来源union文件名
+
+
+__CODE__/__CUR__/__GRADE__ 代码/现价/等级
+__DLP__/__REASON__/__ENTRY__ 背驰力度/定级理由/买卖点
+__ZS__ 中枢区间 __BUY_LO__/__BUY_HI__ 买入区 __STOP__ 止损价
+__BUY_TOP__/__BUY_H__ 买入区在梯子的top%/高度%
+__ZS_TOP__/__ZS_H__ 中枢在梯子的top%/高度%
+__CUR_TOP__/__STOP_TOP__ 现价线/止损线在梯子的top%
+__DLP_PCT__ dlp进度条宽度% __AXIS__ 左侧刻度(脚本生成)
+__POS__ 仓位提示(按等级动态) __HARD_STOP__ 硬止损价(现价x0.85预估,实际按成交价)
+
+无候选时显示,无占位符
+============================================================================= -->
+<!-- SECTION:PAGE -->
+<div style="box-sizing:border-box;max-width:560px;margin:0 auto;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:var(--hatch-widget-text);">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+<div style="font-size:17px;font-weight:700;">__DATE_NICE__ 交易计划</div>
+<div style="font-size:12px;font-weight:700;padding:4px 12px;border-radius:20px;background:__PILL_BG__;color:#fff;">__PILL_TXT__</div>
+</div>
+<div style="display:flex;gap:8px;margin-bottom:12px;">
+<div style="flex:1;background:var(--hatch-widget-surface-muted);border:1px solid var(--hatch-widget-border);border-radius:10px;padding:8px;text-align:center;"><div style="font-size:11px;color:var(--hatch-widget-muted);">A级信号</div><div style="font-size:14px;font-weight:700;">__N_A__只</div></div>
+<div style="flex:1;background:var(--hatch-widget-surface-muted);border:1px solid var(--hatch-widget-border);border-radius:10px;padding:8px;text-align:center;"><div style="font-size:11px;color:var(--hatch-widget-muted);">B级信号</div><div style="font-size:14px;font-weight:700;">__N_B__只</div></div>
+<div style="flex:1;background:var(--hatch-widget-surface-muted);border:1px solid var(--hatch-widget-border);border-radius:10px;padding:8px;text-align:center;"><div style="font-size:11px;color:var(--hatch-widget-muted);">R2大级别</div><div style="font-size:14px;font-weight:700;color:#dc2626;">缺席</div></div>
+</div>
+__MAIN_CARD__
+<div style="background:var(--hatch-widget-surface);border:1px solid var(--hatch-widget-border);border-radius:14px;padding:14px;margin-bottom:12px;">
+<div style="font-size:13px;font-weight:700;margin-bottom:8px;">观察（不买）</div>
+__WATCH_ROWS__
+</div>
+<div style="background:var(--hatch-widget-surface);border:1px solid var(--hatch-widget-border);border-radius:14px;padding:14px;">
+<div style="font-size:13px;font-weight:700;margin-bottom:8px;">纪律</div>
+<div style="font-size:12px;padding:4px 0;">1. 开盘不在买入区 → 全天不做</div>
+<div style="font-size:12px;padding:4px 0;">2. 技术止损与-15%硬止损取紧者，无条件走，不补仓</div>
+<div style="font-size:12px;padding:4px 0;">3. 单票 ≤30% · 总仓位 ≤70%</div>
+<div style="font-size:12px;padding:4px 0;">4. 3 连亏直接停手</div>
+<div style="font-size:12px;padding:4px 0;">5. R2大级别缺席：只做A/B信号，不追大级别确认</div>
+</div>
+<div style="font-size:11px;color:var(--hatch-widget-muted);margin-top:10px;text-align:center;">基于 __SRC__ · 每日08:20自动生成</div>
+</div>
+<!-- SECTION:MAIN -->
+<div style="background:var(--hatch-widget-surface);border:1px solid var(--hatch-widget-border);border-radius:14px;padding:14px;margin-bottom:12px;box-shadow:var(--hatch-widget-shadow);">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+<div><span style="font-size:20px;font-weight:800;">__CODE__</span><span style="font-size:12px;color:var(--hatch-widget-muted);margin-left:8px;">现价 __CUR__</span></div>
+<div style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;background:var(--hatch-widget-accent);color:var(--hatch-widget-on-accent);">__GRADE__级</div>
+</div>
+<div style="font-size:12px;color:var(--hatch-widget-muted);margin-bottom:12px;">dlp __DLP__ · __REASON__</div>
+<div style="font-size:12px;font-weight:700;margin-bottom:8px;">价格位置图（上高下低）</div>
+<div style="position:relative;height:340px;background:var(--hatch-widget-surface-muted);border-radius:10px;overflow:hidden;margin-bottom:12px;">
+<div style="position:absolute;left:0;top:0;bottom:0;width:44px;">__AXIS__</div>
+<div style="position:absolute;left:44px;right:0;top:0;bottom:0;">
+<div style="position:absolute;left:0;right:0;top:__BUY_TOP__%;height:__BUY_H__%;background:rgba(22,163,74,.10);border:2px dashed #16a34a;border-radius:6px;">
+<div style="position:absolute;top:6px;left:10px;font-size:11px;font-weight:700;color:#16a34a;">买入区 __BUY_LO__ – __BUY_HI__</div>
+</div>
+<div style="position:absolute;left:0;right:0;top:__ZS_TOP__%;height:__ZS_H__%;background:rgba(37,99,235,.16);border-top:2px solid #2563eb;border-bottom:2px solid #2563eb;">
+<div style="position:absolute;top:50%;left:10px;transform:translateY(-50%);font-size:11px;font-weight:700;color:#2563eb;">中枢 __ZS__</div>
+</div>
+<div style="position:absolute;left:0;right:0;top:__CUR_TOP__%;border-top:3px solid var(--hatch-widget-text);">
+<div style="position:absolute;right:8px;top:-22px;font-size:11px;font-weight:700;background:var(--hatch-widget-surface);border:1px solid var(--hatch-widget-border);border-radius:8px;padding:2px 8px;">现价 __CUR__</div>
+</div>
+<div style="position:absolute;left:0;right:0;top:__STOP_TOP__%;border-top:3px dashed #dc2626;">
+<div style="position:absolute;right:8px;top:6px;font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:8px;padding:2px 8px;">止损 __STOP__ · 跌破走</div>
+</div>
+</div>
+</div>
+<div style="font-size:12px;font-weight:700;margin-bottom:6px;">背驰力度 dlp</div>
+<div style="height:10px;background:var(--hatch-widget-surface-muted);border-radius:6px;overflow:hidden;margin-bottom:4px;"><div style="width:__DLP_PCT__%;height:100%;background:linear-gradient(90deg,#16a34a,#4ade80);border-radius:6px;"></div></div>
+<div style="font-size:11px;color:var(--hatch-widget-muted);margin-bottom:12px;">__DLP__（门槛0.618）· __ENTRY__</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+<div style="background:rgba(22,163,74,.1);border:1px solid #16a34a;border-radius:10px;padding:10px;"><div style="font-size:11px;color:#16a34a;font-weight:700;">买入</div><div style="font-size:15px;font-weight:800;">__BUY_LO__ – __BUY_HI__</div><div style="font-size:11px;color:var(--hatch-widget-muted);">不在区内不做</div></div>
+<div style="background:rgba(220,38,38,.08);border:1px solid #dc2626;border-radius:10px;padding:10px;"><div style="font-size:11px;color:#dc2626;font-weight:700;">止损</div><div style="font-size:15px;font-weight:800;">跌破 __STOP__</div><div style="font-size:11px;color:var(--hatch-widget-muted);">无条件走</div><div style="font-size:11px;color:var(--hatch-widget-muted);margin-top:4px;">硬止损 __HARD_STOP__（-15%，与技术止损取紧者执行）</div></div>
+</div>
+<div style="margin-top:8px;background:var(--hatch-widget-surface-muted);border-radius:10px;padding:10px;font-size:13px;"><span style="font-weight:700;">仓位 </span>__POS__</div>
+</div>
+<!-- SECTION:EMPTY -->
+<div style="background:var(--hatch-widget-surface);border:1px solid var(--hatch-widget-border);border-radius:14px;padding:24px;margin-bottom:12px;text-align:center;">
+<div style="font-size:16px;font-weight:800;margin-bottom:8px;">今日无候选 · 空仓等待</div>
+<div style="font-size:12px;color:var(--hatch-widget-muted);">A/B级均挂零，不硬找信号</div>
+</div>
+<!-- END -->

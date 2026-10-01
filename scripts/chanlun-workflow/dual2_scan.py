@@ -359,7 +359,6 @@ def _build_jev_prompt(row: dict) -> str:
         f"A-engine direction {row.get('recursive_direction')}",
         f"confirmed bullish trends {rs.get('trend_bullish')}, bearish {rs.get('trend_bearish')}",
         f"confirmed bullish segments {rs.get('segment_bullish')}, bearish {rs.get('segment_bearish')}",
-        f"trend score {rs.get('trend_score')}, segment score {rs.get('segment_score')}",
         f"evidence total {rs.get('evidence_total')} (confirmed {rs.get('confirmed')}, forming {rs.get('forming')})",
         f"unison R2/R1/R0 {rs.get('r2_dir')}/{rs.get('r1_dir')}/{rs.get('r0_dir')}, three_way {rs.get('three_way_unison')}",
         f"B-engine bullish confirmed {timing.get('bullish_confirmed')}, bearish {timing.get('bearish_confirmed')}, interval total {timing.get('total')}",
@@ -411,6 +410,8 @@ def jev_secondary_gate(row: dict, key: str = None, threshold: float = 0.55) -> d
             base_url=base, transport=transport, timeout=_os.environ.get("JEV_TIMEOUT", 30.0) or 30.0,
         )
         prompt = _build_jev_prompt(row)
+        import time as _time
+        _t0 = _time.time()
         resp = client.system_one(
             state=prompt,
             questions={"is_worthlong": Noul(
@@ -418,7 +419,11 @@ def jev_secondary_gate(row: dict, key: str = None, threshold: float = 0.55) -> d
         )
         prob = float(resp.answers["is_worthlong"].noul)
         verdict = "PASS" if prob >= threshold else "FAIL"
-        return {"prob": prob, "verdict": verdict, "error": None}
+        # 2026-10-01: 返回判分上下文供审计。NoulAnswer schema 实锤只有 noul:float,
+        # 无文字评语字段,故评语=输入 prompt 全文 + 阈值 + 耗时, verdict 可复现。
+        return {"prob": prob, "verdict": verdict, "error": None,
+                "prompt": prompt, "threshold": threshold,
+                "latency_ms": round((_time.time() - _t0) * 1000, 1)}
     except Exception as e:  # noqa: BLE001 — JEV 失败不阻断主流程
         return {"prob": None, "verdict": "ERROR", "error": f"{type(e).__name__}: {e}"}
 
@@ -468,6 +473,10 @@ def _append_ledger_row(ledger_path: str, row: dict) -> None:
         # row["jev"] = {prob, verdict, error} (见 jev_secondary_gate). 无 JEV 时为 None.
         "jev_prob": _native((row.get("jev") or {}).get("prob")),
         "jev_verdict": (row.get("jev") or {}).get("verdict"),
+        # 2026-10-01: JEV 判分上下文落盘, verdict 可审计可复现 (阈值校准的数据基础)
+        "jev_prompt": (row.get("jev") or {}).get("prompt"),
+        "jev_threshold": _native((row.get("jev") or {}).get("threshold")),
+        "jev_latency_ms": _native((row.get("jev") or {}).get("latency_ms")),
         # H2a (2026-09-24): 透传 error 键 — ERROR 标带真实原因, 消除 JEV v9 读到的 error=None 空洞假象
         # (此前 _append_ledger_row entry 未写 error 字段, 导致数据质量/异常原因丢失)
         "error": row.get("error"),
@@ -500,8 +509,11 @@ def _process_one(code, base, is_confirmed, as_of, no_beichi, vm_tag):
         except Exception as e:  # noqa: BLE001 — 单标的失败不阻断
             row.update({"gate": "ERROR", "error": f"{type(e).__name__}: {e}"})
 
-        # ── PASS 标的补算 DL_P/ratio ──
-        if (not no_beichi) and row.get("gate") == "PASS" \
+        # ── 补算 DL_P/ratio（P1-5 2026-10-01 扩展）──
+        # meet 调用恒用 --codes（跳过 Stage1），非 PASS 行的 dlp/ratio 原恒为 None，
+        # 转折池（BLOCKED+dlp）被迫依赖外部 vm_rescan_dlp.py 回填。此处扩展到全部
+        # 非 ERROR 行，dual2 自给自足；no_beichi 时仍跳过。
+        if (not no_beichi) and row.get("gate") not in (None, "ERROR") \
                 and row.get("ratio") is None and row.get("price"):
             try:
                 sig = _scan_one_with_timeout(code, row.get("name", ""), row["price"])
@@ -581,10 +593,15 @@ def main() -> int:
         print("[Stage1] workflow 层全市场扫描 (候选池生成)...")
         result = full_scan(silent=False)
         all_sig = result.get("all_signals", result["confirmed"] + result["near"])
-        stage1_map = {r["code"]: r for r in all_sig[:500]}
+        # P1-6 (2026-10-01): 原 all_sig[:500] 静默截断，加警告并允许环境变量覆盖
+        _s1max = int(os.environ.get("MITM_STAGE1_MAX", "500"))
+        if len(all_sig) > _s1max:
+            print(f"[warn] Stage1 无 --codes 模式截断: {len(all_sig)} → {_s1max} "
+                  f"(MITM_STAGE1_MAX 可调)", flush=True)
+        stage1_map = {r["code"]: r for r in all_sig[:_s1max]}
         confirmed_codes = {r["code"] for r in result["confirmed"]}
         confirmed_n = len(result["confirmed"])
-        codes = [r["code"] for r in all_sig[:500]]
+        codes = [r["code"] for r in all_sig[:_s1max]]
         codes = list(dict.fromkeys(codes))  # 去重保序
         report["stage1"] = {
             "total_scanned": result["total_scanned"],
@@ -642,8 +659,8 @@ def main() -> int:
     # 2026-09-09: dlp > 0.618 黄金门槛过滤 (用户规则)
     DL_P_MIN = 0.618
     # 2026-09-22: PASS_JEVN 是 JEV 二次门禁拒掉的标的, 不计入通过名单
-    all_pass = [r for r in report["dual"] if r["gate"] in ("PASS", "PASS_JEVN")]
-    all_pass = [r for r in all_pass if r["gate"] == "PASS"]
+    # P1-4 (2026-10-01): 原两步过滤净效果即纯 PASS（PASS_JEVN 排除），合并为一步
+    all_pass = [r for r in report["dual"] if r["gate"] == "PASS"]
     # 判断 dlp 是否可用（Stage1 可能被跳过导致全 null）
     has_dlp = any(r.get("dlp") is not None and r.get("dlp") > 0 for r in all_pass)
     if has_dlp:
@@ -673,7 +690,10 @@ def main() -> int:
               f"{'A(T↑/T↓/S↑/S↓)':<16} {'B(多/空)':<10} {'来源'}")
         print(f"  {'-'*85}")
         for r in passing:
-            f = calc_funding(r.get("price") or 0.0, 20326.12, 7847.12)
+            # P1-4 (2026-10-01): 资金参数原为硬编码 20326.12/7847.12，改走环境变量
+            _ft = float(os.environ.get("DUAL2_FUNDING_TOTAL", "20326.12"))
+            _fb = float(os.environ.get("DUAL2_FUNDING_BASE", "7847.12"))
+            f = calc_funding(r.get("price") or 0.0, _ft, _fb)
             src = "confirmed" if r.get("stage1_confirmed") else "near"
             rs = r.get("recursive_summary", {})
             t = f"T↑{rs.get('trend_bullish',0)}/T↓{rs.get('trend_bearish',0)} S↑{rs.get('segment_bullish',0)}/S↓{rs.get('segment_bearish',0)}"

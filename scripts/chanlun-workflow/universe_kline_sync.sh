@@ -10,6 +10,11 @@
 # 用法: universe_kline_sync.sh            # 全宇宙, 交易日收盘后由 timer 调用
 #       universe_kline_sync.sh --limit 5  # 冒烟/测试
 set -u
+# 2026-09-28: 限流驱动角色管理（用户批准）
+# role_manager.sh 接管调度，本脚本保留为手动 fallback
+if [ "${ROLE_MANAGER:-1}" = "1" ] && [ -x "$HOME/chan_logs/role_manager.sh" ]; then
+    exec "$HOME/chan_logs/role_manager.sh" a
+fi
 export PATH="$HOME/bin:$PATH"
 
 LOCAL_DIR=/home/gorgesoros39/kline_cache_local
@@ -40,7 +45,7 @@ else
 fi
 
 # 1) 刷新写本地(append-only + 1m 滚窗封顶 5000)
-KLINE_CACHE_DIR="$LOCAL_DIR" "$PYTHON" "$REFRESH" $LIMIT_ARG >> "$LOG" 2>&1
+KLINE_CACHE_DIR="$LOCAL_DIR" "$PYTHON" "$REFRESH" $LIMIT_ARG --coord-id a >> "$LOG" 2>&1
 RC1=$?
 echo "$(date '+%F %T') [sync] refresh rc=$RC1" >> "$LOG"
 

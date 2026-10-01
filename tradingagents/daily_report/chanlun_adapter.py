@@ -32,11 +32,20 @@ if not _CHANLUN_ROOT.exists():
     _CHANLUN_ROOT = Path("/workspace/stock-chanlun/backend").resolve()
 CHANLUN_ROOT = _CHANLUN_ROOT
 if str(CHANLUN_ROOT) not in sys.path:
-    sys.path.insert(0, str(CHANLUN_ROOT))
+    if CHANLUN_ROOT.exists():
+          sys.path.insert(0, str(CHANLUN_ROOT))
 
 # stock-chanlun 的数据服务（纯 httpx，不依赖 akshare）
-from chanlun.engine import ChanlunEngine  # noqa: E402
-from chanlun.elements import ChanlunAnalysis  # noqa: E402
+try:
+  from chanlun.engine import ChanlunEngine  # noqa: E402
+except ImportError:
+  ChanlunEngine = None
+  ChanlunAnalysis = None
+try:
+  from chanlun.elements import ChanlunAnalysis  # noqa: E402
+except ImportError:
+  ChanlunEngine = None
+  ChanlunAnalysis = None
 
 
 def _to_plain_dict(analysis: ChanlunAnalysis) -> Dict[str, Any]:

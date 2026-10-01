@@ -20,16 +20,15 @@ D8=$(date +%Y%m%d)
 mkdir -p "$LOGDIR"
 
 # 防重: pidfile + 存活检查(Step2 批量约 3 分钟, 避免 cron 重入叠加)
+# P2-7 修复 (2026-10-01): pidfile check-then-write 有 TOCTOU 竞态, 改用 flock(锁随 fd 释放)
 LOCK="$LOGDIR/.trend_pool.lock"
-if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
-  echo "$(date '+%F %T') [trend-pool] 已有实例(pid=$(cat "$LOCK"))在运行 -> skip"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "$(date '+%F %T') [trend-pool] 已有实例在运行 -> skip"
   exit 0
 fi
-echo $$ > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT
 
 cd "$WF" || exit 1
-export KLINE_CACHE_DIR="$HD/kline_cache_local"
 
 # ---- 1) 选源 ----
 SRC=$(python3 - "$LOGDIR" <<'PY'
@@ -101,4 +100,18 @@ open(p, "w").write(h + s)
 print("口径标注已写入: %s" % p)
 PY
 
+# P2-9 (2026-10-01): 清理 7 天前的 union 中间文件, 防 ~/chan_logs 堆积
+find "$LOGDIR" -maxdepth 1 -name 'dualscan_union_*.json' -mtime +7 -delete 2>/dev/null || true
 echo "$(date '+%F %T') [trend-pool] DONE -> $WNL_TXT"
+
+# ---- 5) 顺势池双系统分级清单 ----
+# 逻辑见 grade_pool_plan.py 头部 L1-L5:方向分流->信号join->A/B/C/JEV分级->区间套买卖点。
+# 非致命:失败只记日志,不影响池子主产物。
+python3 "$WF/grade_pool_plan.py" --pool-dir "$LOGDIR" --date "$D8" --out-dir "$LOGDIR" \
+    >> "$LOGDIR/grade_pool_${D8}.log" 2>&1 || echo "$(date '+%F %T') [trend-pool] 分级失败 rc=$?"
+
+# ---- 6) 交易计划卡片(每日输出格式) ----
+# 逻辑见 render_plan_card.py 头部 R1-R5:选头名->动态价格梯子->买入区/止损派生->观察名单。
+# 非致命:失败只记日志,不影响池子与分级产物。
+python3 "$WF/render_plan_card.py" --pool-dir "$LOGDIR" --date "$D8" --out-dir "$LOGDIR" \
+    >> "$LOGDIR/plan_card_${D8}.log" 2>&1 || echo "$(date '+%F %T') [trend-pool] 计划卡片失败 rc=$?"

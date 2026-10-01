@@ -121,9 +121,12 @@ def scan_one(code, name, price):
     best_sell = None
     for sig in r.get("signals", []):
         op = sig.get("op")
-        ratio = sig["ratio"]
-        dlp = sig["dl_prob"]
-        valid = sig["valid"]
+        # P2-6 修复 (2026-10-01): 缺键信号跳过, 不抛 KeyError (valid=False 是合法值, 只判 None)
+        ratio = sig.get("ratio")
+        dlp = sig.get("dl_prob")
+        valid = sig.get("valid")
+        if ratio is None or dlp is None or valid is None:
+            continue
         confirmed = ratio < 60 and dlp > 0.8 and valid
         # 【Bug2 修复】数据不一致时 confirmed 强制降级
         if not dq["ok"]:

@@ -33,15 +33,14 @@ OUT_JSON = os.environ.get("BT_JSON_OUT", "/tmp/beichi_turn_pool.json")
 
 
 def grade_tier(dlp, is_conflict=False):
-    # 修复: dlp>DL_P_MIN 的强背驰票即判为转折候选(B 起);
+    # P2-3 修复 (2026-10-01): 调用方已保证 dlp > DL_P_MIN(0.618), 旧的无条件 C 分支为死代码;
+    #   保留一行防御性兜底, 其余仅区分 A/B。
     #   若兼具方向分歧(原 conflict 语义)则升 A(转折核心), 以保留原 design intent。
-    if dlp is None or dlp <= 0:
+    if not dlp or dlp <= DL_P_MIN:
         return "C"
     if dlp >= 1.0:
         return "A"
-    if dlp > DL_P_MIN:
-        return "A" if is_conflict else "B"
-    return "C"
+    return "A" if is_conflict else "B"
 
 
 def resolve_scan_json():

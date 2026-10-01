@@ -5,7 +5,7 @@
 set -u
 
 # —— VM-B 侧路径 (经 SSH 引用) ——
-VM_B=katelolita7788@35.212.190.147
+VM_B=katelolita7788@34.4.105.158
 B_PROJ=/home/katelolita7788/TradingAgents-CN
 B_WF=$B_PROJ/scripts/chanlun-workflow
 B_PY=$B_PROJ/venv_chan/bin/python

@@ -15,8 +15,16 @@ LOGDIR=$HD/chan_logs
 D8=$(date +%Y%m%d)
 mkdir -p "$LOGDIR"
 
+# P2-7 (2026-10-01): 加 flock 防 cron 重入 (Step2 约 3 分钟)
+LOCK="$LOGDIR/.beichi_turn.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "$(date '+%F %T') [beichi-turn] 已有实例在运行 -> skip"
+  exit 0
+fi
+# 锁随 fd 9 持有至脚本退出, 自动释放
+
 cd "$WF" || exit 1
-export KLINE_CACHE_DIR="$HD/kline_cache_local"
 
 # ---- 1) 选源 ----
 SRC=$(python3 - "$LOGDIR" <<'PY'
@@ -74,14 +82,18 @@ python3 - "$WNL_TXT" "$SRC" <<'PY'
 import sys
 p, src = sys.argv[1], sys.argv[2]
 s = open(p).read()
-h = ("【口径】背驰转折候选池 —— 缠论原文口径: 转折信号 = 背驰(趋势末端+力度衰竭), 非顺势共振。\n"
-     "        选池: alignment_overall.final_verdict == conflict  且  dlp > 0.618 (用户黄金门槛)。\n"
+h = ("【口径】高背驰力度池 —— 上升趋势中的回调买点 / 类二买 / 中继（非逆势抄底）。\n"
+     "        选池: dlp > 0.618 硬门槛（背驰力度衰竭为本质判据）；\n"
+     "              final_verdict == conflict 降级为软标记（仅加分，不卡门槛；双引擎体系下高 dlp 票多判 aligned/partial）。\n"
+     "        分级: A=dlp≥1.0 或 (dlp>0.618 且 conflict)；B=dlp>0.618；无有效价格票入“仅观察”副池。\n"
      "        数据源: %s\n"
-     "        风险属性: 逆势/转折候选, 与顺势 2/2 池性质不同, 不可混用。\n"
+     "        风险属性: 顺势中的转折买点，与顺势 2/2 池性质不同，不可混用。\n"
      % src.split("/")[-1]
      + "=" * 74 + "\n")
 open(p, "w").write(h + s)
 print("口径标注已写入: %s" % p)
 PY
 
+# P2-9 (2026-10-01): 清理 7 天前的 union 中间文件, 防 ~/chan_logs 堆积
+find "$LOGDIR" -maxdepth 1 -name 'dualscan_union_*.json' -mtime +7 -delete 2>/dev/null || true
 echo "$(date '+%F %T') [beichi-turn] DONE -> $WNL_TXT"

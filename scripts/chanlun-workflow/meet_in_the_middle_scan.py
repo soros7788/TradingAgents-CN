@@ -45,7 +45,6 @@ BATCH_TIMEOUT = int(os.environ.get("MITM_BATCH_TIMEOUT",
                                    str(BATCH_SIZE * 60)))           # 单批超时 (s)
 
 # --- 汇合即停参数 ---
-SYNC_EVERY = int(os.environ.get("MITM_SYNC_EVERY", "10"))          # 每扫 N 只同步一次
 SYNC_TIMEOUT = int(os.environ.get("MITM_SYNC_TIMEOUT", "60"))      # 单次 rclone 超时
 DEFAULT_SHARE_REMOTE = os.environ.get("MITM_SHARE_REMOTE", "gdrive:mtim_ledger")
 MIN_SCANNED_BEFORE_STOP = int(os.environ.get("MITM_MIN_BEFORE_STOP", "1"))
@@ -84,6 +83,10 @@ def ledger_done_codes(ledger_path, today_only=True):
                 if not c:
                     continue
                 if today_only and str(d.get("ts") or "") < today:
+                    continue
+                # P1-7 (2026-10-01): UNKNOWN 不算成功。超时/异常批次此前记 UNKNOWN
+                # 却计入 done，重启后静默跳过、永不重试。此处排除，UNKNOWN 码重回待扫。
+                if str(d.get("gate") or "") == "UNKNOWN":
                     continue
                 done.add(c)
     except (FileNotFoundError, OSError):
@@ -132,47 +135,12 @@ def run_dual2_batch(codes, dual2_dir, kline_override=None,
     return parse_batch_output(proc.stdout + "\n" + proc.stderr)
 
 
-def _ssh_cmd(host, key=None):
-    cmd = ["ssh"]
-    if key: cmd += ["-i", expand(key)]
-    cmd += ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", host]
-    return cmd
-
-
-def _remote_ledger_path(local_ledger: str, ssh_host: str) -> str:
-    """SSH 模式下把【本地】账本路径映射为【远端】对应路径。
-
-    bug(2026-09-21 修复): 原实现把 VM-A 本地路径 (/home/gorgesoros39/chan_logs/...)
-      原样发给 VM-B 执行 `cat >>`, 而 VM-B 上 /home/gorgesoros39 属主为 gorgesoros39、
-      权限 drwxr-x---, 远端用户 katelolita7788 无写权限 -> 每次 Permission denied,
-      每只标的白跑一次 SSH 往返, 扫描被拖慢(3h25m 仅 union=1280/3195)。
-    fix: 按远端 ssh 用户名重写 home 段 /home/<user>/...;
-         可用环境变量 MITM_REMOTE_LEDGER 显式覆盖(优先, 防路径规则变化)。
-    """
-    override = os.environ.get("MITM_REMOTE_LEDGER")
-    if override:
-        return override
-    user = ssh_host.split("@")[0] if "@" in ssh_host else None
-    m = re.match(r"^/home/[^/]+/(.*)$", str(local_ledger))
-    if user and m:
-        return f"/home/{user}/{m.group(1)}"
-    return str(local_ledger)
-
-
 def append_ledger(ledger, entry, ssh_host=None, ssh_key=None):
-    if ssh_host:
-        remote_ledger = _remote_ledger_path(ledger, ssh_host)
-        remote_json = json.dumps(entry, ensure_ascii=False)
-        proc = subprocess.run(
-            _ssh_cmd(ssh_host, ssh_key) + [f"cat >> {remote_ledger}"],
-            input=remote_json + "\n", text=True,
-            capture_output=True, timeout=SSH_TIMEOUT,
-        )
-        if proc.returncode != 0:
-            print(f"[WARN] ssh ledger write failed: {proc.stderr.strip()[:120]}", flush=True)
-    else:
-        with open(expand(ledger), "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # 始终写本地账本（sync() push 的源，必须更新，否则对端 peer 永远读不到）。
+    # P1-3 (2026-10-01): ssh_host/ssh_key 参数保留仅为兼容旧调用，双机已统一为
+    # 始终写本地 + sync() 推共享盘；B 机旧的 SSH 直写对端分支已随双机对齐退役。
+    with open(expand(ledger), "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +244,9 @@ class MeetDetector:
                             # 只认对端【当日】扫描: 历史记录算进覆盖会导致假汇合
                             if str(_d.get("ts") or "") < _today:
                                 continue
+                            # P1-7: 对端 UNKNOWN 同样不算成功
+                            if str(_d.get("gate") or "") == "UNKNOWN":
+                                continue
                         except Exception:
                             _c = _ln
                         if _c:
@@ -369,6 +340,7 @@ def main():
     n_batches = (len(codes) + BATCH_SIZE - 1) // BATCH_SIZE
     # 跨轮累积: 已扫数从账本去重计数起算 (修复: 重启后归零导致永不汇合)
     covered = set(done & set(all_codes))
+    pending_unknown = set()  # P1-7: 本轮 UNKNOWN 码，help 阶段认领重试
     seen = len(covered)
     print(f"[resume] seen 起算 = {seen}/{universe_n}", flush=True)
     stopped_by = "exhausted"
@@ -393,25 +365,30 @@ def main():
                                       args.dual2_ledger, vm_tag)
         except subprocess.TimeoutExpired:
             print(f"[batch {b+1}/{n_batches}] TIMEOUT (> {BATCH_TIMEOUT}s) "
-                  f"sent={len(batch)} → 记为已扫(UNKNOWN)", flush=True)
+                  f"sent={len(batch)} → 记 UNKNOWN，不计入汇合", flush=True)
             results = []
         except Exception as e:
             print(f"[batch {b+1}/{n_batches}] ERROR {type(e).__name__}: {e} "
-                  f"sent={len(batch)} → 记为已扫(UNKNOWN)", flush=True)
+                  f"sent={len(batch)} → 记 UNKNOWN，不计入汇合", flush=True)
             results = []
 
         elapsed = time.time() - t0
         parsed = {r["code"]: r["gate"] for r in results}
-        # 把本批每只都记入 MTIM 进度账本 (已扫即计数, 防无限重扫)
+        # P1-7 (2026-10-01): 账本照记 UNKNOWN（可观测），但汇合判据只认真实 gate。
+        # UNKNOWN 码不进 covered，后续 help 阶段自动认领重试；防无限重扫靠“每码每轮
+        # 最多主批+help 各一次”，不靠虚假计数。
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for code in batch:
+            gate = parsed.get(code, "UNKNOWN")
             entry = {
-                "code": code, "gate": parsed.get(code, "UNKNOWN"),
+                "code": code, "gate": gate,
                 "vm": vm_tag, "ts": ts,
             }
             append_ledger(args.ledger, entry, args.ssh_host, args.ssh_key)
-            seen += 1
-        covered.update(batch)
+            if gate != "UNKNOWN":
+                covered.add(code)
+            else:
+                pending_unknown.add(code)
         seen = len(covered)
 
         if (b + 1) % 5 == 0 or b == 0 or (b + 1) == n_batches:
@@ -431,6 +408,47 @@ def main():
             print(f"[meet] {detector.status(covered, universe_n)}", flush=True)
 
         time.sleep(SCAN_SLEEP)
+
+    # ── 真·互助: 本端跑完后，帮对端扫剩余 ──
+    # 仅在非 meet 停止时触发（meet 已表示双端合计完成）
+    if stopped_by != "meet" and detector.enabled:
+        detector.sync()
+        _peer = getattr(detector, "peer_codes", None) or set()
+        _all = set(all_codes)
+        # 对方未扫、本端未扫 = 可认领
+        _claimable = [c for c in all_codes if c not in _peer and c not in covered]
+        if _claimable:
+            print(f"[help] 本端已完，认领对端剩余 {len(_claimable)} 只开始帮扫", flush=True)
+            _hb = 0
+            for _i in range(0, len(_claimable), BATCH_SIZE):
+                _batch = _claimable[_i:_i + BATCH_SIZE]
+                _hb += 1
+                try:
+                    _results = run_dual2_batch(_batch, args.dual2_dir, args.kline_override,
+                                              args.dual2_ledger, vm_tag)
+                except Exception as _e:
+                    print(f"[help batch {_hb}] ERROR {_e} → 记 UNKNOWN，不计入汇合", flush=True)
+                    _results = []
+                _parsed = {r["code"]: r["gate"] for r in _results}
+                _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                for _code in _batch:
+                    _gate = _parsed.get(_code, "UNKNOWN")
+                    _entry = {"code": _code, "gate": _gate,
+                              "vm": vm_tag, "ts": _ts}
+                    append_ledger(args.ledger, _entry, args.ssh_host, args.ssh_key)
+                    if _gate != "UNKNOWN":
+                        covered.add(_code)
+                seen = len(covered)
+                print(f"[help batch {_hb}] 帮扫 {len(_batch)} 只，累计 {seen}/{universe_n}", flush=True)
+                # 每批后检查是否已汇合
+                detector.sync()
+                if detector.met(covered, universe_n):
+                    print("[help] 帮扫后已汇合，停止", flush=True)
+                    stopped_by = "help_meet"
+                    break
+                time.sleep(SCAN_SLEEP)
+        else:
+            print("[help] 对方无剩余可认领", flush=True)
 
     print(f"[done] side={args.side} vm={vm_tag} scanned={seen} "
           f"stopped_by={stopped_by} skip_batches={skipped_by_peer} "

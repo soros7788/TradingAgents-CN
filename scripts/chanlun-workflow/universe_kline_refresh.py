@@ -45,6 +45,56 @@ ONE_MIN_CAP = int(os.environ.get("ONE_MIN_CAP", "5000"))   # 1min 滚窗上限�
 DATE_COL   = {"day": "date", "1m": "day", "5m": "day", "30m": "day"}
 MIN_PERIOD = {"1m": "1", "5m": "5", "30m": "30"}
 ALL_TFS    = ["day", "5m", "1m", "30m"]
+
+# ── 限流检测器: 滑动窗口，触发时写 gdrive 信号 ──
+import collections
+class RateLimitDetector:
+    def __init__(self, coord_id=None, window=60, fail_threshold=5, latency_threshold=10.0):
+        self.coord_id = coord_id
+        self.window = window
+        self.fail_threshold = fail_threshold
+        self.latency_threshold = latency_threshold
+        self.events = collections.deque()  # (ts, ok, latency)
+        self.triggered = False
+    def record(self, ok, latency):
+        now = time.time()
+        self.events.append((now, ok, latency))
+        while self.events and self.events[0][0] < now - self.window:
+            self.events.popleft()
+        self._check()
+    def _check(self):
+        if self.triggered or not self.coord_id:
+            return
+        recent = list(self.events)
+        if not recent:
+            return
+        # 连续失败
+        consec_fail = 0
+        for _, ok, _ in reversed(recent):
+            if not ok:
+                consec_fail += 1
+            else:
+                break
+        # 平均延迟
+        avg_lat = sum(l for _, _, l in recent) / len(recent)
+        if consec_fail >= self.fail_threshold or avg_lat > self.latency_threshold:
+            self.triggered = True
+            print(f"[ratelimit] 触发! 连续失败={consec_fail} 平均延迟={avg_lat:.1f}s", flush=True)
+            self._signal()
+    def _signal(self):
+        import subprocess
+        try:
+            sig = Path.home() / f"kline_ratelimited_{self.coord_id}"
+            sig.write_text(datetime.now(SH_TZ).strftime("%Y-%m-%d %H:%M:%S"))
+            subprocess.run(["rclone", "copyto", str(sig),
+                            f"gdrive:TradingAgents-CN/signals/{self.coord_id}_ratelimited"],
+                           timeout=30, capture_output=True)
+            print(f"[ratelimit] 信号已发布: {self.coord_id}_ratelimited", flush=True)
+        except Exception as e:
+            print(f"[ratelimit] 信号发布失败: {e}", flush=True)
+    def should_pause(self):
+        return self.triggered
+
 API_SLEEP  = 0.10
 
 # ── A 项提吞吐(12.5 待办 A): 并发取数 worker ──
@@ -100,6 +150,38 @@ def _load_checkpoint():
     except Exception:
         pass
     return {"cycle": 0, "done": []}
+
+def _coord_publish(coord_id, done_keys, grand_total):
+    """发布本机完整 done_keys 到 gdrive，供对方认领剩余"""
+    import subprocess
+    prog = {"coord_id": coord_id, "done": list(done_keys), "total": grand_total,
+            "ts": datetime.now(SH_TZ).strftime("%Y-%m-%d %H:%M:%S")}
+    pf = Path.home() / f"kline_progress_{coord_id}.json"
+    pf.write_text(json.dumps(prog))
+    try:
+        subprocess.run(["rclone", "copyto", str(pf),
+                        f"gdrive:TradingAgents-CN/kline_progress_{coord_id}.json"],
+                       timeout=60, capture_output=True)
+    except Exception:
+        pass  # 发布失败不阻塞主流程
+
+def _coord_get_other_remaining(coord_id, my_done_keys, all_keys):
+    """读取对方 done_keys，返回对方还没做、本机也没做的 key 列表（可认领）"""
+    import subprocess
+    other = "b" if coord_id == "a" else "a"
+    try:
+        r = subprocess.run(["rclone", "cat",
+                            f"gdrive:TradingAgents-CN/kline_progress_{other}.json"],
+                           timeout=30, capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            od = json.loads(r.stdout)
+            other_done = set(od.get("done", []))
+            # 对方未做 且 本机未做 = 可认领
+            claimable = [k for k in all_keys if k not in other_done and k not in my_done_keys]
+            return claimable
+    except Exception:
+        pass
+    return []
 
 def _save_checkpoint(cp):
     """原子落盘: 先写 .tmp 再 replace, 防 VM 断电/被杀导致 JSON 损坏。"""
@@ -314,6 +396,10 @@ def main():
     parser.add_argument("--tf", type=str, default=",".join(ALL_TFS))
     parser.add_argument("--force", action="store_true", help="忽略交易日检查")
     parser.add_argument("--reset", action="store_true", help="清除断点, 强制开启新周期")
+    parser.add_argument("--direction", type=str, default="asc", choices=["asc", "desc"],
+                        help="遍历方向: asc升序(VM-A) / desc降序(VM-B), 双机相向会合")
+    parser.add_argument("--coord-id", type=str, default=None, choices=["a", "b"],
+                        help="双机协调ID: a=VM-A / b=VM-B, 启用时通过gdrive共享进度, 合计>=总数即停")
     args = parser.parse_args()
 
     tfs = [t.strip() for t in args.tf.split(",") if t.strip() in ALL_TFS]
@@ -342,7 +428,7 @@ def main():
         sys.exit(0)
 
     print(f"[refresh] {datetime.now(SH_TZ).strftime('%Y-%m-%d %H:%M:%S')} "
-          f"codes={len(codes)} tfs={tfs} cap(1m)={ONE_MIN_CAP}", flush=True)
+          f"direction={args.direction} codes={len(codes)} tfs={tfs} cap(1m)={ONE_MIN_CAP}", flush=True)
 
     grand_total = len(codes) * len(tfs)
 
@@ -374,7 +460,10 @@ def main():
 
     # ── A 项: 并发取数(默认 4 worker) ──
     # 扁平化待处理单元; 主线程【有序消费】future, 故 results/done_keys/unsaved 仅主线程改写 → 天然线程安全(无需锁)。
-    pending = [(c, t) for c in codes for t in tfs if f"{c}|{t}" not in done_keys]
+    # 2026-09-28 双机相向: desc 时逆序遍历, 与 VM-A asc 相向会合
+    # 会合点动态漂移: 哪边限流慢, 另一边自然多跑, 并集>=总数即完成
+    ordered_codes = codes if args.direction == "asc" else list(reversed(codes))
+    pending = [(c, t) for c in ordered_codes for t in tfs if f"{c}|{t}" not in done_keys]
 
     def _task(code, tf):
         """worker 内: 取数 + 写盘 + 1m 截尾 + per-request 节流。per-(code,tf) 独立文件, 无写冲突。"""
@@ -393,8 +482,13 @@ def main():
           f"(QPS 上限≈{1/MIN_SUBMIT_INTERVAL:.1f}/s)", flush=True)
     CHUNK = MAX_WORKERS * 8                                # 在途 future 上限: 防内存堆积 + 保 checkpoint 及时落盘
     _last_submit = [0.0]
+    coord_chunk_n = [0]
     with _cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for i in range(0, len(pending), CHUNK):
+            # ── 双机协调: 每5个chunk发布进度 ──
+            if args.coord_id and coord_chunk_n[0] % 5 == 0:
+                _coord_publish(args.coord_id, done_keys, grand_total)
+            coord_chunk_n[0] += 1
             chunk = pending[i:i + CHUNK]
             futs = []
             for c, t in chunk:
@@ -456,6 +550,39 @@ def main():
     if cp is not None and unsaved > 0:
         cp["done"] = list(done_keys)
         _save_checkpoint(cp)
+
+    # ── 真·互助: 自己跑完后，认领对方剩余 ──
+    if args.coord_id and use_ckpt:
+        all_keys = {f"{c}|{t}" for c in codes for t in tfs}
+        for _round in range(3):  # 最多3轮认领，避免无限循环
+            _coord_publish(args.coord_id, done_keys, grand_total)
+            claimable = _coord_get_other_remaining(args.coord_id, done_keys, all_keys)
+            if not claimable:
+                print("[coord] 对方无剩余可认领，退出", flush=True)
+                break
+            print(f"[coord] 认领对方剩余 {len(claimable)} 项，开始帮跑", flush=True)
+            # 帮跑逻辑：复用 _task，但用认领的 key
+            help_pending = []
+            for k in claimable:
+                c, t = k.split("|")
+                help_pending.append((c, t))
+            with _cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex2:
+                for i in range(0, len(help_pending), CHUNK):
+                    chunk = help_pending[i:i + CHUNK]
+                    futs = [ex2.submit(_task, c, t) for c, t in chunk]
+                    for (code, tf), fu in zip(chunk, futs):
+                        key = f"{code}|{tf}"
+                        try:
+                            r = fu.result()
+                        except Exception:
+                            r = {"ok": False}
+                        if r.get("ok"):
+                            done_keys.add(key)
+                            if cp is not None:
+                                cp["done"] = list(done_keys)
+                                _save_checkpoint(cp)
+                    _coord_publish(args.coord_id, done_keys, grand_total)
+            print(f"[coord] 本轮帮跑完成，已做={len(done_keys)}/{grand_total}", flush=True)
 
     elapsed = time.time() - t0
     by_tf = {}

@@ -236,10 +236,24 @@ def main() -> int:
     # 2026-09-09: dlp > 0.618 黄金门槛过滤 (用户规则)
     DL_P_MIN = 0.618
     all_pass = [r for r in report["dual"] if r["gate"] == "PASS"]
-    passing = sorted(
-        [r for r in all_pass if (r.get("dlp", 0) or 0) > DL_P_MIN],
-        key=lambda r: r.get("dlp", 0) or 0, reverse=True,
-    )
+    # 判断 dlp 是否可用（Stage1 可能被跳过导致全 null）
+    has_dlp = any(r.get("dlp") is not None and r.get("dlp") > 0 for r in all_pass)
+    if has_dlp:
+        # 正常模式：按 DL_P 过滤 + 排序
+        passing = sorted(
+            [r for r in all_pass if (r.get("dlp") or 0) > DL_P_MIN],
+            key=lambda r: r.get("dlp") or 0, reverse=True,
+        )
+    else:
+        # dlp 不可用 → 回退：按 B-engine bullish_confirmed 强度 + A-engine trend_score 排序
+        print(f"[汇总] dlp 缺失 ({sum(1 for r in all_pass if r.get('dlp') is None)}/{len(all_pass)}) → 回退按 B-engine 强度排序")
+        passing = sorted(
+            all_pass,
+            key=lambda r: (
+                r.get("interval_timing", {}).get("bullish_confirmed", 0),
+                r.get("interval_timing", {}).get("total", 0) - r.get("interval_timing", {}).get("bearish_confirmed", 0),
+            ), reverse=True,
+        )
 
     print(f"\n{'='*70}")
     print("双引擎裁定汇总 (递归A定方向)")
@@ -256,7 +270,7 @@ def main() -> int:
             rs = r.get("recursive_summary", {})
             t = f"T↑{rs.get('trend_bullish',0)}/T↓{rs.get('trend_bearish',0)} S↑{rs.get('segment_bullish',0)}/S↓{rs.get('segment_bearish',0)}"
             print(f"  {r.get('name',''):<12} {r['code']:<7} "
-                  f"¥{(r.get('price') or 0):<7.2f} {r.get('dlp',0):.4f}  "
+                  f"¥{(r.get('price') or 0):<7.2f} {str(r.get('dlp') or 'N/A'):>10}  "
                   f"{t:<16} "
                   f"{r['interval_timing']['bullish_confirmed']}/"
                   f"{r['interval_timing']['bearish_confirmed']:<5} {src}")

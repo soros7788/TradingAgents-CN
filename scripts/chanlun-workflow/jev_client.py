@@ -71,14 +71,19 @@ def jev_judge(state, questions, timeout=None, model=None):
         raise JevError(f"JEV 调用失败: {type(e).__name__}: {e}") from e
 
 
+def _fmt_num(v, fmt="%.2f"):
+    # P2-5 修复 (2026-10-01): 缺失/NaN 数值格式化为 n/a, 不抛 TypeError
+    return fmt % v if isinstance(v, (int, float)) and v == v else "n/a"
+
+
 def _fmt_answer(a):
     t = a.get("type")
     if t == "choice":
-        return f"choice={a.get('choice')} conf={a.get('confidence'):.2f}"
+        return f"choice={a.get('choice')} conf={_fmt_num(a.get('confidence'))}"
     if t == "score":
-        return f"score={a.get('score'):.3f} conf={a.get('confidence'):.2f}"
+        return f"score={_fmt_num(a.get('score'), '%.3f')} conf={_fmt_num(a.get('confidence'))}"
     if t == "noul":
-        return f"noul={a.get('noul'):.3f}"
+        return f"noul={_fmt_num(a.get('noul'), '%.3f')}"
     return json.dumps(a, ensure_ascii=False)[:120]
 
 

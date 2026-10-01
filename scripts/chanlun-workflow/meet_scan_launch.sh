@@ -10,10 +10,20 @@ mkdir -p $LOGDIR
 
 SCRIPTDIR=~/TradingAgents-CN/scripts/chanlun-workflow
 CODES=~/TradingAgents-CN/kline_cache/_codes_mainboard.txt
-LEDGER=~/chan_logs/scan_ledger.jsonl
+LEDGER=~/chan_logs/mtim_ledger/asc.jsonl
 
 # VM-B 信息 (VM-A 写 VM-B 账本, VM-B 本地写自己的账本)
-VMB_HOST=katelolita7788@35.212.190.147
+# VM-B 地址动态解析（2026-09-30）：B 外网 IP 为 ephemeral，禁止硬编码
+# - VM-A：经 ~/chan_logs/peer_ip.sh 读 gdrive b_ip 信号
+# - VM-B：经 GCP metadata 取本机外网 IP（desc 分支 ssh 自环用）
+if [ -f "$HOME/chan_logs/peer_ip.sh" ]; then
+    . "$HOME/chan_logs/peer_ip.sh" 2>/dev/null || true
+    VMB_HOST="${PEER_B_HOST:-katelolita7788@35.212.190.147}"
+else
+    _BIP=$(curl -sf -m 5 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip 2>/dev/null)
+    VMB_HOST="katelolita7788@${_BIP:-35.212.190.147}"
+fi
+unset _BIP
 
 # ---- 缓存盘健康自检 (2026-09-21 新增: 空盘自愈防护) ----
 # 真实计数必须在目标 VM 本机执行(避免 $(...) 被本地 shell 抢展开导致误报 0)
@@ -59,7 +69,7 @@ fi
 # ---- 启动 ----
 cd $SCRIPTDIR
 
-COMMON_ARGS="--side $SIDE --codes $CODES --ledger $LEDGER --dual2-dir ."
+COMMON_ARGS="--split --side $SIDE --codes $CODES --ledger $LEDGER --dual2-ledger ~/chan_logs/scan_ledger.jsonl --dual2-dir ."
 
 if [ "$SIDE" = "asc" ]; then
   # VM-A 升序: 本地扫, 经 SSH 写 VM-B 共享账本
@@ -84,7 +94,7 @@ else
 set -e
 cd ~/TradingAgents-CN/scripts/chanlun-workflow
 CODES=~/TradingAgents-CN/kline_cache/_codes_mainboard.txt
-LEDGER=~/chan_logs/scan_ledger.jsonl
+LEDGER=~/chan_logs/mtim_ledger/desc.jsonl
 mkdir -p ~/chan_logs
 
 EXIST=\$(pgrep -f "meet_in_the_middle_scan.*--side desc" || true)
@@ -112,7 +122,7 @@ fi
 _cache_health "\$KLINE_CACHE_DIR" || exit 1
 nohup env MITM_LEDGER="\$LEDGER" MITM_SLEEP="0.3" \
   python3 meet_in_the_middle_scan.py \
-  --side desc --codes "\$CODES" --ledger "\$LEDGER" --dual2-dir . \
+  --side desc --codes "\$CODES" --ledger "\$LEDGER" --dual2-ledger ~/chan_logs/scan_ledger.jsonl --dual2-dir . \
   --share-remote chanlun-gdrive:mtim_ledger --vm B \
   > ~/chan_logs/mtim_postmarket_desc.log 2>&1 &
 echo "[VM-B launch] desc PID=\$!"
