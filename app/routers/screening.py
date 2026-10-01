@@ -230,8 +230,8 @@ async def enhanced_screening(req: NewScreeningRequest, user: dict = Depends(get_
         raise HTTPException(status_code=500, detail=f"增强筛选失败: {str(e)}")
 
 
-# 获取支持的字段信息
-@router.get("/fields", response_model=List[Dict[str, Any]])
+# 获取支持的字段信息（使用增强版服务）
+@router.get("/supported-fields", response_model=List[Dict[str, Any]])
 async def get_supported_fields(user: dict = Depends(get_current_user)):
     """获取所有支持的筛选字段信息"""
     try:
