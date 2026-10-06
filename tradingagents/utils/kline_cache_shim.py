@@ -20,6 +20,11 @@ import os
 
 import akshare as ak
 import pandas as pd
+try:
+    import pyarrow.parquet as pq
+    _HAS_PYARROW = True
+except ImportError:
+    _HAS_PYARROW = False
 
 # 数据源目录: 默认 VM-A 的 5TB 共享盘挂载; VM-B 通过环境变量指本地 sh mirror。
 _KLINE_CACHE_DIR = os.environ.get(
@@ -45,8 +50,39 @@ def _code_of(symbol: str) -> str:
     return symbol
 
 
+# 2026-10-06: 本地 Parquet 目录（避开 gdrive FUSE 卡顿）
+_LOCAL_PARQUET_DIR = "/home/gorgesoros39/TradingAgents-CN/kline_parquet"
+
+
 def _read_cache_df(code: str, tf: str):
-    """读缓存 CSV; 不存在/损坏返回 None。day 强制字符串, 防御性按 day 排序去重。"""
+    """读缓存; 优先 Parquet (mmap零拷贝)，fallback 到 CSV。"""
+    if "_HAS_PYARROW" in globals() and _HAS_PYARROW:
+        # 优先本地 Parquet（快，不走 FUSE）
+        local_pq = os.path.join(_LOCAL_PARQUET_DIR, f"{code}_{tf}.parquet")
+        if os.path.exists(local_pq):
+            try:
+                table = pq.read_table(local_pq, memory_map=True)
+                df = table.to_pandas()
+                if "day" in df.columns:
+                    df["day"] = df["day"].astype(str)
+                return _normalize_cache_df(df)
+            except Exception:
+                pass
+        pq_path = os.path.join(_KLINE_CACHE_DIR, f"{code}_{tf}.parquet")
+        if not os.path.exists(pq_path):
+            alt_dir = _KLINE_CACHE_DIR.replace("kline_cache", "kline_parquet")
+            alt_path = os.path.join(alt_dir, f"{code}_{tf}.parquet")
+            if os.path.exists(alt_path):
+                pq_path = alt_path
+        if os.path.exists(pq_path):
+            try:
+                table = pq.read_table(pq_path, memory_map=True)
+                df = table.to_pandas()
+                if "day" in df.columns:
+                    df["day"] = df["day"].astype(str)
+                return _normalize_cache_df(df)
+            except Exception:
+                pass
     path = os.path.join(_KLINE_CACHE_DIR, f"{code}_{tf}.csv")
     if not os.path.exists(path):
         return None
@@ -54,21 +90,59 @@ def _read_cache_df(code: str, tf: str):
         df = pd.read_csv(path, dtype={"day": str})
     except Exception:
         return None
+    return _normalize_cache_df(df)
+
+
+def _normalize_cache_df(df):
+    """统一的 df 规范化：列检查 + 排序去重。"""
     if df is None or len(df) == 0:
         return None
-    # akshare CSV 用 "date" 列, shim 统一用 "day" — rename once
     if "date" in df.columns and "day" not in df.columns:
         df = df.rename(columns={"date": "day"})
+    # 2026-10-06: 指数CSV的date列rename后为datetime64，统一转str；
+    # 下游 sealed 的 _parse_raw_timestamp 只接受 "%Y-%m-%d %H:%M[:%S]" 字符串。
+    if "day" in df.columns:
+        df["day"] = df["day"].astype(str)
     if not set(_REQUIRED_COLS).issubset(set(df.columns)):
         return None
-    # 防御性: 保证 day 严格递增且唯一 (normalizer fail-fast 契约)。
-    # 固定宽度 ISO 字符串按字典序即时间序, 无需解析。
     df = (
         df.sort_values("day", kind="mergesort")
         .drop_duplicates(subset=["day"], keep="last")
         .reset_index(drop=True)
     )
+    # 坏行过滤 (2026-10-06 audit): 空/非数值 OHLC 或 high/low 与 open/close 矛盾的 bar
+    # 会让 CanonicalBar 校验 fail-fast, 使整只标的 ERROR。只剔除坏 bar, 其余照常。
+    ohlc = df[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+    ok = (
+        ohlc.notna().all(axis=1)
+        & (ohlc > 0).all(axis=1)
+        & (ohlc["high"] >= ohlc[["open", "close"]].max(axis=1))
+        & (ohlc["low"] <= ohlc[["open", "close"]].min(axis=1))
+        & (ohlc["high"] >= ohlc["low"])
+    )
+    dropped = int((~ok).sum())
+    if dropped:
+        print(f"[kline_cache_shim] WARN dropped {dropped} invalid bar(s) "
+              f"of {len(df)} (NaN/inconsistent OHLC)")
+        df = df[ok].reset_index(drop=True)
+        if len(df) == 0:
+            return None
     return df
+
+def _clean_symbol(s: str) -> str:
+    """清洗畸形 symbol：去双前缀（szsh/shsh/szsz/shsz），已带前缀原样返回，否则按规则加前缀。"""
+    c = str(s).strip().lower()
+    # 双前缀去重
+    for dp in ("szsh", "shsh", "szsz", "shsz"):
+        if c.startswith(dp):
+            c = c[2:]
+            break
+    if c.startswith(("sh", "sz", "bj")):
+        return c
+    # 无前缀，按首位判断
+    if c.startswith(("6", "9")) or c.startswith("688"):
+        return f"sh{c}"
+    return f"sz{c}"
 
 
 def _fallback(symbol, period, adjust, reason: str):
@@ -77,7 +151,8 @@ def _fallback(symbol, period, adjust, reason: str):
         raise RuntimeError(
             "[kline_cache_shim] ak.stock_zh_a_minute 原引用缺失, 无法回退 live"
         )
-    # 回退路径每次打 live, 不缓存。
+    # 回退路径每次打 live, 不缓存。先清洗畸形 symbol。
+    symbol = _clean_symbol(symbol)
     return _ORIG(symbol=symbol, period=period, adjust=adjust)
 
 
