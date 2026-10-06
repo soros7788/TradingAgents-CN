@@ -19,6 +19,12 @@ LOGDIR=$HD/chan_logs
 D8=$(date +%Y%m%d)
 mkdir -p "$LOGDIR"
 
+# 交易日门 (2026-10-06): 非交易日跳过, 不产出 ghost watchlist
+if ! bash "$WF/is_trading_day.sh" >/dev/null 2>&1; then
+  echo "$(date '+%F %T') [trend-pool] 非交易日，跳过"
+  exit 0
+fi
+
 # 防重: pidfile + 存活检查(Step2 批量约 3 分钟, 避免 cron 重入叠加)
 # P2-7 修复 (2026-10-01): pidfile check-then-write 有 TOCTOU 竞态, 改用 flock(锁随 fd 释放)
 LOCK="$LOGDIR/.trend_pool.lock"
@@ -29,6 +35,23 @@ if ! flock -n 9; then
 fi
 
 cd "$WF" || exit 1
+
+# ---- 0) Regime Gate (2026-10-03 v3) ----
+# 池子永远跑，regime 只调阈值/仓位/模式。个股可有独立于指数的周线趋势。
+eval $(python3 -c "
+import sys; sys.path.insert(0, '.')
+from regime_gate import get_regime, pool_config, gen_run_id
+import json
+r, _ = get_regime()
+c = pool_config('trend', r)
+print('REGIME=%s' % r)
+print('THR_MULT=%.1f' % c['threshold_mult'])
+print('SIZE_MULT=%.1f' % c['size_mult'])
+print('POOL_MODE=%s' % c['mode'])
+print('IS_PRIMARY=%s' % ('1' if c['primary'] else '0'))
+print('RUN_ID=%s' % gen_run_id('trend'))
+" 2>/dev/null)
+echo "$(date '+%F %T') [trend-pool] run_id=$RUN_ID regime=$REGIME mode=$POOL_MODE thr_mult=$THR_MULT size_mult=$SIZE_MULT primary=$IS_PRIMARY"
 
 # ---- 1) 选源 ----
 SRC=$(python3 - "$LOGDIR" <<'PY'
@@ -43,7 +66,9 @@ for f in glob.glob(os.path.join(logdir, "dualscan_*.json")):
         mt = os.path.getmtime(f)
     except OSError:
         continue
-    if now - mt > 86400:          # 仅最近 24h, 排除陈旧历史
+    # 2026-10-03: 数据窗口改为 7 天 (假期感知)，避免长假后 skip
+    _window = int(os.environ.get("POOL_DATA_WINDOW_SEC", "604800"))
+    if now - mt > _window:
         continue
     try:
         recs = json.load(open(f)).get("dual") or []
@@ -81,6 +106,40 @@ export WN_IN="$WN_OUT"
 export WNL_OUT="$LOGDIR/trend_pool_watchlist_${D8}.json"
 export WNL_TXT="$LOGDIR/trend_pool_watchlist_${D8}.txt"
 python3 weekly_watchlist.py || exit 1
+
+# ---- 3b) 注入 regime/engine 标注 (2026-10-03 v3: v1/v5 闭环标注) ----
+# 2026-10-05: v5 已接入
+export _RUN_ID="$RUN_ID" _REGIME="$REGIME" _POOL_MODE="$POOL_MODE" _THR_MULT="$THR_MULT" _SIZE_MULT="$SIZE_MULT" _IS_PRIMARY="$IS_PRIMARY"
+python3 - "$WNL_OUT" <<'PY'
+import sys, json, os
+p = sys.argv[1]
+d = json.load(open(p))
+d["engine"] = "v1+v5"
+d["v5_status"] = "integrated"
+d["run_id"] = os.environ.get("_RUN_ID", "")
+d["market_regime"] = os.environ.get("_REGIME", "")
+d["pool_mode"] = os.environ.get("_POOL_MODE", "")
+d["threshold_mult"] = float(os.environ.get("_THR_MULT", "1.0"))
+d["size_mult"] = float(os.environ.get("_SIZE_MULT", "1.0"))
+d["is_primary"] = os.environ.get("_IS_PRIMARY", "0") == "1"
+# v5 标注 (2026-10-05): 每只加 v5_state
+try:
+    sys.path.insert(0, "/home/gorgesoros39/TradingAgents-CN/scripts/chanlun-workflow")
+    from v5_zhongshu import v5_state
+    for r in d.get("records", []):
+        try:
+            s, direction = v5_state(r["code"])
+            r["v5_state"] = s
+            r["v5_direction"] = direction
+        except Exception as e:
+            print("[trend-pool] v5_state 失败 code=%s err=%s" % (r.get("code"), e), flush=True)
+            r["v5_state"] = "无"
+            r["v5_direction"] = ""
+except ImportError as e:
+    print("[trend-pool] v5_zhongshu 导入失败: %s" % e, flush=True)
+json.dump(d, open(p, "w"), ensure_ascii=False, indent=1)
+print("[trend-pool] 标注已注入: engine=v1+v5 regime=%s mode=%s" % (d["market_regime"], d["pool_mode"]))
+PY
 
 # ---- 4) 给报告加口径标注(自动产出必须自解释, 避免与背驰转折池混淆) ----
 python3 - "$WNL_TXT" "$SRC" <<'PY'

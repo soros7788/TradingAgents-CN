@@ -114,7 +114,9 @@ def main():
         buckets[g].append(dict(code=code, dlp=round(s['dlp'], 4), r1=s['r1'], r2=s['r2'],
                                gate=s['gate'], dev=round(p.get('dev_pct') or 0, 2),
                                zs=p.get('zs_range'), cur=p.get('cur'),
-                               reason=why, entry=entry_note(p)))  # L4
+                               reason=why, entry=entry_note(p),
+                               v5_state=p.get('v5_state', '无'),
+                               v5_direction=p.get('v5_direction', '')))  # L4: v5 透传 (2026-10-05)
     for g in buckets: buckets[g].sort(key=lambda r: -r['dlp'])
 
     js = os.path.join(a.out_dir, f'trend_pool_graded_{dc}.json')

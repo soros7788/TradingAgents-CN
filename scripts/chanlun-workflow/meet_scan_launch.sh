@@ -4,9 +4,49 @@
 
 set -e
 
-SIDE="${1:-asc}"
+# ---- 参数解析 (2026-10-01: 增加 --force) ----
+SIDE="asc"
+FORCE=0
+for _a in "$@"; do
+  case "$_a" in
+    asc|desc) SIDE="$_a" ;;
+    --force)  FORCE=1 ;;
+  esac
+done
+unset _a
+
+# ---- VM-B 防护 (2026-10-04): B 端只准跑 desc, 跑 asc 直接报错 ----
+# 原理: AB 互助要求 A=asc B=desc, B 端跑 asc 会跟 A 重叠
+if [ "$SIDE" = "asc" ] && [ "$(hostname)" != "tradingagents-new" ]; then
+  # 非 A 主机 (即 VM-B) 跑 asc → 报错, 除非 --force
+  if [ "$FORCE" -eq 0 ]; then
+    echo "$(date +%H:%M:%S) [guard] ERROR: 本机非 VM-A, 禁止跑 asc (会跟 A 端重复)。B 端只准跑 desc。" >&2
+    echo "如确需手动干跑, 加 --force。" >&2
+    exit 1
+  else
+    echo "$(date +%H:%M:%S) [guard] WARN: --force 放行, 在非 A 主机跑 asc。" >&2
+  fi
+fi
+
 LOGDIR=~/chan_logs
 mkdir -p $LOGDIR
+
+# ---- 交易日门 (2026-10-01 止血: 休市日 cron 照跑空烧算力+JEV API) ----
+# 周末(周六/日)或 $LOGDIR/trading_holidays.txt 中的法定节假日 → 非交易日直接退出(0)
+# 口径与 daily_morning_check.sh 一致；手动验证/干跑加 --force 放行
+if [ "$FORCE" -eq 0 ]; then
+  _DOW=$(date +%u); _TODAY=$(date +%F)
+  _TRADING=1
+  if [ "$_DOW" -ge 6 ]; then _TRADING=0; fi
+  if [ -f "$LOGDIR/trading_holidays.txt" ] && grep -qx "$_TODAY" "$LOGDIR/trading_holidays.txt" 2>/dev/null; then
+    _TRADING=0
+  fi
+  if [ "$_TRADING" -eq 0 ]; then
+    echo "$(date +%H:%M:%S) [gate] 今日非交易日($_TODAY)，跳过扫描启动。如需手动干跑，加 --force。"
+    exit 0
+  fi
+  unset _DOW _TODAY _TRADING
+fi
 
 SCRIPTDIR=~/TradingAgents-CN/scripts/chanlun-workflow
 CODES=~/TradingAgents-CN/kline_cache/_codes_mainboard.txt
@@ -49,7 +89,14 @@ _cache_health() {
   return 0
 }
 
-# ---- pgrep 防重 ----
+# ---- pgrep 防重 + flock 原子锁 (2026-10-04: mini 审查, 防 TOCTOU 双启) ----
+# flock 确保"检查+启动"原子性, pgrep 做二次确认
+LOCKFILE="/tmp/meet_scan_${SIDE}.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+  echo "$(date +%H:%M:%S) [launch] side=$SIDE lock held -> SKIP"
+  exit 0
+fi
 EXIST=$(pgrep -f "meet_in_the_middle_scan.*--side $SIDE" || true)
 if [ -n "$EXIST" ]; then
   echo "$(date +%H:%M:%S) [launch] side=$SIDE worker already running (PID=$EXIST) -> SKIP"
@@ -89,14 +136,37 @@ if [ "$SIDE" = "asc" ]; then
 else
   # VM-B 降序: 本地扫 + 本地 O_APPEND 账本
   # 需要在 VM-B 上执行, 这里只是 VM-A 转发
+  # 2026-10-04: SSH 失败必须报错退出 (mini 审查)
   echo "$(date +%H:%M:%S) [launch] desc — forwarding to VM-B..."
-  ssh "$VMB_HOST" "bash -s" << REMOTE_EOF
+  ssh -o ConnectTimeout=10 -o BatchMode=yes "$VMB_HOST" "bash -s" << REMOTE_EOF || { echo "$(date +%H:%M:%S) [launch] ERROR: SSH to VM-B ($VMB_HOST) failed" >&2; exit 1; }
 set -e
+# 远程函数定义 (2026-10-04 修复: _cache_health 在远程未定义)
+_cache_csv_count() {
+  local d="$1"
+  [ -d "$d" ] || { echo 0; return; }
+  ls "$d"/*.csv 2>/dev/null | wc -l
+}
+_cache_health() {
+  local d="$1"
+  local n
+  n=$(_cache_csv_count "$d")
+  if [ "$n" -eq 0 ]; then
+    echo "$(date +%H:%M:%S) [cache] CRITICAL: KLINE_CACHE_DIR=$d 为空 -> 中止" >&2
+    return 1
+  fi
+  return 0
+}
 cd ~/TradingAgents-CN/scripts/chanlun-workflow
 CODES=~/TradingAgents-CN/kline_cache/_codes_mainboard.txt
 LEDGER=~/chan_logs/mtim_ledger/desc.jsonl
-mkdir -p ~/chan_logs
+mkdir -p ~/chan_logs/mtim_ledger
 
+# flock 原子锁 (2026-10-04)
+exec 200>/tmp/meet_scan_desc.lock
+if ! flock -n 200; then
+  echo "[VM-B launch] lock held -> SKIP"
+  exit 0
+fi
 EXIST=\$(pgrep -f "meet_in_the_middle_scan.*--side desc" || true)
 if [ -n "\$EXIST" ]; then
   echo "[VM-B launch] already running PID=\$EXIST -> SKIP"

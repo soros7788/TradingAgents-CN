@@ -16,6 +16,15 @@
   python dual_scan.py --codes 002141,600006,603256   # 指定标的(跳过 Stage1)
   python dual_scan.py --near 20                      # Stage2 验证 near 前20
 """
+# 2026-10-06: OMP 单线程（必须在 import numpy/scipy 之前）
+# 根除 fork+OpenMP 死锁；2核机器上避免进程与线程抢 CPU
+import os as _omp_os
+_omp_os.environ.setdefault("OMP_NUM_THREADS", "1")
+_omp_os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+_omp_os.environ.setdefault("MKL_NUM_THREADS", "1")
+_omp_os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+_omp_os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import argparse
 import json
 import os
@@ -483,9 +492,14 @@ def _append_ledger_row(ledger_path: str, row: dict) -> None:
     }
     try:
         p = os.path.expanduser(ledger_path)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
+        # 2026-10-04 修复: dirname 为空时 makedirs("") 会抛 FileNotFoundError
+        _d = os.path.dirname(p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
         with open(p, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:  # noqa: BLE001 — 账本写失败不阻断扫描
         print(f"  [ledger] WARN write failed for {row.get('code')}: {e}", flush=True)
 
@@ -713,8 +727,10 @@ def main() -> int:
     # 落盘
     LOGDIR.mkdir(exist_ok=True)
     jpath = LOGDIR / f"dualscan_{ts}.json"
-    jpath.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str),
-                     encoding="utf-8")
+    _tmp = jpath.with_suffix(".tmp")
+    _tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    _fh = open(_tmp, "r+b"); _fh.flush(); os.fsync(_fh.fileno()); _fh.close()
+    os.replace(_tmp, jpath)
     print(f"\n📄 JSON: {jpath}")
     return 0
 

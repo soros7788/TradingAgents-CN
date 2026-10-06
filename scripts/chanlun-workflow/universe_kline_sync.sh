@@ -10,10 +10,22 @@
 # 用法: universe_kline_sync.sh            # 全宇宙, 交易日收盘后由 timer 调用
 #       universe_kline_sync.sh --limit 5  # 冒烟/测试
 set -u
+# 2026-10-03: 交易日门 (休市日直接退出，--force 放行)
+WF_DIR="$(cd "$(dirname "$0")" && pwd)"
+_force=""
+[ "${1:-}" = "--force" ] && _force="--force"
+if ! bash "$WF_DIR/is_trading_day.sh" $_force; then
+    echo "$(date '+%F %T') [kline-sync] 非交易日 -> skip"
+    exit 0
+fi
 # 2026-09-28: 限流驱动角色管理（用户批准）
 # role_manager.sh 接管调度，本脚本保留为手动 fallback
+# 2026-10-04: 不再 exec 到无限循环 supervisor（会导致 systemd oneshot 永远 activating）
+# role_manager 改为独立 systemd service，此处仅确保它在运行，不阻塞主流程
 if [ "${ROLE_MANAGER:-1}" = "1" ] && [ -x "$HOME/chan_logs/role_manager.sh" ]; then
-    exec "$HOME/chan_logs/role_manager.sh" a
+    if ! systemctl is-active --quiet role-manager.service 2>/dev/null; then
+        systemctl start role-manager.service 2>/dev/null || true
+    fi
 fi
 export PATH="$HOME/bin:$PATH"
 
@@ -26,7 +38,7 @@ DATE=$(date +%Y%m%d)
 LOG=/home/gorgesoros39/chan_logs/universe_sync_${DATE}.log
 
 LIMIT_ARG=""
-if [ "${1:-}" = "--limit" ]; then LIMIT_ARG="--limit $2"; fi
+if [ "${1:-}" = "--limit" ]; then LIMIT_ARG="--limit ${2:-}"; fi
 
 mkdir -p "$(dirname "$LOG")"
 echo "$(date '+%F %T') [sync] start limit='${LIMIT_ARG}'" >> "$LOG"

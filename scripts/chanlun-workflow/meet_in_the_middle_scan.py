@@ -377,9 +377,34 @@ def main():
         # P1-7 (2026-10-01): 账本照记 UNKNOWN（可观测），但汇合判据只认真实 gate。
         # UNKNOWN 码不进 covered，后续 help 阶段自动认领重试；防无限重扫靠“每码每轮
         # 最多主批+help 各一次”，不靠虚假计数。
+        # BUGFIX (2026-10-05): 账本与批次文件不同步导致 20 只丢失。
+        # 修复：写账本前验证批次文件落盘成功且包含该码，否则记 UNKNOWN 重试。
+        # 批次文件路径：dual2_scan.py 写到 LOGDIR/dualscan_{ts}.json
+        _batch_file_ok = {}
+        try:
+            import glob
+            _today = datetime.now().strftime('%Y%m%d')
+            # 找最近 5 分钟内的批次文件（本批刚写）
+            _candidates = sorted(glob.glob(os.path.expanduser(f'~/chan_logs/dualscan_{_today}_*.json')),
+                               key=os.path.getmtime, reverse=True)[:3]
+            for _bf in _candidates:
+                try:
+                    _bd = json.load(open(_bf))
+                    for _r in _bd.get('dual', []):
+                        _c = _r.get('code')
+                        if _c:
+                            _batch_file_ok[_c] = True
+                except:
+                    pass
+        except:
+            pass
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for code in batch:
             gate = parsed.get(code, "UNKNOWN")
+            # 验证：批次文件里必须有这只，否则不算完成
+            if gate != "UNKNOWN" and code not in _batch_file_ok:
+                print(f"[verify] {code} 账本有但批次文件缺失 → 记 UNKNOWN 重试", flush=True)
+                gate = "UNKNOWN"
             entry = {
                 "code": code, "gate": gate,
                 "vm": vm_tag, "ts": ts,
@@ -410,15 +435,21 @@ def main():
         time.sleep(SCAN_SLEEP)
 
     # ── 真·互助: 本端跑完后，帮对端扫剩余 ──
-    # 仅在非 meet 停止时触发（meet 已表示双端合计完成）
-    if stopped_by != "meet" and detector.enabled:
+    # BUGFIX (2026-10-05): meet 停止后也要跑 help 做最终校验。
+    # 原因：meet 判定依据账本计数，账本可能虚高（如 20 只丢失事件）。
+    # 此前 `stopped_by != "meet"` 直接跳过，导致 5 只（603257-603261）永远没人扫。
+    # 修复：meet 后也做一次全量核对，缺谁补谁。
+    if detector.enabled:
         detector.sync()
         _peer = getattr(detector, "peer_codes", None) or set()
         _all = set(all_codes)
         # 对方未扫、本端未扫 = 可认领
         _claimable = [c for c in all_codes if c not in _peer and c not in covered]
         if _claimable:
-            print(f"[help] 本端已完，认领对端剩余 {len(_claimable)} 只开始帮扫", flush=True)
+            if stopped_by == "meet":
+                print(f"[help] meet 后最终校验：发现 {len(_claimable)} 只漏网，开始补扫", flush=True)
+            else:
+                print(f"[help] 本端已完，认领对端剩余 {len(_claimable)} 只开始帮扫", flush=True)
             _hb = 0
             for _i in range(0, len(_claimable), BATCH_SIZE):
                 _batch = _claimable[_i:_i + BATCH_SIZE]

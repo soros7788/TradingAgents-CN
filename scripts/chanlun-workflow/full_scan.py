@@ -102,6 +102,63 @@ def fetch_sza_prices(silent=False):
         print(f"  深市代码总数: {total}, 有效(非ST非停牌): {len(stocks)}只")
     return list(stocks.values())
 
+
+RECURSIVE_BASE_TIMEFRAME = "5m"  # 递归 R0 基棒
+# 数据新鲜度阈值(自然日): 递归基棒最后一根 bar 距 as_of 超过该天数 -> stale=True
+STALE_DAYS = int(os.environ.get("DUAL_SCAN_STALE_DAYS", "7"))
+
+
+def _base_tf_staleness(snapshot, as_of=None):
+    """递归基棒最后一根 bar 的 end_time 及是否陈旧(距 as_of > STALE_DAYS 自然日)。
+
+    支持两类 snapshot:
+    1. CanonicalMarketSnapshot 对象 (带 .bars[RECURSIVE_BASE_TIMEFRAME])
+    2. analyze_beichi 返回的 dict 或带有 times/bars/df 的对象/缓存
+    若传入 None 或没有可用 bar, 尝试从共享盘/本地 kline_cache 直接读取基棒兜底。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    SH_TZ = ZoneInfo("Asia/Shanghai")
+    if as_of is None:
+        as_of = datetime.now(SH_TZ)
+
+    # 1. 如果是 CanonicalMarketSnapshot
+    bars = getattr(snapshot, "bars", None)
+    if isinstance(bars, dict):
+        base_bars = bars.get(RECURSIVE_BASE_TIMEFRAME) or []
+        if base_bars:
+            last = base_bars[-1].end_time
+            try:
+                age_days = (as_of - last).total_seconds() / 86400.0
+            except TypeError:
+                return str(last), False
+            return str(last), age_days > STALE_DAYS
+
+    # 2. 如果 snapshot 是 analyze_beichi 结果 dict
+    if isinstance(snapshot, dict):
+        # 优先读取 times 序列
+        times = snapshot.get("times") or []
+        if times:
+            last_t = str(times[-1])
+            # 解析时间字符串
+            dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(last_t[:19], fmt).replace(tzinfo=SH_TZ)
+                    break
+                except Exception:
+                    pass
+            if dt is not None:
+                try:
+                    age_days = (as_of - dt).total_seconds() / 86400.0
+                    return last_t, age_days > STALE_DAYS
+                except TypeError:
+                    return last_t, False
+            return last_t, False
+
+    return None, True
+
+
 def scan_one(code, name, price):
     try:
         r = analyze_beichi(code, level="日线")
@@ -149,9 +206,12 @@ def scan_one(code, name, price):
                              "confirmed": confirmed, "near": near, "score": score}
     if best_buy is None and best_sell is None:
         return None
+    last_bar, is_stale = _base_tf_staleness(r)
     result = {
         "code": code, "name": name, "price": use_price,
         "data_quality": dq,
+        "last_bar": last_bar,
+        "stale": is_stale,
     }
     if best_buy is not None:
         result.update({"ratio": best_buy["ratio"], "dlp": best_buy["dlp"],

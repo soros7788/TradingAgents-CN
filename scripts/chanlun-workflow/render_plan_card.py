@@ -69,11 +69,39 @@ def main():
     bk = g['buckets']
     counts = g['counts']
 
+    # v5 守门 (2026-10-05): 按 regime 过滤候选
+    # 从同日期 trend pool 读 regime
+    _regime = "UNKNOWN"
+    try:
+        _tp = sorted(glob.glob(os.path.join(a.pool_dir, 'trend_pool_watchlist_' + a.date + '.json')))
+        if _tp:
+            _regime = json.load(open(_tp[-1])).get('market_regime', 'UNKNOWN')
+    except Exception:
+        pass
+
+    def _v5_pass(r):
+        """v5 守门员：决定做不做。返回 True=通过，False=踢掉"""
+        v5 = r.get('v5_state', '无')
+        if _regime == 'BEAR':
+            # 熊市：只做趋势向上，其余空仓
+            return v5 == '趋势' and r.get('v5_direction') == '趋势-向上'
+        elif _regime == 'BULL':
+            # 牛市：v5 过滤踢掉盘整股
+            return v5 != '盘整'
+        # 震荡/未知：不踢，只标注
+        return True
+
+    # R1: 选头名（先 v5 守门过滤，再 A优先）
+    _a_list = [r for r in bk['A'] if _v5_pass(r)]
+    _b_list = [r for r in bk['B'] if _v5_pass(r)]
     top, grade = None, None
-    if bk['A']:
-        top, grade = bk['A'][0], 'A'
-    elif bk['B']:
-        top, grade = bk['B'][0], 'B'
+    if _a_list:
+        top, grade = _a_list[0], 'A'
+    elif _b_list:
+        top, grade = _b_list[0], 'B'
+    _v5_filtered = (len(bk['A']) - len(_a_list)) + (len(bk['B']) - len(_b_list))
+    if _v5_filtered:
+        print('[card] v5 守门过滤: 踢掉 %d 只 (regime=%s)' % (_v5_filtered, _regime))
 
     if top:
         zs = (top.get('zs') or '').split('-')
@@ -90,7 +118,7 @@ def main():
             '__CUR__': format(cur, '.2f'),
             '__GRADE__': grade,
             '__DLP__': format(top['dlp'], '.3f'),
-            '__REASON__': top['reason'],
+            '__REASON__': top['reason'] + ' [v5:' + top.get('v5_state', '无') + ']',
             '__ENTRY__': top['entry'],
             '__ZS__': top['zs'],
             '__BUY_LO__': format(buy_lo, '.2f'),
@@ -117,12 +145,15 @@ def main():
 
     watch = []
     for r in bk['B'][1:3]:
-        watch.append((r['code'], 'B级 dlp ' + format(r['dlp'], '.3f') + ' · ' + r['entry']))
+        # v5 标注 (2026-10-05)
+        _v5tag = r.get('v5_state', '无')
+        watch.append((r['code'], 'B级 dlp ' + format(r['dlp'], '.3f') + ' · v5:' + _v5tag + ' · ' + r['entry']))
     bp = sorted(glob.glob(os.path.join(a.pool_dir, 'beichi_turn_pool_' + a.date + '.json')))
     if bp:
         items = sorted(json.load(open(bp[-1]))['items'], key=lambda x: -(x.get('dlp') or 0))[:2]
         for x in items:
-            watch.append((x['code'], '转折池 dlp ' + format(x['dlp'], '.3f') + ' · 大级别无确认,只看'))
+            _v5tag = x.get('v5_state', '无')
+            watch.append((x['code'], '转折池 dlp ' + format(x['dlp'], '.3f') + ' · v5:' + _v5tag + ' · 大级别无确认,只看'))
     rows = ''.join(
         '<div style="font-size:12px;padding:6px 0;border-bottom:1px solid var(--hatch-widget-border);">'
         '<b>' + c + '</b> <span style="color:var(--hatch-widget-muted);">' + d + '</span></div>'

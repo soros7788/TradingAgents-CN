@@ -29,28 +29,61 @@ HOME = os.path.expanduser("~")
 LOGDIR = os.path.join(HOME, "chan_logs")
 
 def resolve_dual():
-    """选源: union 最近 24h 内所有 dualscan_*.json 的 dual 记录(按 code dedup 保最新),
-    绕开分批小 json 陷阱(单文件条数最多会踩中 20 只小批次)。与 trend/beichi 池一致。"""
+    """选源: 优先用完整存档 dual2scan_*.json（用户定的命名），
+    无完整存档时回退到 union 最近 7 天内所有 dualscan_*.json 的 dual 记录。
+    BUGFIX (2026-10-05): 认 dual2scan_*.json；有完整存档时跳过 2904 个小批次，避免卡死。"""
     now = time.time()
-    merged = {}   # code -> [mtime, record]
-    for f in glob.glob(os.path.join(LOGDIR, "dualscan_*.json")):
+    _window = int(os.environ.get("POOL_DATA_WINDOW_SEC", "604800"))
+    # 1. 优先找完整存档 dual2scan_*.json
+    _complete = []
+    for f in glob.glob(os.path.join(LOGDIR, "dual2scan_*.json")):
         if "union" in os.path.basename(f):
-            continue   # 跳过历史合并产物, 避免自我嵌套
+            continue
         try:
             mt = os.path.getmtime(f)
         except OSError:
             continue
-        if now - mt > 86400:
+        if now - mt > _window:
             continue
-        try:
-            recs = json.load(open(f)).get("dual") or []
-        except Exception:
-            continue
-        for r in recs:
-            code = r.get("code") or r.get("stock") or r.get("symbol") or r.get("ts_code")
-            if code and (code not in merged or mt >= merged[code][0]):
-                merged[code] = [mt, r]
+        _complete.append((mt, f))
+    if _complete:
+        _complete.sort()
+        _best = _complete[-1][1]
+        print(f"[resolve_dual] 用完整存档: {os.path.basename(_best)}", flush=True)
+        return _best
+    # 2. 回退：旧逻辑（dualscan_*.json 小批次 union）
+    merged = {}   # code -> [mtime, record]
+    _seen = set()
+    for f in glob.glob(os.path.join(LOGDIR, "dualscan_*.json")):
+            if f in _seen:
+                continue
+            _seen.add(f)
+            if "union" in os.path.basename(f):
+                continue   # 跳过历史合并产物, 避免自我嵌套
+            try:
+                mt = os.path.getmtime(f)
+            except OSError:
+                continue
+            # 2026-10-03: 数据窗口改为 7 天 (假期感知)
+            _window = int(os.environ.get("POOL_DATA_WINDOW_SEC", "604800"))
+            if now - mt > _window:
+                continue
+            try:
+                recs = json.load(open(f)).get("dual") or []
+            except Exception:
+                continue
+            for r in recs:
+                code = r.get("code") or r.get("stock") or r.get("symbol") or r.get("ts_code")
+                if code and (code not in merged or mt >= merged[code][0]):
+                    merged[code] = [mt, r]
     if not merged:
+        # 2026-10-03 fallback: 无24h内新鲜分片时，用最新的 union 文件
+        unions = sorted(
+            [f for f in glob.glob(os.path.join(LOGDIR, "dualscan_union_*.json"))],
+            key=os.path.getmtime)
+        if unions:
+            print("[combo] 无新鲜分片，回退到最新 union: %s" % os.path.basename(unions[-1]), flush=True)
+            return unions[-1]
         return None
     out = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "stage1": None,
            "dual": [v[1] for v in merged.values()], "summary": {}}
@@ -97,6 +130,28 @@ def grade_tier(r):
     return "C"
 
 def main():
+    # ---- Regime Gate (2026-10-03 v2) ----
+    # BEAR: OBSERVE (跑但只观察，不产生买入); CONSOLIDATION: 关闭; BULL: TRADE
+    _mode = "BLOCKED"
+    try:
+        from regime_gate import get_regime, pool_config, gen_run_id
+        _regime, _detail = get_regime()
+        _cfg = pool_config("combo", _regime)
+        _run_id = gen_run_id("combo")
+        _mode = _cfg["mode"]
+        # v3: 池子永远跑，regime 只调阈值/仓位。BEAR 时 combo 为 OBSERVE。
+        if _regime == "BEAR":
+            _mode = "OBSERVE"
+        print("[combo] run_id=%s regime=%s mode=%s thr_mult=%.1f size_mult=%.1f primary=%s %s"
+              % (_run_id, _regime, _mode, _cfg["threshold_mult"], _cfg["size_mult"], _cfg["primary"], _detail), flush=True)
+        # 闭环标注 (2026-10-05: v5 已接入)
+        _meta = {"run_id": _run_id, "engine": "v1+v5", "v5_status": "integrated",
+                 "market_regime": _regime, "pool_mode": _mode,
+                 "threshold_mult": _cfg["threshold_mult"], "size_mult": _cfg["size_mult"],
+                 "is_primary": _cfg["primary"]}
+    except ImportError as e:
+        print("[combo] regime_gate import 失败 (%s), 保守关闭" % e, flush=True)
+        return
     # P2-1 修复 (2026-10-01): 选源移入 main, import 不再执行 union+写文件/退出
     DS = resolve_dual()
     if not DS:
@@ -146,6 +201,25 @@ def main():
     recs.sort(key=lambda x: -x["dlp"])
     eff_recs = [r for r in recs if r["effective"]]
 
+    # v5 标注 (2026-10-05): 每只加 v5_state (盘整/趋势/无)，参照 beichi_turn_pool.py 修复版
+    try:
+        from v5_zhongshu import v5_state
+        for r in eff_recs:
+            try:
+                s, direction = v5_state(r["code"])
+                r["v5_state"] = s
+                r["v5_direction"] = direction
+            except Exception as e:
+                print("[combo] v5_state 失败 code=%s err=%s" % (r["code"], e), flush=True)
+                r["v5_state"] = "无"
+                r["v5_direction"] = ""
+                r["v5_error"] = str(e)
+    except ImportError as e:
+        print("[combo] v5_zhongshu 导入失败: %s" % e, flush=True)
+        for r in eff_recs:
+            r["v5_state"] = "无"
+            r["v5_direction"] = ""
+
     L = []
     L.append("组合池: 周线向上(类R2) ∩ 高背驰力度(类二买/中继)")
     L.append("基准日: %s | 分级: A=强背驰+新鲜 / B=有效达标 / C=仅观察(锚陈旧)" % BASELINE_DATE)
@@ -178,8 +252,11 @@ def main():
     n_tradable = sum(1 for r in eff_recs if r.get("tradable"))
     json.dump(dict(baseline_date=BASELINE_DATE, records=recs, effective=len(eff_recs),
                    n_tradable=n_tradable,
+                   mode=_mode,  # TRADE / OBSERVE (熊市只观察不买)
                    criteria="周线above ∩ 高dlp(>0.618) ∩ effective; R1conflict 软标记",
-                   anchor_note="above uses weekly_last_k (C fix); tradable 基于周线cur价"), open(OUT_JSON, "w"), ensure_ascii=False, indent=1)
+                   anchor_note="above uses weekly_last_k (C fix); tradable 基于周线cur价",
+                   **_meta),  # v3: engine/v1/v5/regime 闭环标注
+              open(OUT_JSON, "w"), ensure_ascii=False, indent=1)
     print(txt)
     print("TXT:", OUT_TXT)
     print("JSON:", OUT_JSON)

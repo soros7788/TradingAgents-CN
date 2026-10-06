@@ -57,6 +57,25 @@ def resolve_scan_json():
 
 
 def main():
+    # ---- Regime Gate (2026-10-03 v3) ----
+    # 池子永远跑，regime 只调阈值/仓位。个股可有独立于指数的趋势。
+    from regime_gate import get_regime, pool_config, gen_run_id
+    _regime, _detail = get_regime()
+    _cfg = pool_config("beichi_turn", _regime)
+    _run_id = gen_run_id("beichi_turn")
+    _thr_mult = _cfg["threshold_mult"]
+    print("[beichi-turn] run_id=%s regime=%s mode=%s thr_mult=%.1f size_mult=%.1f primary=%s %s"
+          % (_run_id, _regime, _cfg["mode"], _thr_mult, _cfg["size_mult"], _cfg["primary"], _detail), flush=True)
+    # 闭环标注 (v1/v5)
+    _meta = {"run_id": _run_id, "engine": "v1+v5", "v5_status": "integrated",
+             "market_regime": _regime, "pool_mode": _cfg["mode"],
+             "threshold_mult": _thr_mult, "size_mult": _cfg["size_mult"],
+             "is_primary": _cfg["primary"]}
+    # v3: regime 调阈值 (熊市 1.5x, 震荡 1.2x, 牛市 1.0x)
+    global DL_P_MIN
+    _dlp_min = DL_P_MIN * _thr_mult
+    DL_P_MIN = _dlp_min  # 全局生效 (含 grade_tier 防御性兜底)
+    print("[beichi-turn] dlp 阈值: %.3f × %.1f = %.3f" % (0.618, _thr_mult, _dlp_min), flush=True)
     f = resolve_scan_json()
     d = json.load(open(f))
     print("数据来源: %s (ts=%s) —— 仅取单一 json，不合并历史"
@@ -96,6 +115,40 @@ def main():
             "tradable": True,
         })
     picked.sort(key=lambda r: (-r["dlp"]))
+    # v5 标注 (2026-10-03): 每只加 v5_state (盘整/趋势/无)
+    # 2026-10-04 修复: 1)异常不再静默吞,必须打日志; 2)保留方向信息
+    try:
+        from v5_zhongshu import v5_state
+        for r in picked:
+            try:
+                s, direction = v5_state(r["code"])
+                r["v5_state"] = s
+                r["v5_direction"] = direction  # 保留方向: 趋势-向上/趋势-向下
+            except Exception as e:
+                # 异常必须可见,不准静默变"无"
+                print("[beichi-turn] v5_state 失败 code=%s err=%s" % (r["code"], e), flush=True)
+                r["v5_state"] = "无"
+                r["v5_direction"] = ""
+                r["v5_error"] = str(e)
+    except ImportError as e:
+        print("[beichi-turn] v5_zhongshu 导入失败: %s" % e, flush=True)
+        for r in picked:
+            r["v5_state"] = "无"
+            r["v5_direction"] = ""
+    # v5 牛市过滤 (2026-10-03): BULL 时踢掉 v5_state=盘整 的 (79% 噪音)
+    _v5_filtered_n = 0
+    if _regime == "BULL":
+        for r in picked:
+            if r.get("v5_state") == "盘整":
+                r["tradable"] = False
+                r["v5_excluded"] = True
+                _v5_filtered_n += 1
+    # 统计 v5 分布
+    from collections import Counter
+    _v5_dist = Counter(r.get("v5_state", "无") for r in picked)
+    print("[beichi-turn] v5分布: %s" % dict(_v5_dist), flush=True)
+    if _v5_filtered_n:
+        print("[beichi-turn] 牛市 v5 过滤: 踢掉 %d 只盘整股" % _v5_filtered_n, flush=True)
     ta = sum(1 for r in picked if r["tier"] == "A")
     tb = sum(1 for r in picked if r["tier"] == "B")
     tc = sum(1 for r in picked if r["tier"] == "C")
@@ -107,7 +160,8 @@ def main():
                "source": os.path.basename(f), "ts": d.get("ts"), "dlp_min": DL_P_MIN,
                "n": len(picked), "tier_stats": {"A": ta, "B": tb, "C": tc},
                "n_untradable": len(untradable), "untradable_items": untradable,
-               "items": picked},
+               "items": picked,
+               **_meta},  # v3: engine/v1/v5/regime 闭环标注
               open(OUT_JSON, "w"), ensure_ascii=False, indent=1)
 
     print("高背驰力度池: %d 只可交易 (dlp>%.3f 硬门槛, conflict 软标记, price 有效)" % (len(picked), DL_P_MIN))
