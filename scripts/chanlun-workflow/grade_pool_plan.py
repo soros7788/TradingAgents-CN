@@ -93,6 +93,9 @@ def main():
     ap.add_argument('--date', required=True, help='YYYYMMDD,池子与union的日期')
     ap.add_argument('--out-dir', required=True)
     a = ap.parse_args()
+    if not re.fullmatch(r"\d{8}", a.date):
+        print(f"[grade] 错误: --date 必须严格为 8 位纯数字 (YYYYMMDD), 收到: {a.date}", file=sys.stderr)
+        return 1
     dc = a.date
 
     pats = sorted(glob.glob(os.path.join(a.pool_dir, f'trend_pool_watchlist_{dc}.json')))

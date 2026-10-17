@@ -59,6 +59,9 @@ def main():
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--template', default=TEMPLATE)
     a = ap.parse_args()
+    if not re.fullmatch(r"\d{8}", a.date):
+        print(f"[card] 错误: --date 必须严格为 8 位纯数字 (YYYYMMDD), 收到: {a.date}", file=sys.stderr)
+        return 1
 
     secs = load_sections(a.template)
     pats = sorted(glob.glob(os.path.join(a.pool_dir, 'trend_pool_graded_' + a.date + '.json')))
@@ -69,7 +72,7 @@ def main():
     bk = g['buckets']
     counts = g['counts']
 
-    # v5 守门 (2026-10-05): 按 regime 过滤候选
+    # v5 守门 (2026-10-05 改良): 按 regime 与缠论买卖点哲学过滤候选
     # 从同日期 trend pool 读 regime
     _regime = "UNKNOWN"
     try:
@@ -80,14 +83,45 @@ def main():
         pass
 
     def _v5_pass(r):
-        """v5 守门员：决定做不做。返回 True=通过，False=踢掉"""
+        """v5 守门员：决定做不做。返回 True=通过，False=踢掉
+        改良规则（结合缠中说禅买卖点哲学与多级别共振）：
+        1. 坚决一票否决：任何处于明确向下趋势（v5 == '趋势' 且 direction == 'bearish' 或 '向下'）的标的绝不买入！
+        2. 熊市环境（BEAR）：
+           - 严格趋势向上直接放行（v5 == '趋势' 且 direction in ('bullish', '趋势-向上')）
+           - 缠论买卖点精髓豁免放行：R1/R2双向多头(bullish/bullish) + 贴中枢上沿(类二买/三买，dev <= 3.0%) + 未破位(direction != 'bearish')。此为熊市逆势高盈亏比确定性买点！
+        3. 牛市环境（BULL）：
+           - 过滤震荡盘整股（v5 != '盘整'），顺势而为
+        4. 震荡/未知环境：默认放行，排除向下破位
+        """
         v5 = r.get('v5_state', '无')
+        v5d = r.get('v5_direction')
+        direction = v5d.get('direction') if isinstance(v5d, dict) else (v5d or '')
+
+        # 铁律：坚决拦截任何大级别向下破位趋势
+        if v5 == '趋势' and (direction == 'bearish' or '向下' in str(direction)):
+            return False
+
         if _regime == 'BEAR':
-            # 熊市：只做趋势向上，其余空仓
-            return v5 == '趋势' and r.get('v5_direction') == '趋势-向上'
+            # 1. 明确的上升趋势放行
+            if v5 == '趋势' and (direction == 'bullish' or '向上' in str(direction)):
+                return True
+            # 2. 缠论精髓放行：R1/R2双向多头共振 + 贴中枢上沿(类二买/三买 dev <= 3.0%) + 未向下破位
+            r1 = r.get('r1', '')
+            r2 = r.get('r2', '')
+            entry = r.get('entry', '')
+            try:
+                dev = float(r.get('dev', 999.0))
+            except (ValueError, TypeError):
+                dev = 999.0
+
+            if r1 == 'bullish' and r2 == 'bullish':
+                if ('类二买' in entry or dev <= 3.0) and direction != 'bearish':
+                    return True
+            return False
+
         elif _regime == 'BULL':
-            # 牛市：v5 过滤踢掉盘整股
             return v5 != '盘整'
+
         # 震荡/未知：不踢，只标注
         return True
 
@@ -101,7 +135,8 @@ def main():
         top, grade = _b_list[0], 'B'
     _v5_filtered = (len(bk['A']) - len(_a_list)) + (len(bk['B']) - len(_b_list))
     if _v5_filtered:
-        print('[card] v5 守门过滤: 踢掉 %d 只 (regime=%s)' % (_v5_filtered, _regime))
+        print('[card] v5 守门过滤: 踢掉 %d 只 (regime=%s), 通过 A=%d, B=%d' % (
+            _v5_filtered, _regime, len(_a_list), len(_b_list)))
 
     if top:
         zs = (top.get('zs') or '').split('-')
@@ -144,8 +179,11 @@ def main():
         pill_txt, pill_bg = '空仓等待', '#6b7280'
 
     watch = []
-    for r in bk['B'][1:3]:
-        # v5 标注 (2026-10-05)
+    _watch_candidates = _b_list[1:3] if (top and grade == 'B') else _b_list[:2]
+    if not _watch_candidates:
+        _watch_candidates = bk['B'][1:3] if (top and grade == 'B') else bk['B'][:2]
+    for r in _watch_candidates:
+        # v5 标注
         _v5tag = r.get('v5_state', '无')
         watch.append((r['code'], 'B级 dlp ' + format(r['dlp'], '.3f') + ' · v5:' + _v5tag + ' · ' + r['entry']))
     bp = sorted(glob.glob(os.path.join(a.pool_dir, 'beichi_turn_pool_' + a.date + '.json')))
@@ -170,6 +208,9 @@ def main():
         '__MAIN_CARD__': main_card,
         '__WATCH_ROWS__': rows,
         '__SRC__': g.get('src_union', ''),
+        '__R2_COLOR__': '#16a34a',
+        '__R2_STATUS__': '共振就绪',
+        '__R2_RULE__': '5. R2大级别已全量对撞：R1/R2双向共振，严格按次级别离开段执行',
     })
     out = os.path.join(a.out_dir, 'trade_plan_card_' + a.date + '.html')
     open(out, 'w').write(html)

@@ -16,7 +16,22 @@ set -u
 HD=$HOME
 WF=$HD/TradingAgents-CN/scripts/chanlun-workflow
 LOGDIR=$HD/chan_logs
-D8=$(date +%Y%m%d)
+# 规范化 D8: 必须严格为 8 位数字 YYYYMMDD，剥离 _final 等非标后缀
+if [ -n "${D8:-}" ]; then
+  D8=$(echo "$D8" | grep -oE "[0-9]{8}" | head -1)
+fi
+if [ -z "${D8:-}" ]; then
+  if bash "$WF/is_trading_day.sh" >/dev/null 2>&1; then
+    D8=$(date +%Y%m%d)
+  else
+    # 非交易日（如周末容灾跑批），以最新已收盘交易日为真值基准
+    if [ -f "$HD/kline_cache_local/sh000001_day.csv" ]; then
+      D8=$(tail -n 1 "$HD/kline_cache_local/sh000001_day.csv" | cut -d',' -f1 | tr -d '-')
+    else
+      D8=$(date +%Y%m%d)
+    fi
+  fi
+fi
 mkdir -p "$LOGDIR"
 
 # 交易日门 (2026-10-06): 非交易日跳过, 不产出 ghost watchlist
@@ -168,6 +183,20 @@ echo "$(date '+%F %T') [trend-pool] DONE -> $WNL_TXT"
 # 非致命:失败只记日志,不影响池子主产物。
 python3 "$WF/grade_pool_plan.py" --pool-dir "$LOGDIR" --date "$D8" --out-dir "$LOGDIR" \
     >> "$LOGDIR/grade_pool_${D8}.log" 2>&1 || echo "$(date '+%F %T') [trend-pool] 分级失败 rc=$?"
+
+
+# ---- 5.5) Agy multi-role debate (VM-B, non-fatal) ----
+{
+  PEER_B=$(~/chan_logs/peer_ip.sh 2>/dev/null || echo "35.212.190.147")
+  scp -q -i /home/gorgesoros39/.ssh/hermes_key -o StrictHostKeyChecking=accept-new \
+    "$LOGDIR/trend_pool_graded_${D8}.json" "katelolita7788@${PEER_B}:/tmp/" 2>&1 | head -2
+  ssh -i /home/gorgesoros39/.ssh/hermes_key -o StrictHostKeyChecking=accept-new \
+    "katelolita7788@${PEER_B}" \
+    "python3 /home/katelolita7788/agy_debate.py --pool-dir /tmp --date ${D8} --out-dir /tmp" \
+    >> "$LOGDIR/agy_debate_${D8}.log" 2>&1 || echo "$(date '+%F %T') [trend-pool] agy debate failed rc=$?"
+  scp -q -i /home/gorgesoros39/.ssh/hermes_key -o StrictHostKeyChecking=accept-new \
+    "katelolita7788@${PEER_B}:/tmp/agy_debate_${D8}.json" "$LOGDIR/" 2>&1 | head -2
+} || echo "$(date '+%F %T') [trend-pool] agy debate step abnormal"
 
 # ---- 6) 交易计划卡片(每日输出格式) ----
 # 逻辑见 render_plan_card.py 头部 R1-R5:选头名->动态价格梯子->买入区/止损派生->观察名单。
