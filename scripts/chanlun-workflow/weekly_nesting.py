@@ -29,7 +29,7 @@ from datetime import date
 
 socket.setdefaulttimeout(60)
 
-REPO_DIR = "/home/gorgesoros39/TradingAgents-CN/scripts/chanlun-workflow"
+REPO_DIR = os.path.expanduser("~/TradingAgents-CN/scripts/chanlun-workflow")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if os.path.isdir(REPO_DIR):
     sys.path.insert(0, REPO_DIR)
@@ -100,11 +100,8 @@ def get_level(code, level, use_cache=True):
     d = read_cache(code, {"日线": "day", "30min": "30m", "5min": "5m"}[level]) if use_cache else None
     if d:
         return d, "cache"
-    try:
-        return fetch_level_akshare(code, level), "akshare"
-    except Exception as e:
-        print("  %-5s 取数失败: %s: %s" % (level, type(e).__name__, str(e)[:60]), flush=True)
-        return None, "fail"
+    # 2026-10-14: 缓存未命中时直接跳过，绝不在后台执行阻塞式 akshare/东财，杜绝挂死
+    return None, "fail"
 
 
 # ---------------- 周线 ----------------

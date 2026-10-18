@@ -25,6 +25,7 @@ universe_kline_refresh.py — 全宇宙每交易日增量刷新 + 1min 滚窗封
 """
 import os, sys, time, argparse, fcntl, json
 import concurrent.futures as _cf
+# 2026-10-10: DummyExecutor 已移除，恢复真 ThreadPoolExecutor（线程无 bug，真凶是东财限流）
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -34,11 +35,11 @@ import akshare as ak
 SH_TZ = timezone(timedelta(hours=8))
 KLINE_DIR = Path(os.environ.get(
     "KLINE_CACHE_DIR",
-    "/home/gorgesoros39/gdrive/TradingAgents-CN/kline_cache"
+    str(Path.home() / "kline_cache_local")
 ))
 UNIVERSE_FILE = Path(os.environ.get(
     "UNIVERSE_FILE",
-    "/home/gorgesoros39/TradingAgents-CN/kline_cache/_codes_mainboard.txt"
+    str(Path.home() / "TradingAgents-CN" / "kline_cache" / "_codes_mainboard.txt")
 ))
 ONE_MIN_CAP = int(os.environ.get("ONE_MIN_CAP", "5000"))   # 1min 滚窗上限（防爆盘）
 
@@ -140,16 +141,42 @@ def _fetch_with_timeout(fn, *args, **kw):
 CHECKPOINT_PATH = Path.home() / "kline_refresh_checkpoint.json"
 
 def _load_checkpoint():
-    """返回 {cycle:int, done:list[str]}。文件损坏/缺失则返回 cycle=0, done=[]。"""
+    """返回 {cycle:int, done:list[str], target_date:str}。文件损坏/缺失则返回 cycle=0, done=[]。
+    2026-10-13: 增加 target_date 校验，目标日期变化时 checkpoint 失效（防 10-12 的 done 跳过 10-13 的任务）。"""
     try:
         if CHECKPOINT_PATH.exists():
             d = json.loads(CHECKPOINT_PATH.read_text())
             if isinstance(d, dict) and "done" in d:
                 d.setdefault("cycle", 0)
+                # 校验 target_date
+                _cur_target = _current_target_date()
+                if d.get("target_date") != _cur_target:
+                    # 目标日期变了，清空 done，强制重查
+                    return {"cycle": d.get("cycle", 0), "done": [], "target_date": _cur_target}
                 return d
     except Exception:
         pass
-    return {"cycle": 0, "done": []}
+    return {"cycle": 0, "done": [], "target_date": _current_target_date()}
+
+def _current_target_date() -> str:
+    """当前目标交易日（与 _append_only_inner 预检逻辑一致）：15:00 前为昨天，否则今天；周末顺延。"""
+    from datetime import datetime, timedelta
+    _now = datetime.now(SH_TZ)
+    _today = _now.date()
+    _wd = _today.weekday()
+    if _wd == 5:
+        return (_today - timedelta(days=1)).strftime("%Y-%m-%d")
+    elif _wd == 6:
+        return (_today - timedelta(days=2)).strftime("%Y-%m-%d")
+    elif _now.strftime("%H:%M") < "15:00":
+        _y = _today - timedelta(days=1)
+        if _y.weekday() == 6:
+            _y -= timedelta(days=2)
+        elif _y.weekday() == 5:
+            _y -= timedelta(days=1)
+        return _y.strftime("%Y-%m-%d")
+    else:
+        return _today.strftime("%Y-%m-%d")
 
 def _coord_publish(coord_id, done_keys, grand_total):
     """发布本机完整 done_keys 到 gdrive，供对方认领剩余"""
@@ -184,9 +211,11 @@ def _coord_get_other_remaining(coord_id, my_done_keys, all_keys):
     return []
 
 def _save_checkpoint(cp):
-    """原子落盘: 先写 .tmp 再 replace, 防 VM 断电/被杀导致 JSON 损坏。"""
+    """原子落盘: 先写 .tmp 再 replace, 防 VM 断电/被杀导致 JSON 损坏。
+    2026-10-13: 保存 target_date，用于下次加载时校验。"""
     tmp = CHECKPOINT_PATH.with_suffix(".tmp")
     try:
+        cp["target_date"] = _current_target_date()
         tmp.write_text(json.dumps(cp))
         tmp.replace(CHECKPOINT_PATH)
     except Exception:
@@ -231,7 +260,41 @@ def _day_start_for(code: str) -> str:
     return "20210909"
 
 
+def fetch_day_sina(code: str) -> pd.DataFrame:
+    """新浪日线 (scale=240, 免 JS 引擎, 跨平台直通, 毫秒级返回)"""
+    import json, urllib.request
+    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+    url = (f"https://quotes.sina.cn/cn/api/openapi.php/CN_MarketDataService.getKLineData"
+           f"?symbol={prefix}{code}&scale=240&ma=no&datalen=45")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            j = json.loads(resp.read().decode("utf-8", "ignore"))
+        data = j.get("result", {}).get("data", [])
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        if "day" not in df.columns:
+            return pd.DataFrame()
+        df = df.rename(columns={"day": "date"})
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        for c in ["amount", "outstanding_share", "turnover"]:
+            df[c] = pd.NA
+        return df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount',
+                  'outstanding_share', 'turnover']]
+    except Exception:
+        return pd.DataFrame()
+
+
 def fetch_day(code: str) -> pd.DataFrame:
+    # 2026-10-14: 新浪日线优先 (0.05s 直连，海外 GCP 与国内网络均畅通，免 py_mini_racer 引擎)
+    try:
+        df_sina = fetch_day_sina(code)
+        if df_sina is not None and len(df_sina) > 0:
+            return df_sina
+    except Exception:
+        pass
     start = _day_start_for(code)
     try:
         prefix = "sh" if code.startswith("6") else "sz"
@@ -279,8 +342,134 @@ def fetch_day(code: str) -> pd.DataFrame:
         bs.logout()
 
 
+
+def fetch_minute_sina(code: str, tf: str) -> pd.DataFrame:
+    """新浪分钟线 (2026-10-10: 东财限流时切新浪)。
+    限制: datalen<=1970, 无日期参数, 默认不复权。"""
+    import json, urllib.request
+    prefix = "sh" if code.startswith("6") else "sz"
+    scale = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}.get(tf, 5)
+    url = (f"https://quotes.sina.cn/cn/api/openapi.php/CN_MarketDataService.getKLineData"
+           f"?symbol={prefix}{code}&scale={scale}&ma=no&datalen=1970")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            j = json.loads(resp.read().decode("utf-8", "ignore"))
+        data = j.get("result", {}).get("data", [])
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        # 2026-10-12: 退市/ST/停牌票 sina 返回无 day 列，直接返回空触发 fallback/跳过
+        if "day" not in df.columns:
+            return pd.DataFrame()
+        # day -> date, 格式 "2026-10-09 14:15:00"
+        # 列名对齐东财: day（分钟线用 day，不用 date）
+        df["day"] = pd.to_datetime(df["day"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["amount"] = pd.to_numeric(df.get("amount", 0), errors="coerce")
+        return df[["day", "open", "high", "low", "close", "volume", "amount"]]
+    except Exception as e:
+        print(f"  [WARN] sina minute failed {code}/{tf}: {e}", file=sys.stderr)
+        return pd.DataFrame()
+
+# 2026-10-13: 东财域名轮换 (zwldarren/akshare-one commit 161ac3d 思路)
+# push2.eastmoney.com 间歇性 502，三域名轮换；HTML 错误页也算失败
+_EM_QUOTE_HOSTS = (
+    "push2.eastmoney.com",
+    "82.push2.eastmoney.com",
+    "push2delay.eastmoney.com",
+)
+_EM_KLINE_HOSTS = ("push2his.eastmoney.com",)
+
+# 2026-10-13: 东财字段映射表（学习 akshare PR #7427：按名取数，防上游改字段顺序）
+# fields2 请求顺序决定返回的列顺序，用字段名映射而非硬编码位置
+_EM_KLINE_FIELDS2 = ["f51", "f52", "f53", "f54", "f55", "f56", "f57", "f58", "f59", "f60", "f61"]
+_EM_KLINE_FIELDMAP = {
+    "f51": "day",     # 时间
+    "f52": "open",    # 开
+    "f53": "close",   # 收
+    "f54": "high",    # 高
+    "f55": "low",     # 低
+    "f56": "volume",  # 量
+    "f57": "amount",  # 额
+    # f58-f61: 涨幅/换手等，暂不用
+}
+_EM_TIMEOUT = 15.0
+
+def _em_get_json(path: str, params: dict, hosts: tuple) -> dict:
+    """从多个东财域名依次尝试，返回可用 JSON；全失败抛异常。"""
+    import requests
+    last_err = None
+    for host in hosts:
+        url = f"https://{host}{path}"
+        try:
+            r = requests.get(url, params=params, timeout=_EM_TIMEOUT)
+            r.raise_for_status()
+            return r.json()  # HTML 错误页会抛 JSON 解析异常，算失败换下一台
+        except Exception as e:
+            last_err = e
+            continue
+    raise ConnectionError(f"All EastMoney hosts failed for {path}: {last_err}")
+
+def fetch_minute_eastmoney(code: str, tf: str) -> pd.DataFrame:
+    """东财分钟线（带域名轮换）。失败返回空 DataFrame。"""
+    try:
+        prefix = "1" if code.startswith("6") else "0"
+        secid = f"{prefix}.{code}"
+        klt_map = {"5m": "5", "15m": "15", "30m": "30", "60m": "60", "1m": "1"}
+        klt = klt_map.get(tf, "5")
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": klt,
+            "fqt": "1",
+            "secid": secid,
+            "beg": "0",
+            "end": "20500101",
+        }
+        data = _em_get_json("/api/qt/stock/kline/get", params, _EM_KLINE_HOSTS)
+        klines = data.get("data", {}).get("klines", [])
+        if not klines:
+            return pd.DataFrame()
+        # 按字段名映射取数（防东财改字段顺序）
+        _idx = {f: i for i, f in enumerate(_EM_KLINE_FIELDS2)}
+        rows = []
+        for k in klines:
+            parts = k.split(",")
+            if len(parts) < len(_EM_KLINE_FIELDS2):
+                continue
+            try:
+                rows.append({
+                    "day": parts[_idx["f51"]],
+                    "open": float(parts[_idx["f52"]]),
+                    "close": float(parts[_idx["f53"]]),
+                    "high": float(parts[_idx["f54"]]),
+                    "low": float(parts[_idx["f55"]]),
+                    "volume": int(float(parts[_idx["f56"]])),
+                    "amount": float(parts[_idx["f57"]]),
+                })
+            except (ValueError, IndexError, KeyError):
+                continue
+        df = pd.DataFrame(rows)
+        df["day"] = pd.to_datetime(df["day"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        return df[["day", "open", "high", "low", "close", "volume", "amount"]]
+    except Exception as e:
+        print(f"  [WARN] eastmoney minute failed {code}/{tf}: {e}", file=sys.stderr)
+        return pd.DataFrame()
+
+
 def fetch_minute(code: str, tf: str, retries: int = 3) -> pd.DataFrame:
-    """Fetch minute K-line with retry. akshare occasionally returns empty/jitters."""
+    """Fetch minute K-line: 新浪优先 (2026-10-14 架构重构: 免阻断、超低延迟), 东财 fallback。"""
+    # 1. 新浪优先
+    df = fetch_minute_sina(code, tf)
+    if df is not None and len(df) > 0:
+        return df
+    # 2. 东财 fallback
+    df = fetch_minute_eastmoney(code, tf)
+    if df is not None and len(df) > 0:
+        return df
+    # 3. akshare fallback
     prefix = "sh" if code.startswith("6") else "sz"
     last_err = None
     for attempt in range(1, retries + 1):
@@ -299,10 +488,52 @@ def fetch_minute(code: str, tf: str, retries: int = 3) -> pd.DataFrame:
 
 def append_only(code: str, tf: str) -> dict:
     """追加新 bar, 幂等, 不覆盖. 与 incremental_kline_sync.py 同逻辑."""
+    try:
+        return _append_only_inner(code, tf)
+    except KeyError as e:
+        return {"code": code, "tf": tf, "ok": False, "error": f"KeyError: {e}"}
+
+def _append_only_inner(code: str, tf: str) -> dict:
     csv_path = KLINE_DIR / f"{code}_{tf}.csv"
+    # ── 预检 (2026-10-10): 本地已是最新交易日则跳过 API ──
+    try:
+        if csv_path.exists():
+            _dcol_pre = "date" if tf == "day" else "day"
+            _df_pre = pd.read_csv(csv_path, usecols=[_dcol_pre], dtype=str)
+            if len(_df_pre) > 0:
+                _last = str(_df_pre[_dcol_pre].iloc[-1])[:10]
+                # 目标：最新交易日（2026-10-13: 15:00 前以昨天为目标，盘中数据不完整）
+                _now = datetime.now(SH_TZ)
+                _today = _now.date()
+                _wd = _today.weekday()
+                if _wd == 5:
+                    _target = (_today - timedelta(days=1)).strftime("%Y-%m-%d")
+                elif _wd == 6:
+                    _target = (_today - timedelta(days=2)).strftime("%Y-%m-%d")
+                elif _now.strftime("%H:%M") < "15:00":
+                    _y = _today - timedelta(days=1)
+                    if _y.weekday() == 6:
+                        _y -= timedelta(days=2)
+                    elif _y.weekday() == 5:
+                        _y -= timedelta(days=1)
+                    _target = _y.strftime("%Y-%m-%d")
+                else:
+                    _target = _today.strftime("%Y-%m-%d")
+                if _last >= _target:
+                    return {"code": code, "tf": tf, "ok": True, "skipped": True, "added": 0}
+    except Exception:
+        pass
     date_col = DATE_COL[tf]
     try:
         df_live = fetch_day(code) if tf == "day" else fetch_minute(code, tf)
+        date_col = "day" if tf != "day" else "date"
+        if df_live is None or len(df_live) == 0 or date_col not in df_live.columns:
+            # 2026-10-13 17:10 修正：有本地数据时返回空=临时问题（数据未发布），不记完成以便重试
+            # 无本地数据=异常股（ST/停牌/退市），记完成
+            if csv_path.exists():
+                return {"code": code, "tf": tf, "ok": False, "error": "empty_retry"}
+            # 2026-10-13: 异常股（ST/停牌/退市）计入完成，不再算失败
+            return {"code": code, "tf": tf, "ok": True, "skipped": True, "added": 0, "reason": "empty"}
     except Exception as e:
         err_msg = str(e)[:120]
         print(f"  [ERROR] append_only {code}/{tf}: {err_msg}", file=sys.stderr)
@@ -321,6 +552,10 @@ def append_only(code: str, tf: str) -> dict:
                 if _alt in df_local.columns:
                     _dcol = _alt
                     break
+        # 2026-10-12: 列名全对不上（退市/ST/停牌导致数据源异常），直接跳过
+        # 2026-10-13: 计入完成
+        if _dcol not in df_local.columns:
+            return {"code": code, "tf": tf, "ok": True, "skipped": True, "added": 0, "reason": "column mismatch skip"}
         local_rows = len(df_local)
         local_last = df_local[_dcol].iloc[-1]
         df_new = df_live[df_live[date_col] > local_last]
@@ -529,8 +764,13 @@ def main():
     # 不写 done_keys(本已是 done), top-up 失败仅 WARN, 不影响全量回填续跑状态。
     # 由 universe-kline-sync.timer(每日15:35)自动触发 → 冻结单元每日被补齐。
     if cp is not None and done_keys and is_trade_day(today):
+        # 2026-10-13: B1 top-up default skip, user wants daily incremental only
         MAX_LAG_DAYS = int(os.environ.get("KLINE_TOPUP_LAG", "2"))
-        stale = _stale_units(done_keys, MAX_LAG_DAYS)
+        if os.environ.get("KLINE_TOPUP", "0") != "1":
+            print("[refresh] B1 top-up skipped", flush=True)
+            stale = []
+        else:
+            stale = _stale_units(done_keys, MAX_LAG_DAYS)
         if stale:
             print(f"[refresh] B1 top-up: {len(stale)} 个落后单元(last_bar落后>{MAX_LAG_DAYS}天)补最新bar",
                   flush=True)

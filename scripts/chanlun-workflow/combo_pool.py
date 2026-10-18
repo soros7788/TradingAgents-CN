@@ -22,7 +22,7 @@
 """
 import sys, os, glob, json, time
 from datetime import datetime
-sys.path.insert(0, "/home/gorgesoros39/TradingAgents-CN/scripts/chanlun-workflow")
+sys.path.insert(0, os.path.expanduser("~/TradingAgents-CN/scripts/chanlun-workflow"))
 import weekly_watchlist as W
 
 HOME = os.path.expanduser("~")

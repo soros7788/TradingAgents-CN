@@ -35,7 +35,7 @@ import json
 import glob
 import datetime
 
-REPO_DIR = "/home/gorgesoros39/TradingAgents-CN/scripts/chanlun-workflow"
+REPO_DIR = os.path.expanduser("~/TradingAgents-CN/scripts/chanlun-workflow")
 sys.path.insert(0, REPO_DIR)
 import weekly_nesting as wn  # noqa: E402
 

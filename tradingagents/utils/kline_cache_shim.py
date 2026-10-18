@@ -29,7 +29,7 @@ except ImportError:
 # 数据源目录: 默认 VM-A 的 5TB 共享盘挂载; VM-B 通过环境变量指本地 sh mirror。
 _KLINE_CACHE_DIR = os.environ.get(
     "KLINE_CACHE_DIR",
-    "/home/gorgesoros39/gdrive/TradingAgents-CN/kline_cache",
+    "/home/gorgesoros39/kline_cache_local",
 )
 
 # sealed _PERIOD_BY_TIMEFRAME 反向: "30"/"5"/"1" -> "30m"/"5m"/"1m"

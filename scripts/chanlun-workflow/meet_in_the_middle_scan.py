@@ -41,11 +41,11 @@ DEFAULT_LEDGER = os.environ.get("MITM_LEDGER", "~/chan_logs/scan_ledger.jsonl")
 
 # --- 批间检测参数 (v4) ---
 BATCH_SIZE = int(os.environ.get("MITM_BATCH_SIZE", "20"))          # 每批只数
-BATCH_TIMEOUT = int(os.environ.get("MITM_BATCH_TIMEOUT",
-                                   str(BATCH_SIZE * 60)))           # 单批超时 (s)
+BATCH_TIMEOUT = int(os.environ.get("MITM_BATCH_TIMEOUT", "600"))   # 单批超时 (默认 600s/10分钟)
 
 # --- 汇合即停参数 ---
-SYNC_TIMEOUT = int(os.environ.get("MITM_SYNC_TIMEOUT", "60"))      # 单次 rclone 超时
+SYNC_TIMEOUT = int(os.environ.get("MITM_SYNC_TIMEOUT", "60"))
+SHARE_MODE = os.environ.get("MITM_SHARE_MODE", "rsync")       # 默认采用内网 rsync 直连模式
 DEFAULT_SHARE_REMOTE = os.environ.get("MITM_SHARE_REMOTE", "gdrive:mtim_ledger")
 MIN_SCANNED_BEFORE_STOP = int(os.environ.get("MITM_MIN_BEFORE_STOP", "1"))
 
@@ -67,6 +67,9 @@ def ledger_done_codes(ledger_path, today_only=True):
       同一交易日内 watchdog 重启 → 续扫 (增量, 不重复扫)
       跨到新交易日 → 自动归零重新扫全市场 (每日循环才不会第二天就空转)
     """
+    import os
+    if os.environ.get("MTIM_NO_DATE_FILTER"):
+        today_only = False
     done = set()
     today = _mtim_cut_ts()
     try:
@@ -128,11 +131,21 @@ def run_dual2_batch(codes, dual2_dir, kline_override=None,
         cmd += ["--ledger", expand(dual2_ledger)]
     if vm_tag:
         cmd += ["--vm", vm_tag]
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd, cwd=dual2_dir, env=env,
-        capture_output=True, text=True, timeout=BATCH_TIMEOUT,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True
     )
-    return parse_batch_output(proc.stdout + "\n" + proc.stderr)
+    try:
+        stdout, stderr = proc.communicate(timeout=BATCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except Exception:
+            pass
+        proc.communicate()
+        raise
+    return parse_batch_output(stdout + "\n" + stderr)
 
 
 def append_ledger(ledger, entry, ssh_host=None, ssh_key=None):
@@ -165,6 +178,47 @@ def _has_rclone():
     rc, _, _ = _rclone(["--version"], timeout=15)
     return rc == 0
 
+def _rsync_push_pull(local_file, remote_user_host, remote_path, direction, ssh_key=None, timeout=60):
+    import subprocess
+    ssh_cmd = "ssh"
+    if ssh_key:
+        ssh_cmd = "ssh -i %s -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new" % ssh_key
+    if direction == "push":
+        src, dst = local_file, "%s:%s" % (remote_user_host, remote_path)
+    else:
+        src, dst = "%s:%s" % (remote_user_host, remote_path), local_file
+    cmd = ["rsync", "-avz", "-e", ssh_cmd, src, dst]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stderr.strip()[:100]
+    except FileNotFoundError:
+        return 127, "rsync not found"
+    except subprocess.TimeoutExpired:
+        return 124, "rsync timeout %ss" % timeout
+    except Exception as e:
+        return 1, "%s: %s" % (type(e).__name__, e)
+
+def _get_peer_b_host():
+    import subprocess, re, os
+    try:
+        p = subprocess.run(["bash", "-c", "source ~/chan_logs/peer_ip.sh 2>/dev/null && peer_b_ip"],
+                           capture_output=True, text=True, timeout=10)
+        ip = p.stdout.strip()
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+            return "katelolita7788@%s" % ip
+    except Exception:
+        pass
+    cache_path = os.path.expanduser("~/chan_logs/.peer_b_ip.cache")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                ip = f.read().strip()
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                    return "katelolita7788@%s" % ip
+        except Exception:
+            pass
+    return "katelolita7788@35.212.213.72"
+
 
 def _mtim_cut_ts():
     """汇合判据的滚动时间下界: 最近 N 小时内的对端记录才算本轮有效覆盖。
@@ -192,7 +246,13 @@ class MeetDetector:
         self.peer = "desc" if side == "asc" else "asc"
         self.share_remote = share_remote.rstrip("/")
         self.local = expand(local_ledger)
-        self.enabled = enabled and _has_rclone()
+        import os
+        if os.environ.get("MTIM_NO_MEET"):
+            enabled = False
+        if SHARE_MODE == "rsync":
+            self.enabled = enabled
+        else:
+            self.enabled = enabled and _has_rclone()
         self.peer_scanned = 0
         self.peer_codes = set()
         self.peer_synced_at = None
@@ -212,6 +272,9 @@ class MeetDetector:
         """push 自己 + pull 对方, 更新 peer_scanned。返回是否成功。"""
         if not self.enabled:
             return False
+        # rsync 模式: A(asc) 经 SSH 直连 B, B 只写本地由 A 拉取
+        if SHARE_MODE == "rsync":
+            return self._sync_rsync()
         ok = True
         # push: 本地账本 -> 共享盘 <side>.jsonl
         rc, _, err = _rclone(["copyto", self.local,
@@ -258,17 +321,155 @@ class MeetDetector:
                 ok = False
         return ok
 
+    def _sync_rsync(self):
+        """rsync 直连模式: A(asc) 双向同步, B(desc) 只读本地。"""
+        import os
+        ok = True
+        peer_local = os.path.join(os.path.dirname(self.local), f"peer_{self.peer}.jsonl")
+        if self.side == "asc":
+            # A: push 自己 -> B, pull B -> 本地
+            b_host = _get_peer_b_host()
+            ssh_key = os.path.expanduser("~/.ssh/hermes_key")
+            b_ledger_dir = "/home/katelolita7788/chan_logs/mtim_ledger"
+            # push asc.jsonl -> B
+            rc, err = _rsync_push_pull(self.local, b_host, "%s/asc.jsonl" % b_ledger_dir,
+                                       "push", ssh_key=ssh_key)
+            if rc != 0:
+                self.push_fail += 1
+                ok = False
+                print(f"[meet-rsync] push 失败 rc={rc} {err}", flush=True)
+            # pull desc.jsonl <- B
+            rc, err = _rsync_push_pull(peer_local, b_host, "%s/desc.jsonl" % b_ledger_dir,
+                                       "pull", ssh_key=ssh_key)
+            if rc != 0:
+                self.pull_fail += 1
+                ok = False
+            else:
+                self._parse_peer(peer_local)
+        else:
+            # B: 只读本地 peer_asc.jsonl (由 A push 过来的)
+            # push 由 A 完成 (A 会来拉 desc.jsonl)
+            b_ledger_dir = os.path.dirname(self.local)
+            peer_asc = os.path.join(b_ledger_dir, "asc.jsonl")
+            if os.path.exists(peer_asc):
+                self._parse_peer(peer_asc)
+            # B 不主动 push, A 会来拉
+        return ok
+
+    def _parse_peer(self, peer_file):
+        """解析对端账本文件, 更新 peer_scanned/peer_codes。"""
+        import json
+        try:
+            with open(peer_file) as f:
+                _seen = set()
+                _today = _mtim_cut_ts()
+                for _ln in f:
+                    _ln = _ln.strip()
+                    if not _ln:
+                        continue
+                    try:
+                        _d = json.loads(_ln)
+                        _c = _d.get("code")
+                        if str(_d.get("ts") or "") < _today:
+                            continue
+                        if str(_d.get("gate") or "") == "UNKNOWN":
+                            continue
+                    except Exception:
+                        _c = _ln
+                    if _c:
+                        _seen.add(_c)
+                self.peer_scanned = len(_seen)
+                self.peer_codes = _seen
+            from datetime import datetime
+            self.peer_synced_at = datetime.now().strftime("%H:%M:%S")
+        except FileNotFoundError:
+            pass
+
     def met(self, self_codes, universe_n):
         """汇合判据: 两端【当日】已覆盖 code 的并集 >= 全量。
 
         用并集而非求和: 两端扫到同一只只算一次, 避免高估导致提前停止。
+
+        BUGFIX 2026-10-12: 计数达标后加新鲜度抽查。20h 窗口账本会导致
+        resume 旧记录被算入，union 虚高（如 1840/3197 误判汇合）。
+        抽查 20 只，<90% 为当日新鲜则不判汇合。
         """
-        return len(set(self_codes) | self.peer_codes) >= universe_n
+        _union = set(self_codes) | self.peer_codes
+        if len(_union) < universe_n:
+            return False
+        # 新鲜度抽查：从 union 中抽 20 只，查 ledger ts 是否为当日
+        return self._fresh_check(list(_union)[:20])
+
+    def _fresh_check(self, sample_codes, min_ratio=0.9):
+        """抽查 ledger 新鲜度：sample 中 ts 为当日的比例 >= min_ratio"""
+        import datetime as _dt
+        _today_str = _dt.datetime.now().strftime("%Y-%m-%d")
+        _fresh = 0
+        _total = 0
+        try:
+            with open(expand(self.local)) as f:
+                _ts_map = {}
+                for _ln in f:
+                    try:
+                        _d = __import__('json').loads(_ln.strip())
+                        _c = _d.get("code")
+                        if _c and _c not in _ts_map:
+                            _ts_map[_c] = str(_d.get("ts") or "")
+                    except:
+                        continue
+            for _c in sample_codes:
+                _ts = _ts_map.get(_c, "")
+                _total += 1
+                if _ts.startswith(_today_str):
+                    _fresh += 1
+        except:
+            return False
+        return _total > 0 and (_fresh / _total) >= min_ratio
 
     def status(self, self_codes, universe_n):
         u = set(self_codes) | self.peer_codes
         return (f"self={len(set(self_codes))} peer={len(self.peer_codes)} "
                 f"union={len(u)}/{universe_n}")
+
+
+def _freshness_gate(codes, kline_dir, expected_date=None, sample_n=20, min_ratio=0.9):
+    """K线新鲜度门: 抽查 sample_n 只的 day.csv 最新日期。
+    返回 (ok, msg)。ok=False 时调用方应中止扫描。
+    expected_date: 期望的交易日 (YYYY-MM-DD)，默认取"上一交易日"逻辑——
+      简化为: 用样本中最常见的日期作为基准，要求 >=90% 样本等于基准。
+    环境变量 MITM_NO_FRESHNESS=1 或 --no-freshness-check 可 bypass。"""
+    import os, random
+    if os.environ.get("MITM_NO_FRESHNESS"):
+        return True, "bypassed by env"
+    if not codes:
+        return True, "no codes to check"
+    sample = random.sample(codes, min(sample_n, len(codes)))
+    dates = {}
+    missing = 0
+    for c in sample:
+        fp = os.path.join(kline_dir, "%s_day.csv" % c)
+        try:
+            with open(fp) as f:
+                lines = f.readlines()
+                if not lines:
+                    missing += 1
+                    continue
+                last = lines[-1].strip().split(",")[0].strip()
+                dates[last] = dates.get(last, 0) + 1
+        except FileNotFoundError:
+            missing += 1
+        except Exception:
+            missing += 1
+    if not dates:
+        return False, "CRITICAL: 抽查 %d 只全部缺 K 线文件" % len(sample)
+    baseline = max(dates, key=dates.get)
+    baseline_n = dates[baseline]
+    ratio = baseline_n / len(sample)
+    msg = "抽查%d只: 基准日期%s(%d只,%.0f%%), 缺文件%d只" % (
+        len(sample), baseline, baseline_n, ratio * 100, missing)
+    if ratio < min_ratio:
+        return False, "CRITICAL: K线新鲜度不足: " + msg
+    return True, "OK: " + msg
 
 
 def main():
@@ -282,17 +483,38 @@ def main():
                     help="传给 dual2_scan.py 的 6 字段 DL_P 账本路径")
     ap.add_argument("--kline-override", default=None)
     ap.add_argument("--vm", default=None, help="传给 dual2_scan.py 的 VM 标记 (A/B)")
+    ap.add_argument("--no-meet", action="store_true",
+                    help="禁用汇合检测（单端跑时用，防 peer 旧账本误判提前停）")
     ap.add_argument("--ssh-host", default=None)
     ap.add_argument("--ssh-key", default=None)
     ap.add_argument("--share-remote", default=DEFAULT_SHARE_REMOTE,
                     help="共享盘 rclone remote 路径 (默认 $MITM_SHARE_REMOTE)")
     ap.add_argument("--fresh", action="store_true",
                     help="忽略账本进度, 强制全量重扫")
-    ap.add_argument("--no-meet", action="store_true",
-                    help="关闭汇合检测 (退化为: 本端扫完全量清单才停)")
+    ap.add_argument("--no-freshness-check", action="store_true", help="跳过K线新鲜度门")
+    ap.add_argument("--share-mode", default=None, choices=["rclone", "rsync"])
     ap.add_argument("--split", action="store_true",
                     help="[已废弃] 静态砍半, 仅作降级开关")
     args = ap.parse_args()
+    global SHARE_MODE
+    if args.share_mode:
+        SHARE_MODE = args.share_mode
+    print("[init] SHARE_MODE=%s" % SHARE_MODE, flush=True)
+
+    # K线新鲜度门 (2026-10-11): 扫描前抽查 K 线日期，不新鲜则中止
+    if not args.no_freshness_check:
+        _codes_for_gate = []
+        try:
+            with open(expand(args.codes)) as _f:
+                _codes_for_gate = [ln.strip() for ln in _f if ln.strip()]
+        except Exception as _e:
+            print("[freshness] 读代码列表失败: %s" % _e, flush=True)
+        _kline_dir = os.environ.get("KLINE_CACHE_DIR", "./kline_cache")
+        _ok, _msg = _freshness_gate(_codes_for_gate, expand(_kline_dir))
+        print("[freshness] %s" % _msg, flush=True)
+        if not _ok:
+            print("[freshness] 中止扫描。用 --no-freshness-check 强制绕过。", flush=True)
+            sys.exit(2)
 
     vm_tag = args.vm or ("A" if args.side == "asc" else "B")
 
@@ -471,12 +693,6 @@ def main():
                         covered.add(_code)
                 seen = len(covered)
                 print(f"[help batch {_hb}] 帮扫 {len(_batch)} 只，累计 {seen}/{universe_n}", flush=True)
-                # 每批后检查是否已汇合
-                detector.sync()
-                if detector.met(covered, universe_n):
-                    print("[help] 帮扫后已汇合，停止", flush=True)
-                    stopped_by = "help_meet"
-                    break
                 time.sleep(SCAN_SLEEP)
         else:
             print("[help] 对方无剩余可认领", flush=True)

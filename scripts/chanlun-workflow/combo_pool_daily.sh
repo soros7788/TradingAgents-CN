@@ -17,6 +17,12 @@ WF=$HD/TradingAgents-CN/scripts/chanlun-workflow
 LOGDIR=$HD/chan_logs
 mkdir -p "$LOGDIR"
 
+# 交易日门 (2026-10-09): 非交易日跳过, 不产出 ghost watchlist
+if ! bash "$WF/is_trading_day.sh" >/dev/null 2>&1; then
+  echo "$(date '+%F %T') [combo-pool] 非交易日，跳过"
+  exit 0
+fi
+
 # 防重: pidfile + 存活检查(避免 cron 重入叠加)
 # P2-7 修复 (2026-10-01): pidfile check-then-write 有 TOCTOU 竞态, 改用 flock(锁随 fd 释放)
 LOCK="$LOGDIR/.combo_pool.lock"

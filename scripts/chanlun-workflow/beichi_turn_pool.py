@@ -23,7 +23,7 @@ import json
 import glob
 from datetime import datetime
 
-REPO_DIR = "/home/gorgesoros39/TradingAgents-CN/scripts/chanlun-workflow"
+REPO_DIR = os.path.expanduser("~/TradingAgents-CN/scripts/chanlun-workflow")
 sys.path.insert(0, REPO_DIR)
 
 LOGDIR = os.path.expanduser("~/chan_logs")

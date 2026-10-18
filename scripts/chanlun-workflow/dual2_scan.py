@@ -258,19 +258,23 @@ def interval_timing(bundle) -> dict:
 
 
 def _snapshot_last_close(snapshot):
-    """从 canonical snapshot 取递归基棒(5m)最后一根收盘价作为 market price。
+    """从 canonical snapshot 取全周期中最新时间戳的收盘价作为 market price (时戳优选加固版)。
 
-    Stage1 被跳过(--codes/--codes-file)时 stage1_map 为空, price/ratio/dlp 全为 None。
-    这里从 snapshot.bars 直接取价, 零额外网络开销(快照已含 K 线)。
+    避免某分钟周期断片时，盲目使用陈旧周期的收盘价导致价格失真。
     """
     bars = getattr(snapshot, "bars", None) or {}
-    for tf in (RECURSIVE_BASE_TIMEFRAME, "30m", "1m"):
+    candidates = []
+    for tf in ("day", "1m", "5m", "30m"):
         arr = bars.get(tf)
         if arr:
             last = arr[-1]
             close = getattr(last, "close", None)
-            if close:
-                return float(close)
+            end_time = getattr(last, "end_time", None) or getattr(last, "dt", None)
+            if close is not None:
+                candidates.append((str(end_time or ""), float(close)))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
     return None
 
 
@@ -303,7 +307,7 @@ def run_dual_engine(code: str, as_of: datetime, price: float = None) -> dict:
     return {
         "code": code,
         "gate": final_gate,
-        "price": price if price is not None else _snapshot_last_close(snapshot),
+        "price": price if (price is not None and not (isinstance(price, float) and math.isnan(price))) else _snapshot_last_close(snapshot),
         "recursive_direction": direction.value,
         "recursive_summary": rec_sum,
         "interval_timing": timing,
@@ -546,6 +550,15 @@ def _process_one(code, base, is_confirmed, as_of, no_beichi, vm_tag):
             except Exception as e:  # noqa: BLE001 — 补算失败不阻断主流程
                 row["dlp_error"] = f"{type(e).__name__}: {e}"
 
+        # 2026-10-07: dlp 缺失原因标注（不再用 0.0000 冒充真实值）
+        if row.get("dlp") is None and not row.get("dlp_missing_reason"):
+            if not row.get("price"):
+                row["dlp_missing_reason"] = "数据不足"
+            elif no_beichi:
+                row["dlp_missing_reason"] = "模型未加载"
+            else:
+                row["dlp_missing_reason"] = "无买信号"
+
         # ── JEV 二次门禁 ──
         _jev_env = os.environ.get("JEV_GATE", "").strip()
         _jev_on = _jev_env in ("1", "on", "true", "TRUE")
@@ -711,8 +724,10 @@ def main() -> int:
             src = "confirmed" if r.get("stage1_confirmed") else "near"
             rs = r.get("recursive_summary", {})
             t = f"T↑{rs.get('trend_bullish',0)}/T↓{rs.get('trend_bearish',0)} S↑{rs.get('segment_bullish',0)}/S↓{rs.get('segment_bearish',0)}"
+            _dlp_v = r.get('dlp')
+            _dlp_s = f"{_dlp_v:.4f}" if _dlp_v is not None else r.get('dlp_missing_reason','--')
             print(f"  {r.get('name',''):<12} {r['code']:<7} "
-                  f"¥{(r.get('price') or 0):<7.2f} {(r.get('dlp') or 0):.4f}  "
+                  f"¥{(r.get('price') or 0):<7.2f} {_dlp_s:>7}  "
                   f"{t:<16} "
                   f"{r['interval_timing']['bullish_confirmed']}/"
                   f"{r['interval_timing']['bearish_confirmed']:<5} {src}")
