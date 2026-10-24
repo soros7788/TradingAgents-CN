@@ -23,6 +23,47 @@ on:
         description: "股票代码，逗号分隔，如：000001,002463,000006"
         required: false
         default: "002463,000006"
+      kline_period:
+        description: "K线周期"
+        required: false
+        type: choice
+        options:
+          - 15m
+          - 30m
+          - 60m
+        default: "15m"
+      signal_mode:
+        description: "信号模式"
+        required: false
+        type: choice
+        options:
+          - strict
+          - balanced
+          - relaxed
+        default: "balanced"
+      daily_filter_mode:
+        description: "日线过滤"
+        required: false
+        type: choice
+        options:
+          - off
+          - trend
+          - momentum
+          - pullback
+        default: "trend"
+      scan_phase:
+        description: "扫描阶段"
+        required: false
+        type: choice
+        options:
+          - auto
+          - intraday
+          - close
+        default: "auto"
+      max_data_lag_minutes:
+        description: "最大数据延迟(分钟)"
+        required: false
+        default: "15"
       analysis_type:
         description: "分析类型"
         required: false
@@ -49,6 +90,11 @@ jobs:
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       STOCKS: ${{ github.event.inputs.stocks || '000001,002463,000006' }}
+      KLINE_PERIOD: ${{ github.event.inputs.kline_period || '15m' }}
+      SIGNAL_MODE: ${{ github.event.inputs.signal_mode || 'balanced' }}
+      DAILY_FILTER_MODE: ${{ github.event.inputs.daily_filter_mode || 'trend' }}
+      SCAN_PHASE: ${{ github.event.inputs.scan_phase || 'auto' }}
+      MAX_DATA_LAG_MINUTES: ${{ github.event.inputs.max_data_lag_minutes || '15' }}
       ANALYSIS_TYPE: ${{ github.event.inputs.analysis_type || 'quick' }}
 
     steps:
@@ -78,6 +124,11 @@ jobs:
           echo "====== TradingAgents Telegram Only ======" > run.log
           echo "Time UTC: $(date -u '+%Y-%m-%d %H:%M:%S')" >> run.log
           echo "Stocks: $STOCKS" >> run.log
+          echo "Kline Period: $KLINE_PERIOD" >> run.log
+          echo "Signal Mode: $SIGNAL_MODE" >> run.log
+          echo "Daily Filter Mode: $DAILY_FILTER_MODE" >> run.log
+          echo "Scan Phase: $SCAN_PHASE" >> run.log
+          echo "Max Data Lag Minutes: $MAX_DATA_LAG_MINUTES" >> run.log
           echo "Analysis Type: $ANALYSIS_TYPE" >> run.log
           echo "" >> run.log
 
@@ -94,6 +145,11 @@ jobs:
           if [ -f scripts/trading_analysis_main.py ]; then
             python scripts/trading_analysis_main.py \
               --stocks "$STOCKS" \
+              --period "$KLINE_PERIOD" \
+              --signal-mode "$SIGNAL_MODE" \
+              --daily-filter-mode "$DAILY_FILTER_MODE" \
+              --scan-phase "$SCAN_PHASE" \
+              --max-data-lag-minutes "$MAX_DATA_LAG_MINUTES" \
               --analysis_type "$ANALYSIS_TYPE" \
               --output json \
               > result.json 2>> run.log
@@ -138,11 +194,15 @@ jobs:
                   "NONE": "— 未触发",
               }.get(sig, sig or "-")
 
-          msg = []
-          msg.append("📈 A股30分钟突破监控")
-          msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
-          msg.append("")
+          def daily_filter_cn(mode):
+              return {
+                  "trend": "趋势：日线站稳 MA20，MA20 不弱于 MA60。",
+                  "momentum": "动量：MA5 强于 MA20，收盘站上 MA5，靠近近期高点。",
+                  "pullback": "回撤：仍在 MA20 上方，近 10 日有反弹，不追高。",
+                  "off": "关闭：不做日线过滤，直接看盘中信号。",
+              }.get(mode, f"日线过滤：{mode}")
 
+          msg = []
           if not Path("result.json").exists() or Path("result.json").stat().st_size == 0:
               log = Path("run.log").read_text(encoding="utf-8", errors="ignore") if Path("run.log").exists() else ""
               msg.append("⚠️ 本次没有生成分析结果。")
@@ -166,14 +226,28 @@ jobs:
           total = summary.get("total", 0)
           ok = summary.get("ok", 0)
           errors = summary.get("errors", 0)
+          period = data.get("period", "15m")
+          signal_mode = data.get("signal_mode", "balanced")
+          daily_filter_mode = data.get("daily_filter_mode", "trend")
+          daily_filter_label = data.get("daily_filter_label", "趋势过滤")
+          scan_phase = data.get("scan_phase", "auto")
+          max_data_lag_minutes = data.get("max_data_lag_minutes", 15)
+          title = data.get("title", "TradingAgents-CN 突破扫描")
           candidates = data.get("candidates", [])
           all_results = data.get("all_results", [])
           err_list = data.get("errors", [])
+
+          msg.append(f"📈 {title}")
+          msg.append(f"⏰ 北京时间：{bj:%Y-%m-%d %H:%M:%S}")
+          msg.append(f"周期：{period}｜模式：{signal_mode}｜日线：{daily_filter_label}({daily_filter_mode})｜阶段：{scan_phase}｜最大延迟：{max_data_lag_minutes}分钟")
+          msg.append(daily_filter_cn(daily_filter_mode))
+          msg.append("")
 
           msg.append(f"📊 扫描：{total} 只")
           msg.append(f"✅ 成功：{ok} 只")
           msg.append(f"❌ 异常：{errors} 只")
           msg.append(f"🎯 候选：{len(candidates)} 只")
+          msg.append(f"📈 日线通过：{summary.get('daily_pass', 0)}｜未通过：{summary.get('daily_fail', 0)}｜未知：{summary.get('daily_unknown', 0)}")
           msg.append("")
 
           if candidates:
@@ -182,20 +256,19 @@ jobs:
                   code = x.get("code", "-")
                   sig = signal_cn(x.get("signal"))
                   price = x.get("last_price", "-")
-                  high = x.get("structure_high_60", "-")
                   bp = fmt_pct(x.get("breakout_pct"))
                   score = x.get("score", "-")
                   decision = x.get("decision", "-")
-                  cond = x.get("conditions", {})
+                  lag = x.get("data_delay_minutes", "-")
+                  stale = x.get("data_stale", False)
+                  daily = x.get("daily_filter", {})
 
-                  msg.append(f"{code}｜{sig}｜得分 {score}")
-                  msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}")
+                  msg.append(f"{code}｜{sig}｜{decision}")
                   msg.append(
-                      f"A高点共振 {yesno(cond.get('A_high_resonance_5_20_60'))} "
-                      f"B低点抬高 {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
-                      f"D突破 {yesno(cond.get('D_price_above_structure_high'))}"
+                      f"价 {price}｜距突破 {bp}｜延迟 {lag} 分钟{'｜stale' if stale else ''}｜"
+                      f"日线 {daily.get('status', '-')}｜{daily.get('mode_label', '-')}"
                   )
-                  msg.append(f"结论：{decision}")
+                  msg.append(f"日线说明：{daily.get('reason', '-')}")
                   msg.append("")
           else:
               msg.append("🎯 本次没有触发候选。")
@@ -207,21 +280,19 @@ jobs:
                   code = x.get("code", "-")
                   sig = signal_cn(x.get("signal"))
                   price = x.get("last_price", "-")
-                  high = x.get("structure_high_60", "-")
-                  bp = fmt_pct(x.get("breakout_pct"))
                   score = x.get("score", "-")
                   source = x.get("data_source", "-")
                   latest_time = x.get("latest_time", "-")
-                  cond = x.get("conditions", {})
+                  lag = x.get("data_delay_minutes", "-")
+                  stale = x.get("data_stale", False)
+                  daily = x.get("daily_filter", {})
 
-                  msg.append(f"{code}｜{sig}｜得分 {score}")
-                  msg.append(f"现价 {price}｜结构高点 {high}｜距突破 {bp}")
+                  msg.append(f"{code}｜{sig}｜{score}分")
                   msg.append(
-                      f"A {yesno(cond.get('A_high_resonance_5_20_60'))} "
-                      f"B {yesno(cond.get('B_low_not_breaking_2_vs_5'))} "
-                      f"D {yesno(cond.get('D_price_above_structure_high'))}"
+                      f"价 {price}｜延迟 {lag} 分钟{'｜stale' if stale else ''}｜"
+                      f"日线 {daily.get('status', '-')}｜{daily.get('mode_label', '-')}｜源 {source}"
                   )
-                  msg.append(f"数据源：{source}｜K线时间：{latest_time}")
+                  msg.append(f"时间：{latest_time}｜{daily.get('reason', '-')}")
                   msg.append("")
 
           if err_list:
@@ -230,10 +301,9 @@ jobs:
                   msg.append(f"{e.get('code', '-')}: {e.get('error', '-')}")
               msg.append("")
 
-          msg.append("规则：")
-          msg.append("A = 5/20/60 高点共振")
-          msg.append("B = 近2根低点不破近5根低点")
-          msg.append("D = 当前价突破60根结构高点")
+          msg.append("规则：A高点共振｜B低点不破｜D突破结构高点")
+          msg.append("日线：trend=趋势｜momentum=强势｜pullback=回撤再起")
+          msg.append("时效：超时=stale，跳过强信号")
 
           Path("telegram_message.txt").write_text("\n".join(msg)[:12000], encoding="utf-8")
           PY
