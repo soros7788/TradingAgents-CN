@@ -2211,13 +2211,14 @@ def format_rebalance_summary(holdings, ts):
                 score *= 0.7
                 risk_tag = f" [离一买低{dist_to_obl:.1%},中风险]"
 
-        # 卖点检查
+        # 卖点检查 (2026-08-09: 增加三卖检测)
         sell_signal = ""
         try:
             r30 = analyze_beichi(code, level="30min")
             for sig in r30.get("signals", []):
-                if sig["op"] in ("一卖", "二卖") and sig.get("valid"):
+                if sig["op"] in ("一卖", "二卖", "三卖") and sig.get("valid"):
                     sell_signal = sig["op"]
+                    break
         except:
             pass
 

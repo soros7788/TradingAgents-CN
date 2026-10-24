@@ -76,8 +76,10 @@ class ScreeningService:
     # --- 公共入口 ---
     def run(self, conditions: Dict[str, Any], params: ScreeningParams) -> Dict[str, Any]:
         symbols = self._get_universe()
-        # 为控制时长，先限制样本规模（后续用批量/缓存优化）
-        symbols = symbols[:120]
+        # 为控制时长，限制样本规模（默认上限可通过环境变量调整）
+        import os as _os
+        _max = int(_os.getenv("SCREENING_MAX_SYMBOLS", "500"))
+        symbols = symbols[:_max]
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=220)
@@ -173,7 +175,12 @@ class ScreeningService:
                 f = order.get("field")
                 d = order.get("direction", "desc").lower()
                 if f in ALLOWED_FIELDS:
-                    results.sort(key=lambda x: (x.get(f) is None, x.get(f)), reverse=(d == "desc"))
+                    # 安全排序: None值排到最后, 避免比较异常
+                    _desc = (d == "desc")
+                    def _sort_key(item, _f=f):
+                        v = item.get(_f)
+                        return (v is None, v if v is not None else 0)
+                    results.sort(key=_sort_key, reverse=_desc)
 
         # 分页
         start = params.offset or 0
